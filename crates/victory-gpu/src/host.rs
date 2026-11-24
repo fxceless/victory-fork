@@ -7432,15 +7432,45 @@ fn direct_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// Whether we run under Wine (ntdll exports `wine_get_version`).
+pub(crate) fn on_wine() -> bool {
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    // Under Wine, writes into our own process (`NtWriteVirtualMemory`,
+    // `WriteProcessMemory`) are wineserver requests, thousands a second
+    // in gameplay behind one busy server thread; a read of our own process
+    // is copied in place, and checks that its destination is writable
+    // first. So there the write is a read from the host copy into the
+    // title page. `VICTORY_WINE_WRITES=0` writes as on Windows.
+    static WINE_READS: OnceLock<bool> = OnceLock::new();
+    let wine = *WINE_READS.get_or_init(|| {
+        on_wine() && std::env::var_os("VICTORY_WINE_WRITES").is_none_or(|v| v != "0")
+    });
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
+        if wine {
+            // SAFETY: the source is our mapped host copy; Wine checks the
+            // destination before it copies.
+            return unsafe {
+                ReadProcessMemory(GetCurrentProcess(), from.cast(), at as _, n, &mut done) != 0
+            };
+        }
         if direct {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:
@@ -8987,5 +9017,39 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod writes {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// Title memory with a hole: the pages around it get the host's bytes
+    /// and the hole is left alone, on Windows and (through its own path)
+    /// under Wine.
+    #[test]
+    fn writes_skip_pages_that_are_not_mapped() {
+        const K64: usize = 64 << 10;
+        // SAFETY: a reservation of our own, its first and last thirds
+        // committed; released at the end.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 3 * K64, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for at in [0, 2 * K64] {
+                assert!(
+                    !VirtualAlloc(base.add(at).cast(), K64, MEM_COMMIT, PAGE_READWRITE).is_null()
+                );
+            }
+            let host: Vec<u8> = (0..3 * K64).map(|i| (i % 251) as u8).collect();
+            super::write_mapped(base, host.as_ptr(), host.len());
+            let first = std::slice::from_raw_parts(base, K64);
+            let last = std::slice::from_raw_parts(base.add(2 * K64), K64);
+            assert_eq!(first, &host[..K64]);
+            assert_eq!(last, &host[2 * K64..]);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
     }
 }
