@@ -160,13 +160,13 @@ the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+it can (shaders and pipelines too, see Getting started) and on first use
+otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Status (2026-11-24)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+**Not playable yet.** The title boots, runs its menus at its own 30 fps,
+loads the world and shows it: slowly, and with rendering defects.
 
 | Stage | State |
 |-------|-------|
@@ -174,14 +174,16 @@ loads the world, where rendering fails.
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
 | Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
 
 Tested on one machine: Windows 11, AMD RX 6700 XT.
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+> **Warning.** Entering the world on a real GPU has hung it in earlier
+> builds, and Windows then resets the display driver (every monitor goes
+> black for a moment). The latest runs did not, but it is not ruled out; a
+> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
+> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
+> to reach the world in minutes).
 
 What each part does today and what it still needs:
 
@@ -194,8 +196,8 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
+| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
@@ -204,6 +206,12 @@ What each part does today and what it still needs:
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
+
+To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
+the installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. Building needs the MSVC C++
+build tools: Visual Studio or its Build Tools with the "Desktop development
+with C++" workload.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
@@ -227,6 +235,13 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
+
+Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
+top-level window to that bounding box. Smaller windows keep their size,
+larger windows keep their proportions, and the monitor's work area still
+limits them. This scales the displayed image; it does not change the
+console render resolution or the swap-chain buffers. With the variable
+unset, window sizing is unchanged.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
@@ -256,6 +271,24 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+### Windows shader-test validator
+
+The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
+An older Windows SDK validator can load successfully but reject them with
+`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
+from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+or a current Windows SDK. Set its path for the test session:
+
+```powershell
+$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+```
+
+Without this override, the validator loader selects the newest installed
+Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
+path when no SDK copy is found. This is a test/offline-validation dependency;
+the translated shaders do not require it at runtime.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -264,12 +297,16 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+The on/off switches below (`...=1`) are off when unset or set to `0`.
+
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
@@ -284,8 +321,24 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+Every build appends unhandled exceptions, panics, and host GPU failures to
+`crashes.log` in the title's data folder.
+
+For a startup breakpoint (`0x80000003`), run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`crashes.log` entries. A host DLL refusal includes the caller stack in the
+console output. The refusal is expected for DLLs outside the host policy.
+
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
+
+To compare hardware and software rendering, repeat with
+`VICTORY_D3D12_WARP=1` and check the console for
+`host device on the software adapter (WARP)` to confirm the WARP device was
+created. Compare the exception's module and offset, stack frames, and
+preceding messages across the two runs.
 
 ## License
 
