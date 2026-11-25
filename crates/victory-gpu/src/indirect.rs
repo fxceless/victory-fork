@@ -1825,15 +1825,14 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
         let mut zeroed = 0usize;
+        let mut kept_at: Vec<usize> = Vec::new();
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept_at.push(i);
             } else {
-                assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
+                assert_eq!((rec[0], rec[1]), (0, 0), "an uncharged draw is zeroed whole (record {i})");
                 zeroed += 1;
             }
             assert_eq!(rec[2], 1000 + i as u32);
@@ -1841,7 +1840,19 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Which two fit is the GPU's to choose: the records are charged with an
+        // atomic add from parallel lanes, so the group that reaches it first is
+        // the one that fits - it is not fixed which group that is (measured
+        // here, this test alone, 15 runs: records 1 and 2 kept theirs 4 times,
+        // records 64 and 65 11 times, spent == BUDGET_CAP in all 15), and the
+        // order of the lanes inside a group is not a promise either, so the
+        // records are not named. The fixed facts are the ones asserted: two
+        // records of 1 << 26 fit a budget of 1 << 27, the empty first record
+        // charges nothing, no other record keeps its draw, the budget does not
+        // wrap, and no word of any record is lost.
+        assert_eq!(kept_at.len(), 2, "two draws fit a budget of 1 << 27; these kept theirs: {kept_at:?}");
+        assert_eq!(zeroed, (RECORDS as usize) - 2, "every other record is zeroed whole");
+        assert!(!kept_at.contains(&0), "the empty first record charges nothing; kept: {kept_at:?}");
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
