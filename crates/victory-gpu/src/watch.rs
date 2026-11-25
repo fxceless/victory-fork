@@ -762,22 +762,22 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     crate::descriptor::host::page_written(at, len);
 }
 
-/// The runtime mapped a view of the physical bytes `[offset, offset + len)`
-/// of `section` (`crate::inplace::title_memory_view`): the view is
-/// writable, so the same bytes guarded at another view must be checked
-/// again — and are, the pages noted written, which also has the next check
-/// guard the new view (`protect`).
-pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
-    if !view_guard() {
-        return;
-    }
-    let ranges = crate::inplace::views_of_section(section, offset, len);
-    if ranges.is_empty() {
+/// The runtime mapped a view of physical pages (`crate::inplace::title_memory_view`):
+/// the new view is writable, so the same bytes guarded at another view must be
+/// checked again — and are, the pages noted written, which also has the next
+/// check guard the new view (`protect`).
+pub(crate) fn views_mapped(ranges: &[(usize, usize)]) {
+    if !view_guard() || ranges.is_empty() {
         return;
     }
     let mut g = guards();
-    for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+    for &(at, n) in ranges {
+        let end = at.saturating_add(n);
+        let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        for block in aliased {
+            g.aliased.remove(&block);
+        }
+        if open_here(&mut g, at, end) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -841,7 +841,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // written.
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
-    crate::inplace::views_gone(at, len);
+    let reopen = crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
@@ -858,6 +858,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    for (addr, n) in reopen {
+        let end = addr.saturating_add(n);
+        let stale: Vec<usize> = g.aliased.range(addr / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        for block in stale {
+            g.aliased.remove(&block);
+        }
+        open_here(&mut g, addr, end);
     }
 }
 
@@ -1393,6 +1401,59 @@ mod tests {
         unsafe { ((one + 8) as *mut u8).write(1) };
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    #[test]
+    fn crossing_many_views_upward_releases_aliases_and_reports_dirty() {
+        let (section, one, two) = two_views(BLOCK);
+        // Bring view count to exact MANY_VIEWS (64): one + two + 62 fillers.
+        let filler = one + (1 << 45);
+        for n in 0..MANY_VIEWS - 2 {
+            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+        }
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        assert!(!writable(two), "two is guarded alongside one at MANY_VIEWS");
+        assert!(guards().aliased.contains(&(one / BLOCK)));
+
+        // Adding the (MANY_VIEWS + 1)-th view crosses the threshold: existing
+        // guarded aliases must be opened and removed from g.aliased so `two`
+        // is not stuck read-only and `one` does not stay spuriously clean.
+        let extra = filler + (MANY_VIEWS - 2) * BLOCK;
+        crate::inplace::title_memory_view(extra, BLOCK, section, 0);
+        assert!(writable(two), "sibling alias must be released when crossing MANY_VIEWS");
+        assert!(!guards().aliased.contains(&(one / BLOCK)));
+        assert!(!guards().aliased.contains(&(two / BLOCK)));
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+
+        title_memory_remapped(filler, (MANY_VIEWS - 1) * BLOCK);
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    #[test]
+    fn crossing_many_views_downward_reopens_remaining_views_for_shared_guarding() {
+        let (section, one, two) = two_views(BLOCK);
+        // Start above MANY_VIEWS (65 views): one + two + 63 fillers.
+        let filler = one + (1 << 45);
+        for n in 0..MANY_VIEWS - 1 {
+            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+        }
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        assert!(writable(two), "above MANY_VIEWS, two is left writable");
+
+        // Unmap the fillers, dropping the page back to 2 views (<= MANY_VIEWS).
+        title_memory_remapped(filler, (MANY_VIEWS - 1) * BLOCK);
+        // `one` must be reopened so the next guard protects `two` alongside it.
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert!(!writable(two), "after dropping below MANY_VIEWS, two is guarded with one");
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        // Writing through `two` now faults and notifies `one`.
+        // SAFETY: `two` is a live mapped view of `section`; the VEH reopens it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+
         drop_views(section, &[one, two], BLOCK);
     }
 
