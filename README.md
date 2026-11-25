@@ -540,9 +540,11 @@ use):
 
 Tools and diagnostics:
 - `victory translate <shader file> --warm all --jobs N` translates every
-  shader ahead of a run, on the processor only (about 4.5 to 6.5 minutes
-  here); the shader cache is keyed on the translator's source, so a new
-  build that does not touch the translator starts warm.
+  shader ahead of a run (about 4.5 to 6.5 minutes here). It detects the
+  runtime D3D12 adapter settings before translating. Run it with the same
+  adapter, build settings and shader switches as the game. This fills the
+  translated shader cache. Driver pipelines are built and cached as the
+  game supplies their full state.
 - Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
