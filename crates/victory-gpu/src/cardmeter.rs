@@ -13,22 +13,24 @@
 //!
 //! Here a list gets one timestamp where it begins and one where it ends,
 //! both resolved into one read-back buffer by the list itself. The card
-//! writes them when it gets there; a pair is read a second and a half
-//! after it was recorded, when every flight of that time has long landed,
-//! and its length goes to the frame log's totals by kind. So the frame
+//! writes them when it gets there. A pair is read after its submission's
+//! fence completes and it has been pending for a second and a half.
+//! Its length goes to the frame log's totals by kind. So the frame
 //! log's card columns are of the frames of a moment ago: right for the
 //! usual frame, not for placing one long frame.
 //!
 //! On by default in diagnostics builds; `VICTORY_CARD_METER=0` or `1` says
 //! otherwise. Two queries and a resolve a list.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 /// What a timed list is.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// Ours: changed bytes go up to copies in the card's memory and their
     /// pieces are hashed again (`Host::card_before`).
@@ -42,38 +44,102 @@ pub(crate) enum Kind {
 
 /// Pairs of timestamps in the ring.
 const PAIRS: u32 = 8192;
-/// A pair is read this long after it was recorded.
-const AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Age a submission before reporting it, even if it has finished already.
+const AFTER: Duration = Duration::from_millis(1500);
 
-/// A pair being recorded: its place in the ring, or none.
-#[derive(Clone, Copy)]
+/// A timestamp pair that can still be used by a recorded command list.
 pub(crate) struct Span(u32);
 
 impl Span {
-    pub(crate) const NONE: Span = Span(u32::MAX);
-    /// For keeping in an atomic.
-    pub(crate) fn raw(self) -> u32 {
+    pub(crate) fn pair(&self) -> u32 {
         self.0
     }
-    pub(crate) fn from_raw(raw: u32) -> Span {
-        Span(raw)
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(m)) = meter.as_mut() {
+            m.slots.release(self.0);
+        }
+    }
+}
+
+struct Slot {
+    kind: Kind,
+    owned: bool,
+    /// The latest submission that can write the pair and when it was sent.
+    submitted: Option<(u64, Instant)>,
+}
+
+struct Slots {
+    free: Vec<u32>,
+    entries: Vec<Option<Slot>>,
+    pending: BTreeSet<(u64, u32)>,
+}
+
+impl Slots {
+    fn new(count: u32) -> Self {
+        Self {
+            free: (0..count).rev().collect(),
+            entries: (0..count).map(|_| None).collect(),
+            pending: BTreeSet::new(),
+        }
+    }
+
+    fn reserve(&mut self, kind: Kind) -> Option<u32> {
+        let pair = self.free.pop()?;
+        self.entries[pair as usize] = Some(Slot { kind, owned: true, submitted: None });
+        Some(pair)
+    }
+
+    fn release(&mut self, pair: u32) {
+        let slot = self.entries[pair as usize].as_mut().expect("owned timestamp pair");
+        slot.owned = false;
+        if slot.submitted.is_none() {
+            self.give_back(pair);
+        }
+    }
+
+    fn give_back(&mut self, pair: u32) {
+        self.entries[pair as usize] = None;
+        self.free.push(pair);
+    }
+
+    fn submit(&mut self, pair: u32, fence: u64, at: Instant) {
+        let slot = self.entries[pair as usize].as_mut().expect("submitted timestamp pair");
+        if let Some((prior, _)) = slot.submitted.replace((fence, at)) {
+            self.pending.remove(&(prior, pair));
+        }
+        self.pending.insert((fence, pair));
+    }
+
+    fn take_ready(&mut self, completed: u64, now: Instant) -> Option<(u32, Kind)> {
+        let &(fence, pair) = self.pending.first()?;
+        let slot = self.entries[pair as usize].as_mut().expect("pending timestamp pair");
+        let (_, sent) = slot.submitted.expect("a timestamp pair's submission");
+        if fence > completed || now.saturating_duration_since(sent) < AFTER {
+            return None;
+        }
+        self.pending.pop_first();
+        slot.submitted = None;
+        let kind = slot.kind;
+        if !slot.owned {
+            self.give_back(pair);
+        }
+        Some((pair, kind))
     }
 }
 
 struct Meter {
     heap: ID3D12QueryHeap,
+    fence: ID3D12Fence,
     back: ID3D12Resource,
     /// The read-back buffer's bytes, mapped for good.
     mapped: usize,
     /// Ticks a second of the queue's clock.
     frequency: u64,
-    next: u32,
-    /// Pairs recorded and not read yet: place, kind, when recorded.
-    pending: std::collections::VecDeque<(u32, Kind, std::time::Instant)>,
-    /// What each place held when it was last read: a place the card has
-    /// not written since (its list never ran) still holds that, and is
-    /// not counted again.
-    seen: Vec<(u64, u64)>,
+    slots: Slots,
 }
 
 // SAFETY: host objects (free-threaded) and a mapping only read, behind a lock.
@@ -127,37 +193,32 @@ fn make() -> Option<Meter> {
         tracing::info!(
             "the card's time is measured by kind of list, a timestamp where each list begins and ends (VICTORY_CARD_METER=0: not)"
         );
-        Some(Meter { heap, back, mapped: mapped as usize, frequency, next: 0, pending: Default::default(), seen: vec![(0, 0); PAIRS as usize] })
+        Some(Meter {
+            heap, fence: host.completion_fence().clone(), back, mapped: mapped as usize, frequency,
+            slots: Slots::new(PAIRS),
+        })
     }
 }
 
 /// A list of `kind` begins here: the first timestamp of a pair.
-pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
+pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Option<Span> {
     if !on() {
-        return Span::NONE;
+        return None;
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(m) = meter.get_or_insert_with(make) else {
-        return Span::NONE;
-    };
-    // The ring must not come round to pairs that were not read yet.
-    if m.pending.len() as u32 >= PAIRS - 64 {
-        return Span::NONE;
-    }
-    let pair = m.next;
-    m.next = (m.next + 1) % PAIRS;
-    m.pending.push_back((pair, kind, std::time::Instant::now()));
+    let m = meter.get_or_insert_with(make).as_mut()?;
+    let pair = m.slots.reserve(kind)?;
     // SAFETY: an open list and our query heap.
     unsafe { list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2) };
-    Span(pair)
+    Some(Span(pair))
 }
 
 /// The list ends here: the pair's second timestamp, and both go to the
 /// read-back buffer when the card has run the list.
-pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
-    if span.0 == u32::MAX {
+pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Option<&Span>) {
+    let Some(span) = span else {
         return;
-    }
+    };
     let meter = METER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(m)) = meter.as_ref() else {
         return;
@@ -167,6 +228,21 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
     unsafe {
         list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2 + 1);
         list.ResolveQueryData(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2, 2, &m.back, u64::from(span.0) * 16);
+    }
+}
+
+/// Registers the fence before the direct queue can write a reused pair.
+/// The caller keeps every span alive until submission.
+pub(crate) fn submitted(fence: u64, pairs: &[u32]) {
+    if pairs.is_empty() {
+        return;
+    }
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(m)) = meter.as_mut() {
+        let now = Instant::now();
+        for &pair in pairs {
+            m.slots.submit(pair, fence, now);
+        }
     }
 }
 
@@ -180,8 +256,7 @@ fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
     ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
 }
 
-/// The pairs recorded long enough ago are read and added to the frame
-/// log's totals. Called once a frame.
+/// Adds the completed, aged pairs to the frame log. Called once a frame.
 pub(crate) fn collect() {
     if !on() {
         return;
@@ -190,21 +265,22 @@ pub(crate) fn collect() {
     let Some(Some(m)) = meter.as_mut() else {
         return;
     };
-    let now = std::time::Instant::now();
-    while let Some(&(pair, kind, at)) = m.pending.front() {
-        if now.duration_since(at) < AFTER {
-            break;
-        }
-        m.pending.pop_front();
-        // SAFETY: the pair's sixteen bytes of the mapped read-back buffer;
-        // the card wrote them long ago or never.
+    // SAFETY: this is the direct queue's completion fence.
+    let completed = unsafe { m.fence.GetCompletedValue() };
+    if completed == u64::MAX {
+        return; // the device was removed
+    }
+    collect_ready(m, completed, Instant::now());
+}
+
+fn collect_ready(m: &mut Meter, completed: u64, now: Instant) {
+    while let Some((pair, kind)) = m.slots.take_ready(completed, now) {
+        // SAFETY: the fence covers both writes to the pair's readback bytes.
+        // The meter lock keeps a new submission from writing them meanwhile.
         let (begin, end) = unsafe {
             let p = (m.mapped as *const u64).add(pair as usize * 2);
             (p.read_volatile(), p.add(1).read_volatile())
         };
-        if std::mem::replace(&mut m.seen[pair as usize], (begin, end)) == (begin, end) {
-            continue;
-        }
         let us = micros(begin, end, m.frequency);
         use crate::framelog::{T, add};
         match kind {
@@ -227,6 +303,106 @@ pub(crate) fn collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unsubmitted_list_reserves_its_pair() {
+        let mut slots = Slots::new(2);
+        let older = slots.reserve(Kind::Lists).unwrap();
+        let newer = slots.reserve(Kind::Sync).unwrap();
+        assert_ne!(older, newer);
+        assert!(slots.reserve(Kind::Check).is_none());
+        assert_eq!(slots.take_ready(10, Instant::now() + AFTER), None);
+        assert!(slots.reserve(Kind::Check).is_none());
+        slots.release(newer);
+        assert_eq!(slots.reserve(Kind::Check), Some(newer));
+    }
+
+    #[test]
+    fn dropping_a_submitted_list_keeps_its_pair_until_the_fence_and_sample() {
+        let mut slots = Slots::new(1);
+        let pair = slots.reserve(Kind::Check).unwrap();
+        let now = Instant::now();
+        slots.submit(pair, 9, now);
+        slots.release(pair);
+
+        assert_eq!(slots.take_ready(9, now), None);
+        assert_eq!(slots.take_ready(8, now + AFTER), None);
+        assert!(slots.reserve(Kind::Lists).is_none());
+        assert_eq!(slots.take_ready(9, now + AFTER), Some((pair, Kind::Check)));
+        assert_eq!(slots.reserve(Kind::Lists), Some(pair));
+    }
+
+    #[test]
+    fn a_resubmitted_pair_waits_for_its_latest_write() {
+        let mut slots = Slots::new(2);
+        let repeated = slots.reserve(Kind::Lists).unwrap();
+        let between = slots.reserve(Kind::Sync).unwrap();
+        let now = Instant::now();
+        slots.submit(repeated, 3, now);
+        slots.submit(between, 4, now);
+        slots.submit(repeated, 5, now);
+        assert_eq!(slots.take_ready(3, now + AFTER), None);
+        assert_eq!(slots.take_ready(4, now + AFTER), Some((between, Kind::Sync)));
+        assert_eq!(slots.take_ready(4, now + AFTER), None);
+        assert_eq!(slots.take_ready(5, now + AFTER), Some((repeated, Kind::Lists)));
+        assert_eq!(slots.take_ready(5, now + AFTER), None);
+        assert!(slots.reserve(Kind::Check).is_none());
+    }
+
+    #[test]
+    fn a_host_submission_resolves_its_owned_pair() {
+        if !on() {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "a WARP host is required");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        list.close();
+        list.reset();
+        list.close();
+        let pair = list.meter_pair().expect("the closed list owns its timestamp pair");
+        host.execute(&[&list]);
+
+        let mut meter = METER.lock().unwrap();
+        let m = meter.as_mut().unwrap().as_mut().unwrap();
+        let (signal, at) = m.slots.entries[pair as usize].as_ref().unwrap().submitted.unwrap();
+        // SAFETY: the fence belongs to the queue that executed the list.
+        let completed = unsafe { m.fence.GetCompletedValue() };
+        assert!(completed != u64::MAX && completed >= signal);
+        // SAFETY: the queue completed the submission that resolved the pair.
+        let (begin, end) = unsafe {
+            let p = (m.mapped as *const u64).add(pair as usize * 2);
+            (p.read_volatile(), p.add(1).read_volatile())
+        };
+        assert!(end > 0 && end >= begin, "invalid timestamps {begin}, {end}");
+        collect_ready(m, completed, at + AFTER);
+        let slot = m.slots.entries[pair as usize].as_ref().unwrap();
+        assert_eq!(slot.submitted, None);
+        assert!(slot.owned);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_grouped_empty_submission_signals_the_direct_queue() {
+        if std::env::var_os("VICTORY_GPU_TIMING").is_none() {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "a WARP host is required");
+            return;
+        };
+        // SAFETY: the direct queue's live fence; the submission waits for
+        // its own signal before returning.
+        let before = unsafe { host.completion_fence().GetCompletedValue() };
+        host.execute(&[]);
+        let after = unsafe { host.completion_fence().GetCompletedValue() };
+        assert!(
+            after != u64::MAX && after > before,
+            "an empty timed submission needs a new completion signal"
+        );
+    }
 
     #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {

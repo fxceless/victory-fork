@@ -845,7 +845,7 @@ pub(crate) struct HostList {
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
-    meter: AtomicU32,
+    meter: Mutex<Option<crate::cardmeter::Span>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1855,6 +1855,8 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// The timestamp pairs recorded into the sync and compare lists.
+    timings: [Option<crate::cardmeter::Span>; 2],
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
     sent_as: u64,
@@ -3797,7 +3799,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
-                meter: AtomicU32::new(u32::MAX),
+                meter: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4084,6 +4086,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut sync_timing = None;
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -4140,7 +4143,7 @@ impl Host {
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<Option<crate::cardmeter::Span>> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
@@ -4195,15 +4198,16 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
-                    crate::cardmeter::end(list, timed);
+                    crate::cardmeter::end(list, timed.as_ref());
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
+                    Ok(timed)
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
-            }
+            sync_timing = match recorded {
+                Ok(timed) => timed,
+                Err(e) => fail(format_args!("host copies in the card's memory could not be brought up to date ({e})")),
+            };
             used.push((false, sync));
         }
         numbered();
@@ -4213,6 +4217,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            timings: [sync_timing, None],
             sent_as,
             inflight: false,
             inflight_landed: 0,
@@ -4258,7 +4263,7 @@ impl Host {
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
             let recorded = unsafe {
-                (|| -> windows::core::Result<ID3D12CommandList> {
+                (|| -> windows::core::Result<(ID3D12CommandList, Option<crate::cardmeter::Span>)> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Check);
@@ -4320,13 +4325,16 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
-                    crate::cardmeter::end(list, timed);
+                    crate::cardmeter::end(list, timed.as_ref());
                     list.Close()?;
-                    list.cast()
+                    Ok((list.cast()?, timed))
                 })()
             };
             match recorded {
-                Ok(list) => plan.check = Some(list),
+                Ok((list, timed)) => {
+                    plan.check = Some(list);
+                    plan.timings[1] = timed;
+                }
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
             }
             plan.lists.push((true, check));
@@ -5428,9 +5436,19 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        let time_submission = |fence| {
+            if crate::cardmeter::on() {
+                let mut pairs: Vec<_> = runs.iter().filter_map(|list| list.meter_pair()).collect();
+                if let Some(card) = &card {
+                    pairs.extend(card.timings.iter().flatten().map(crate::cardmeter::Span::pair));
+                }
+                crate::cardmeter::submitted(fence, &pairs);
+            }
+        };
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            time_submission(*submitted);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -5455,9 +5473,10 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each title list timed on its own. Without title
+        // lists, one signal still covers any auxiliary work.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() && !runs.is_empty() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -5468,13 +5487,17 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // The final signal covers every title list and the auxiliary lists.
+        time_submission(*submitted + groups.len() as u64);
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5494,10 +5517,10 @@ impl Host {
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
-            if timing() {
+            if let Some(run) = runs.get(i).filter(|_| timing()) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                for (ms, op) in run.slowest(frequency, usize::MAX) {
                     crate::copystat::command_took(&op, ms);
                 }
             }
@@ -5505,12 +5528,12 @@ impl Host {
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let Some(run) = runs.get(i).filter(|_| timing() && started.elapsed() > std::time::Duration::from_millis(50)) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in run.slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
@@ -5770,6 +5793,11 @@ impl Host {
         unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
     }
 
+    /// The direct queue's fence, signalled behind host submissions.
+    pub(crate) fn completion_fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
     pub(crate) fn log_messages(&self) -> Option<String> {
@@ -5923,7 +5951,10 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
-        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)));
+        if crate::cardmeter::on() {
+            let timed = self.meter.lock().unwrap_or_else(|e| e.into_inner());
+            crate::cardmeter::end(&self.list, timed.as_ref());
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5939,6 +5970,14 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+    }
+
+    pub(crate) fn meter_pair(&self) -> Option<u32> {
+        self.meter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(crate::cardmeter::Span::pair)
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -5971,8 +6010,11 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        self.meter
-            .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
+        if crate::cardmeter::on() {
+            let mut timed = self.meter.lock().unwrap_or_else(|e| e.into_inner());
+            drop(timed.take());
+            *timed = crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
