@@ -134,7 +134,13 @@ impl GraphicsState {
                     );
                     self.names = elements
                         .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
+                        .map(|e| {
+                            if e.SemanticName.0.is_null() {
+                                CString::default()
+                            } else {
+                                CStr::from_ptr(e.SemanticName.0.cast()).to_owned()
+                            }
+                        })
                         .collect();
                     self.inputs = elements
                         .iter()
@@ -1315,5 +1321,42 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    #[test]
+    fn input_layout_with_null_semantic_name_does_not_dereference_null() {
+        let elements = [
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR::null(),
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                ..Default::default()
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(c"POSITION".as_ptr().cast()),
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                ..Default::default()
+            },
+        ];
+        #[repr(C)]
+        struct Subobject {
+            kind: u32,
+            _pad: u32,
+            layout: D3D12_INPUT_LAYOUT_DESC,
+        }
+        let sub = Subobject {
+            kind: 12,
+            _pad: 0,
+            layout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: elements.as_ptr(),
+                NumElements: elements.len() as u32,
+            },
+        };
+        let mut state = GraphicsState::default();
+        // SAFETY: `sub` is a well-formed kind-12 input layout subobject.
+        unsafe { state.read(12, (&raw const sub).cast()) };
+        assert_eq!(state.names.len(), 2);
+        assert_eq!(state.names[0].as_bytes(), b"");
+        assert_eq!(state.names[1].as_bytes(), b"POSITION");
+        assert_eq!(state.inputs.len(), 2);
     }
 }

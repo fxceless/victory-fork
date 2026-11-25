@@ -176,9 +176,31 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
+/// Whether `len` bytes hold `h` rows of `w` elements (`bpp` bytes each)
+/// laid out `pitch` bytes apart, with the final row unpadded as D3D12's
+/// `GetCopyableFootprints` `pTotalBytes` reports.
+fn rows_fit(w: usize, h: usize, pitch: usize, bpp: usize, len: usize) -> bool {
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let Some(row_bytes) = w.checked_mul(bpp) else {
+        return false;
+    };
+    if pitch < row_bytes {
+        return false;
+    }
+    (h - 1)
+        .checked_mul(pitch)
+        .and_then(|start| start.checked_add(row_bytes))
+        .is_some_and(|need| need <= len)
+}
+
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    if !rows_fit(width as usize, height as usize, pitch, 4, rows.len()) {
+        return;
+    }
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -233,12 +255,13 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer.
+/// readback buffer, returning the buffer, footprint, and exact byte size
+/// (`pTotalBytes` from `GetCopyableFootprints`).
 pub(crate) fn read_back(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64)> {
     read_back_of(device, list, texture, 0)
 }
 
@@ -249,7 +272,7 @@ fn read_back_of(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
     sub: u32,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -265,6 +288,9 @@ fn read_back_of(
             None,
             Some(&mut total),
         );
+    }
+    if total == 0 {
+        return None;
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
@@ -312,7 +338,7 @@ fn read_back_of(
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint))
+        Some((buffer, footprint, total))
     }
 }
 
@@ -321,6 +347,7 @@ pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    total: u64,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
@@ -331,14 +358,16 @@ pub(crate) fn save_read_back(
             return;
         }
     };
+    let Ok(len) = usize::try_from(total) else {
+        return;
+    };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
+    // readback buffer was created with `Width == total`.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -428,22 +457,24 @@ fn dump_one(
     let (read, stencil) = read;
     list.close();
     host.execute(&[&list]);
-    if let Some((buffer, footprint)) = stencil {
-        stencil_values(&buffer, &footprint, frame, resource);
+    if let Some((buffer, footprint, total)) = stencil {
+        stencil_values(&buffer, &footprint, total, frame, resource);
     }
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint, total)) = read else { return };
+    let Ok(len) = usize::try_from(total) else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    // SAFETY: the copy finished; the readback buffer was created with
+    // `Width == total`.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
-        if matches!(d.Format.0, 44..=47) {
+        if matches!(d.Format.0, 44..=47) && rows_fit(f.Width as usize, f.Height as usize, pitch, 4, rows.len()) {
             let mut depths = std::collections::HashMap::<u32, u32>::new();
             let mut tops = std::collections::HashMap::<u32, u32>::new();
             for y in 0..f.Height as usize {
@@ -480,19 +511,26 @@ fn dump_one(
 fn stencil_values(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    total: u64,
     frame: u64,
     resource: crate::object::This,
 ) {
     let f = footprint.Footprint;
     let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let Ok(len) = usize::try_from(total) else {
+        return;
+    };
+    if !rows_fit(w, h, pitch, 1, len) {
+        return;
+    }
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows of
-    // one byte a texel, the last row without its padding.
+    // SAFETY: the copy finished; the readback buffer was created with
+    // `Width == total`, and `rows_fit` verified every accessed byte lies in it.
     unsafe {
-        if h == 0 || w == 0 || buffer.Map(0, None, Some(&mut data)).is_err() {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         let mut values = [0u32; 256];
         let mut bits = [0u32; 8];
         // Left, top, right, bottom of the texels with bit 3.
@@ -561,7 +599,6 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
@@ -569,6 +606,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            if !rows_fit(w, h, pitch, 4, rows.len()) {
+                return None;
+            }
+            let mut out = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -579,6 +620,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
+            if !rows_fit(w, h, pitch, 4, rows.len()) {
+                return None;
+            }
+            let mut out = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -613,6 +658,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
+    if !rows_fit(w, h, pitch, n, rows.len()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
     let values: Vec<[f32; 3]> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
@@ -859,5 +908,36 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// `GetCopyableFootprints` omits trailing row-pitch padding after the
+    /// last row (`total = (h - 1) * pitch + w * bpp`, strictly smaller than
+    /// `h * pitch` whenever `w * bpp < pitch`). `to_rgba` and `rows_fit`
+    /// must accept exact `total`-sized buffers and reject short ones without
+    /// panicking or slicing past the readback buffer.
+    #[test]
+    fn unpadded_last_row_fits_and_short_buffer_is_rejected() {
+        // 5x2 RGBA8 with 256-byte row pitch: total = 256 + 20 = 276 (< 512).
+        let (w, h, pitch) = (5usize, 2usize, 256usize);
+        let total = (h - 1) * pitch + w * 4;
+        assert!(total < h * pitch);
+        assert!(super::rows_fit(w, h, pitch, 4, total));
+        assert!(!super::rows_fit(w, h, pitch, 4, total - 1));
+        assert!(!super::rows_fit(0, h, pitch, 4, total));
+        assert!(!super::rows_fit(w, h, 4, 4, total)); // pitch < row_bytes
+
+        let mut buf = vec![0u8; total];
+        buf[0..4].copy_from_slice(&[10, 20, 30, 40]);
+        buf[pitch + 16..pitch + 20].copy_from_slice(&[50, 60, 70, 80]);
+        let rgba = super::to_rgba(28, w, h, pitch, &buf).expect("exact total fits");
+        assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&rgba[(w * h - 1) * 4..], &[50, 60, 70, 255]);
+
+        // One byte short must return None rather than panicking.
+        assert_eq!(super::to_rgba(28, w, h, pitch, &buf[..total - 1]), None);
+        // Same for decoded float/integer formats (R16G16B16A16_UNORM, 8 B/px).
+        let total16 = (h - 1) * pitch + w * 8;
+        assert!(super::to_rgba(11, w, h, pitch, &vec![0u8; total16]).is_some());
+        assert_eq!(super::to_rgba(11, w, h, pitch, &vec![0u8; total16 - 1]), None);
     }
 }

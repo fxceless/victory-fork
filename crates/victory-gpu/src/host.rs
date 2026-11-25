@@ -8001,8 +8001,8 @@ impl Host {
                 None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            if let Some((buffer, footprint, total)) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint, total);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
