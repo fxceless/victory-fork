@@ -60,8 +60,20 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(
+                key = %self.key, thread = ?std::thread::current().id(), shaders = ?self.shaders,
+                "host pipeline build started"
+            );
+            let pipeline = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(
+                key = %self.key, thread = ?std::thread::current().id(), made = pipeline.is_some(),
+                "host pipeline build finished"
+            );
+            pipeline
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();

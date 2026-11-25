@@ -1,5 +1,21 @@
 # Diagnostic logs
 
+## Trace pipeline builds at startup
+
+In PowerShell, set `$titleExe` to the path of your local title executable and run the diagnostics build.
+
+```powershell
+$env:VICTORY_LOG = 'info,victory_gpu::pipeline::make=debug'
+.\target\diag\victory.exe run $titleExe --execute 2> "$env:TEMP\victory-pipelines.log"
+```
+
+Each `host pipeline build started` line gives the pipeline key used in `early-pipelines.txt` and
+the stage and hash of each shader. Match `key` and `thread` to `host pipeline build finished`.
+`made=false` means the build returned without a host pipeline. A start without a finish identifies
+a build still outstanding when the log stopped. Several builds can overlap before the first frame.
+
+## Published runs
+
 Logs of short diagnostics runs on the test machine (Windows 11, Intel i7-14700KF, NVIDIA RTX 4070
 12 GB, 32 GB RAM), for people who want to suggest changes from real numbers.
 
