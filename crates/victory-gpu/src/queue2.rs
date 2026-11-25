@@ -1,5 +1,5 @@
-//! More queues on the card, for copies only (`VICTORY_QUEUE2`; off by
-//! default): work of ours that does not depend on the order of the title's
+//! More queues on the card, for copies only (`VICTORY_QUEUE2`; the down
+//! lane is on by default, `VICTORY_QUEUE2=0` turns it off): work of ours that does not depend on the order of the title's
 //! draws goes to a copy queue of its own and no longer stands in the one
 //! direct queue behind them. A copy queue runs on the card's copy engine,
 //! beside the engine that draws.
@@ -60,8 +60,12 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-/// `VICTORY_QUEUE2`, a sum of bits; unset or 0: off, everything goes
+/// `VICTORY_QUEUE2`, a sum of bits; unset: 1; 0: off, everything goes
 /// through the one direct queue as before.
+///
+/// On by default (bit 1) since an RTX 4070 run with the relay: the frame
+/// line's "copying back" went from 121-136 ms to 41.5 ms a frame, and the
+/// copy-back thread's wait for fetches from about 121 ms to 7.
 ///
 /// - 1: fetches of what shaders wrote to copies in the card's memory go to
 ///   a copy queue (the gain is with `VICTORY_RELAY=1`/`2`; without the
@@ -75,7 +79,7 @@ use windows::core::Interface;
 /// Read once, when the first submission asks.
 pub(crate) fn bits() -> u32 {
     static BITS: OnceLock<u32> = OnceLock::new();
-    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3)
+    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").map_or(Some(1), |v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3)
 }
 
 /// The most bytes of landing buffers in the card's memory, for title

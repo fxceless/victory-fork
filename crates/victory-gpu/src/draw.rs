@@ -140,8 +140,14 @@ struct Window {
 const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW`; on by
+/// default, `=0` turns it off; off by default with
+/// `VICTORY_CARD_FETCH_INFLIGHT=1`, the one run with a device loss since the
+/// fix below had both on).
+///
+/// On by default since a ten-and-a-half-minute run on an RTX 4070 with no
+/// device loss: the card's time for the title's lists went from about 85
+/// to 37-43 ms a frame, and the frame from about 174 ms to 144-154.
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -187,7 +193,10 @@ const WINDOW_MOST: u64 = 64;
 /// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_INDIRECT_WINDOW") {
+        Some(v) => v == "1",
+        None => std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_none_or(|v| v != "1"),
+    }) && !crate::drvwatch::tripped()
 }
 
 /// Whether a record that is not on the window's walk opens a window of its
@@ -243,14 +252,16 @@ fn jump_windows() -> bool {
 /// such records, in place of a pass of ours in front of its draw
 /// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
 /// seconds with, twenty without, in turn, each change said in the log).
-/// Off by default. Needs [`windows`].
+/// On by default (`=0`: off) since an RTX 4070 / Ryzen 5 7500F run with
+/// it, `VICTORY_BACK_OWN_VIEW` and `VICTORY_JOIN_PARTS`: 125-127 ms a frame
+/// against 134-137. Needs [`windows`].
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -598,10 +609,11 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
+/// Counts a draw not run on the host by its reason, and marks the last
+/// traced draw (diagnostics).
 fn dropped(pipeline: usize) {
     crate::pipeline::note_drop(pipeline as This);
+    #[cfg(feature = "diagnostics")]
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -2221,11 +2233,9 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -2234,11 +2244,9 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         };
         if !p.compute {
@@ -2539,7 +2547,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2938,7 +2945,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -3042,7 +3048,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -3082,12 +3087,8 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };

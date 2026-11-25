@@ -429,8 +429,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut held = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -1390,6 +1390,25 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    // Blocks the lazy copy-back keeps from the CPU (`crate::lazyback`) are
+    // its own: their protection is not ours to change.
+    if crate::lazyback::any_card_only() {
+        let mut at = from;
+        for block in from..to {
+            if crate::lazyback::is_card_only(block * BLOCK) {
+                if at < block {
+                    protect(g, at, block);
+                }
+                at = block + 1;
+            }
+        }
+        if at > from {
+            if at < to {
+                protect(g, at, to);
+            }
+            return;
+        }
+    }
     protect_here(g, from, to);
     if !view_guard() {
         return;
@@ -1418,6 +1437,19 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// The 64 KiB block at `at` leaves the guards (the lazy copy-back takes
+/// its protection over, `crate::lazyback`): it is no longer counted as
+/// guarded or clean. Whether it was guarded.
+pub(crate) fn release(at: usize) -> bool {
+    let block = at / BLOCK;
+    let mut g = guards();
+    let was = g.protected.remove(&block);
+    g.clean.remove(&block);
+    g.viewed.remove(&block);
+    g.aliased.remove(&block);
+    was
+}
+
 /// Views of one page past which its views are not guarded together.
 pub(crate) const MANY_VIEWS: usize = 64;
 
@@ -1444,7 +1476,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || crate::lazyback::is_card_only(block * BLOCK) {
         return;
     }
     let mut old = 0;
@@ -1583,6 +1615,14 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // A page the lazy copy-back keeps from the CPU is given back first: the
+    // kernel cannot write a page with no access (`crate::lazyback`). Only
+    // while there is one: with the call made at every file read of the
+    // title's, the game crashed as its first cutscene started (a write to
+    // 0 in its own code), with no page card-only yet.
+    if crate::lazyback::any_card_only() {
+        crate::lazyback::touched(at, len.min(usize::MAX - at));
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -1892,6 +1932,7 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,

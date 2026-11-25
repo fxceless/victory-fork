@@ -1285,6 +1285,62 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The masked merge (`crate::host::CARD_MASK`) on the software adapter:
+    /// the card's side takes the title's byte exactly where the mask has a
+    /// bit, including single bytes of a word, and keeps its own bytes (what
+    /// shaders wrote) everywhere else, also outside the masked stretch.
+    #[test]
+    fn warp_card_mask_takes_only_the_masked_bytes() {
+        use crate::shadow::Masked;
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let merge = compile_cs(&warp.device, crate::host::CARD_MASK).expect("the card mask must compile on WARP");
+        const SIZE: usize = 512;
+        let (_title, title_ptr, title_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        let title: Vec<u8> = (0..SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        let card: Vec<u8> = (0..SIZE).map(|i| !((i * 7 + 3) as u8)).collect();
+        // SAFETY: each mapping holds `SIZE` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), title_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(card.as_ptr(), card_ptr, SIZE);
+        }
+        // Runs of the stretch at offset 69: a lone byte, a run across a
+        // word's edge, a long run, the stretch's last byte.
+        let at = 69;
+        let runs = [(0usize, 1usize), (6, 5), (40, 70), (150, 1)];
+        let m = Masked::of_runs(at, &runs);
+        // The mask a few words into its buffer, as masks of other pages lie
+        // before it.
+        const MASK_AT: usize = 12;
+        let (_mask, mask_ptr, mask_gpu) = warp.shared_buffer((MASK_AT + 4 * m.bits.len()) as u64);
+        // SAFETY: the mapping holds the mask past `MASK_AT`.
+        unsafe { std::ptr::copy_nonoverlapping(m.bits.as_ptr().cast::<u8>(), mask_ptr.add(MASK_AT), 4 * m.bits.len()) };
+        let words = ((m.to - m.from) / 4) as u32;
+        // SAFETY: our open list, live buffers, the shader's own root
+        // signature; the dispatch stays inside the buffers.
+        unsafe {
+            warp.list.SetComputeRootSignature(&merge.root);
+            warp.list.SetPipelineState(&merge.pso);
+            let constants = [m.from as u32, words, MASK_AT as u32, 0];
+            warp.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, title_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, mask_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            warp.list.Dispatch(words.div_ceil(64), 1, 1);
+        }
+        warp.submit_and_wait();
+        let mut got = vec![0u8; SIZE];
+        // SAFETY: the mapping holds `SIZE` bytes, and the card is done.
+        unsafe { std::ptr::copy_nonoverlapping(card_ptr, got.as_mut_ptr(), SIZE) };
+        let masked = |b: usize| runs.iter().any(|&(r, n)| b >= at + r && b < at + r + n);
+        for b in 0..SIZE {
+            let want = if masked(b) { title[b] } else { card[b] };
+            assert_eq!(got[b], want, "byte {b} (masked: {})", masked(b));
+        }
+    }
+
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, in one list behind the compare as `Host::card_before`
     /// records it: each flagged piece takes a ticket and, while it is

@@ -573,15 +573,18 @@ thread_local! {
 /// next ones are prepared. Each queue with a part taken keeps the mark
 /// [`Held::Running`] at the head of its line until the part is sent:
 /// what the title gives the queue meanwhile, signals too, stays behind.
+/// On by default (`VICTORY_JOIN_PARTS=0`: off) since an RTX 4070 / Ryzen 5
+/// 7500F run with it, `VICTORY_BACK_OWN_VIEW` and `VICTORY_INDIRECT_GATHER`:
+/// 125-127 ms a frame against 134-137.
 #[cfg(windows)]
 fn join_parts() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| {
         let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
-            Ok("1") => 1,
+            Ok("0") => 0,
             Ok("alt") => 2,
-            _ => 0,
+            _ => 1,
         };
         if mode != 0 {
             tracing::info!(
