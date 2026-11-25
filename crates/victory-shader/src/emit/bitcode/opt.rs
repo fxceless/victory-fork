@@ -52,8 +52,10 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Single-predecessor linear blocks merged into their predecessor.
+pub const MERGE: u32 = 64;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | MERGE;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
 
@@ -114,6 +116,53 @@ fn opposite(p: u8) -> u8 {
         _ => pred::SGE,
     }
 }
+
+/// The comparison that holds on `(b, a)` exactly when `p` holds on `(a, b)`.
+fn swap_pred(p: u8) -> u8 {
+    match p {
+        0..=15 => (p & 9) | ((p & 2) << 1) | ((p & 4) >> 1),
+        pred::EQ => pred::EQ,
+        pred::NE => pred::NE,
+        pred::IUGT => pred::IULT,
+        pred::IULT => pred::IUGT,
+        pred::IUGE => pred::IULE,
+        pred::IULE => pred::IUGE,
+        pred::SGT => pred::SLT,
+        pred::SLT => pred::SGT,
+        pred::SGE => pred::SLE,
+        pred::SLE => pred::SGE,
+        _ => p,
+    }
+}
+
+/// Canonical operand order for a comparison `(p, a, b)`.
+fn canonical_cmp(p: u8, a: V, b: V) -> (u8, V, V) {
+    if b < a {
+        (swap_pred(p), b, a)
+    } else {
+        (p, a, b)
+    }
+}
+
+/// Constant folding for `dx.op.binary.i32` min/max opcodes (37..=40).
+fn fold_binary_i32(op: u64, x: u64, y: u64) -> Option<u64> {
+    let (ux, uy) = (x as u32, y as u32);
+    let (sx, sy) = (ux as i32, uy as i32);
+    Some(u64::from(match op {
+        37 => sx.max(sy) as u32, // IMax
+        38 => sx.min(sy) as u32, // IMin
+        39 => ux.max(uy),        // UMax
+        40 => ux.min(uy),        // UMin
+        _ => return None,
+    }))
+}
+
+/// Disjoint state classes an `Effect::Writes` instruction may clobber
+/// within a basic block.
+const CLOBBER_LDS: u8 = 1;
+const CLOBBER_MEM: u8 = 2;
+const CLOBBER_LANES: u8 = 4;
+const CLOBBER_ALL: u8 = CLOBBER_LDS | CLOBBER_MEM | CLOBBER_LANES;
 
 /// What holds in the block being walked: values that are a known bit there,
 /// and comparisons (by their operands) with a known outcome.
@@ -203,6 +252,10 @@ pub(super) fn effect(f: &Func) -> Effect {
         {
             Effect::Pure
         }
+        // A thread's lane index and the wave's lane count never change.
+        Some(Attr::ReadOnly) if name == "waveGetLaneIndex" || name == "waveGetLaneCount" => {
+            Effect::Pure
+        }
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
@@ -215,7 +268,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | MERGE) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -223,6 +276,9 @@ impl Module {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
                     changed |= self.prune();
+                }
+                if passes & MERGE != 0 {
+                    changed |= self.merge_blocks();
                 }
                 if !changed {
                     break;
@@ -368,12 +424,17 @@ impl Module {
                 };
                 self.learn(x, holds != (k != 0), facts, learned, depth - 1);
             }
-            // The opposite comparison of the same operands.
+            // The comparison itself and its opposite, in canonical operand order.
             Op::Cmp(p, a, b) => {
-                let key = (opposite(p), a, b);
-                if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
-                    e.insert(!holds);
-                    learned.compares.push(key);
+                for (key, value) in [
+                    (canonical_cmp(p, a, b), holds),
+                    (canonical_cmp(opposite(p), a, b), !holds),
+                ] {
+                    if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key)
+                    {
+                        e.insert(value);
+                        learned.compares.push(key);
+                    }
                 }
             }
             _ => {}
@@ -401,6 +462,59 @@ impl Module {
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
         self.int_const(ty, signed(bits, x & mask(bits)))
+    }
+
+    /// If `v` is the boolean negation `x ^ true`, returns `x`.
+    fn not_of(&self, v: V) -> Option<V> {
+        let V::Inst(j) = v else { return None };
+        let Op::Bin(Bin::Xor, a, b) = self.insts[j as usize].op else {
+            return None;
+        };
+        match (self.int_k(a), self.int_k(b)) {
+            (None, Some((1, 1))) => Some(a),
+            (Some((1, 1)), None) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Which [`LOADS`] caches a writing instruction `i` invalidates.
+    fn write_clobbers(&self, i: u32) -> u8 {
+        match &self.insts[i as usize].op {
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => CLOBBER_LDS,
+            Op::Call(f, _) => {
+                let name = self.funcs[*f as usize].name.as_str();
+                let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                if name.starts_with("bufferStore")
+                    || name.starts_with("rawBufferStore")
+                    || name.starts_with("textureStore")
+                    || name.starts_with("atomicBinOp")
+                    || name.starts_with("atomicCompareExchange")
+                {
+                    CLOBBER_MEM
+                } else if name.starts_with("storeOutput")
+                    || name.starts_with("storePatchConstant")
+                    || name.starts_with("storeVertexOutput")
+                    || name.starts_with("storePrimitiveOutput")
+                    || matches!(
+                        name,
+                        "emitIndices"
+                            | "setMeshOutputCounts"
+                            | "emitStream"
+                            | "cutStream"
+                            | "emitThenCutStream"
+                    )
+                {
+                    0
+                } else if name == "discard" {
+                    CLOBBER_LANES
+                } else if name == "barrier" {
+                    CLOBBER_LDS | CLOBBER_MEM
+                } else {
+                    CLOBBER_ALL
+                }
+            }
+            _ => 0,
+        }
     }
 
     /// The value instruction `i` is known to have without it, if any: a
@@ -435,7 +549,7 @@ impl Module {
                     };
                     return Some(self.k(ty, bits, r));
                 }
-                match (op, ka, kb) {
+                if let Some(v) = match (op, ka, kb) {
                     (
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
@@ -451,8 +565,127 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    (Bin::Sub | Bin::Xor, _, _) if a == b => Some(self.k(ty, bits, 0)),
+                    (Bin::URem, _, Some(1)) => Some(self.k(ty, bits, 0)),
+                    (Bin::And, _, _)
+                        if bits == 1
+                            && (self.not_of(a) == Some(b) || self.not_of(b) == Some(a)) =>
+                    {
+                        Some(self.bool(false))
+                    }
+                    (Bin::Or, _, _)
+                        if bits == 1
+                            && (self.not_of(a) == Some(b) || self.not_of(b) == Some(a)) =>
+                    {
+                        Some(self.bool(true))
+                    }
                     _ => None,
+                } {
+                    return Some(v);
                 }
+                // Reassociate chained constants: `(x op k1) op k2`, `(x +/- k1) +/- k2`,
+                // and chained constant shifts.
+                if matches!(op, Bin::Add | Bin::Mul | Bin::And | Bin::Or | Bin::Xor) {
+                    let (inner, k2) = match (ka, kb) {
+                        (None, Some(k2)) => (a, k2),
+                        (Some(k2), None) => (b, k2),
+                        _ => return None,
+                    };
+                    if let V::Inst(j) = inner
+                        && let Op::Bin(op1, a1, b1) = self.insts[j as usize].op
+                    {
+                        let pair = if op1 == op {
+                            match (self.int_k(a1), self.int_k(b1)) {
+                                (None, Some((_, k1))) => Some((a1, k1)),
+                                (Some((_, k1)), None) => Some((b1, k1)),
+                                _ => None,
+                            }
+                        } else if op == Bin::Add && op1 == Bin::Sub {
+                            match (self.int_k(a1), self.int_k(b1)) {
+                                (None, Some((_, k1))) => Some((a1, 0u64.wrapping_sub(k1) & all)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((x, k1)) = pair {
+                            let combined = match op {
+                                Bin::Add => k1.wrapping_add(k2) & all,
+                                Bin::Mul => k1.wrapping_mul(k2) & all,
+                                Bin::And => k1 & k2 & all,
+                                Bin::Or => (k1 | k2) & all,
+                                Bin::Xor => (k1 ^ k2) & all,
+                                _ => unreachable!(),
+                            };
+                            match (op, combined) {
+                                (Bin::Add | Bin::Or | Bin::Xor, 0) => return Some(x),
+                                (Bin::Mul, 1) => return Some(x),
+                                (Bin::And, m) if m == all => return Some(x),
+                                (Bin::Mul | Bin::And, 0) => return Some(self.k(ty, bits, 0)),
+                                (Bin::Or, m) if m == all => return Some(self.k(ty, bits, all)),
+                                _ => {
+                                    let k = self.k(ty, bits, combined);
+                                    self.insts[i as usize].op = Op::Bin(op, x, k);
+                                    *changed = true;
+                                }
+                            }
+                        }
+                    }
+                } else if op == Bin::Sub
+                    && let (None, Some(k2)) = (ka, kb)
+                    && let V::Inst(j) = a
+                    && let Op::Bin(op1, a1, b1) = self.insts[j as usize].op
+                {
+                    if op1 == Bin::Add {
+                        let pair = match (self.int_k(a1), self.int_k(b1)) {
+                            (None, Some((_, k1))) => Some((a1, k1)),
+                            (Some((_, k1)), None) => Some((b1, k1)),
+                            _ => None,
+                        };
+                        if let Some((x, k1)) = pair {
+                            let diff = k1.wrapping_sub(k2) & all;
+                            if diff == 0 {
+                                return Some(x);
+                            }
+                            let k = self.k(ty, bits, diff);
+                            self.insts[i as usize].op = Op::Bin(Bin::Add, x, k);
+                            *changed = true;
+                        }
+                    } else if op1 == Bin::Sub
+                        && self.int_k(a1).is_none()
+                        && let Some((_, k1)) = self.int_k(b1)
+                    {
+                        let sum = k1.wrapping_add(k2) & all;
+                        if sum == 0 {
+                            return Some(a1);
+                        }
+                        let k = self.k(ty, bits, sum);
+                        self.insts[i as usize].op = Op::Bin(Bin::Sub, a1, k);
+                        *changed = true;
+                    }
+                } else if matches!(op, Bin::Shl | Bin::LShr | Bin::AShr)
+                    && let (None, Some(k2)) = (ka, kb)
+                    && k2 < u64::from(bits)
+                    && let V::Inst(j) = a
+                    && let Op::Bin(op1, x, sh1) = self.insts[j as usize].op
+                    && op1 == op
+                    && let Some((_, k1)) = self.int_k(sh1)
+                    && k1 < u64::from(bits)
+                {
+                    let sum = k1 + k2;
+                    if op == Bin::AShr {
+                        let k = self.k(ty, bits, sum.min(u64::from(bits - 1)));
+                        self.insts[i as usize].op = Op::Bin(Bin::AShr, x, k);
+                        *changed = true;
+                    } else if sum >= u64::from(bits) {
+                        return Some(self.k(ty, bits, 0));
+                    } else {
+                        let k = self.k(ty, bits, sum);
+                        self.insts[i as usize].op = Op::Bin(op, x, k);
+                        *changed = true;
+                    }
+                }
+                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -501,24 +734,54 @@ impl Module {
                 if a == b {
                     return Some(self.bool(holds(0, 0, 32)));
                 }
-                // A bit widened and tested again is the bit.
-                if p == pred::NE
-                    && self.int_k(b).is_some_and(|k| k.1 == 0)
-                    && let V::Inst(z) = a
-                    && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
-                    && self.type_of(x) == ty
-                {
-                    return Some(x);
+                if p == pred::EQ || p == pred::NE {
+                    let (var, k) = match (self.int_k(a), self.int_k(b)) {
+                        (None, Some((_, k))) => (a, k),
+                        (Some((_, k)), None) => (b, k),
+                        _ => return None,
+                    };
+                    // A bit compared with a constant, or widened and compared.
+                    let bit = if self.type_of(var) == ty {
+                        Some(var)
+                    } else if let V::Inst(z) = var
+                        && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
+                        && self.type_of(x) == ty
+                    {
+                        Some(x)
+                    } else {
+                        None
+                    };
+                    if let Some(x) = bit {
+                        if k > 1 {
+                            return Some(self.bool(p == pred::NE));
+                        }
+                        if (p == pred::EQ) == (k == 1) {
+                            return Some(x);
+                        }
+                        if let Some(inner) = self.not_of(x) {
+                            return Some(inner);
+                        }
+                        let yes = self.bool(true);
+                        self.insts[i as usize].op = Op::Bin(Bin::Xor, x, yes);
+                        *changed = true;
+                        return None;
+                    }
                 }
                 None
             }
-            Op::Select(c, mut t, mut f) => {
+            Op::Select(mut c, mut t, mut f) => {
                 if let Some((_, c)) = self.int_k(c) {
                     return Some(if c != 0 { t } else { f });
                 }
+                let mut inner = false;
+                // A select on a negated condition flips its arms.
+                if let Some(c2) = self.not_of(c) {
+                    c = c2;
+                    std::mem::swap(&mut t, &mut f);
+                    inner = true;
+                }
                 // Under the same condition an inner select is one of its
                 // operands (two guarded writes of one register in a row).
-                let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
                     && c2 == c
@@ -534,11 +797,12 @@ impl Module {
                 if t == f {
                     return Some(t);
                 }
-                if self.int_bits(ty) == Some(1)
-                    && self.int_k(t).is_some_and(|k| k.1 == 1)
-                    && self.int_k(f).is_some_and(|k| k.1 == 0)
-                {
-                    return Some(c);
+                if self.int_bits(ty) == Some(1) {
+                    let t_one = self.int_k(t).is_some_and(|k| k.1 == 1);
+                    let f_zero = self.int_k(f).is_some_and(|k| k.1 == 0);
+                    if (t_one && f_zero) || (t == c && f_zero) || (t_one && f == c) {
+                        return Some(c);
+                    }
                 }
                 if inner {
                     self.insts[i as usize].op = Op::Select(c, t, f);
@@ -600,6 +864,55 @@ impl Module {
                     _ => None,
                 }
             }
+            Op::Call(f, ref args)
+                if args.len() == 3 && self.funcs[f as usize].name == "dx.op.binary.i32" =>
+            {
+                let (op_v, a, b) = (args[0], args[1], args[2]);
+                let (_, op_code) = self.int_k(op_v)?;
+                if !(37..=40).contains(&op_code) {
+                    return None;
+                }
+                if a == b {
+                    return Some(a);
+                }
+                let (ka, kb) = (self.int_k(a).map(|k| k.1), self.int_k(b).map(|k| k.1));
+                if let (Some(x), Some(y)) = (ka, kb) {
+                    return Some(self.k(ty, 32, fold_binary_i32(op_code, x, y)?));
+                }
+                let (inner, k2) = match (ka, kb) {
+                    (None, Some(k2)) => (a, k2),
+                    (Some(k2), None) => (b, k2),
+                    _ => return None,
+                };
+                // Identity / annihilator bounds for 32-bit min/max.
+                match (op_code, k2 as u32) {
+                    (37, 0x8000_0000) | (38, 0x7FFF_FFFF) | (39, 0) | (40, u32::MAX) => {
+                        return Some(inner);
+                    }
+                    (37, 0x7FFF_FFFF) | (38, 0x8000_0000) | (39, u32::MAX) | (40, 0) => {
+                        return Some(self.k(ty, 32, k2));
+                    }
+                    _ => {}
+                }
+                // Nested same-op clamp: clamp(clamp(x, k1), k2) -> clamp(x, fold(k1, k2)).
+                if let V::Inst(j) = inner
+                    && let Op::Call(f2, ref args2) = self.insts[j as usize].op
+                    && f2 == f
+                    && args2.len() == 3
+                    && self.int_k(args2[0]).is_some_and(|(_, c)| c == op_code)
+                {
+                    let (a2, b2) = (args2[1], args2[2]);
+                    let (x, k1) = match (self.int_k(a2), self.int_k(b2)) {
+                        (None, Some((_, k1))) => (a2, k1),
+                        (Some((_, k1)), None) => (b2, k1),
+                        _ => return None,
+                    };
+                    let k = self.k(ty, 32, fold_binary_i32(op_code, k1, k2)?);
+                    self.insts[i as usize].op = Op::Call(f, vec![op_v, x, k]);
+                    *changed = true;
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -650,7 +963,10 @@ impl Module {
                 Key::Bin(*op as u8, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
-            Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
+            Op::Cmp(p, a, b) => {
+                let (p, a, b) = canonical_cmp(*p, *a, *b);
+                Key::Cmp(p, a, b)
+            }
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
             Op::Call(f, args) => Key::Call(*f, args.clone()),
@@ -709,8 +1025,11 @@ impl Module {
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
         let mut known: HashMap<Key, V> = HashMap::new();
-        // The reads of the block being walked since its last store.
-        let mut read: HashMap<Key, V> = HashMap::new();
+        // The reads of the block being walked since the last store that can
+        // clobber their class (LDS, buffers/textures, or active lanes).
+        let mut lds_reads: HashMap<Key, V> = HashMap::new();
+        let mut mem_reads: HashMap<Key, V> = HashMap::new();
+        let mut lane_reads: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -750,7 +1069,9 @@ impl Module {
                 Some(false) => no,
                 None => v,
             };
-            read.clear();
+            lds_reads.clear();
+            mem_reads.clear();
+            lane_reads.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -791,7 +1112,7 @@ impl Module {
                     bit
                 });
                 if let Op::Cmp(p, x, y) = self.insts[i as usize].op
-                    && let Some(&holds) = facts.compares.get(&(p, x, y))
+                    && let Some(&holds) = facts.compares.get(&canonical_cmp(p, x, y))
                 {
                     repl[i as usize] = Some(if holds { yes } else { no });
                     changed = true;
@@ -817,28 +1138,53 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
-                // Reads of memory, and wave operations (the same lanes run
-                // the whole block): the block's own earlier one.
+                // Reads of LDS, buffer/texture memory, and wave operations
+                // (the same lanes run the whole block): the block's own
+                // earlier one while nothing clobbers that class.
                 if passes & LOADS != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
                 {
-                    if let Some(&first) = read.get(&key) {
+                    let cache = if class == Effect::Lanes {
+                        &mut lane_reads
+                    } else if matches!(self.insts[i as usize].op, Op::Load(_)) {
+                        &mut lds_reads
+                    } else {
+                        &mut mem_reads
+                    };
+                    if let Some(&first) = cache.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
                         continue;
                     }
-                    read.insert(key, V::Inst(i));
+                    cache.insert(key, V::Inst(i));
                 }
                 if class == Effect::Writes {
-                    read.clear();
+                    let clobbers = self.write_clobbers(i);
+                    if clobbers & CLOBBER_LDS != 0 {
+                        lds_reads.clear();
+                    }
+                    if clobbers & CLOBBER_MEM != 0 {
+                        mem_reads.clear();
+                    }
+                    if clobbers & CLOBBER_LANES != 0 {
+                        lane_reads.clear();
+                    }
                 }
                 kept.push(i);
             }
             self.blocks[b].body = kept;
             if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term {
                 let c = known_bit(&facts, resolve(&repl, c));
-                self.blocks[b].term = Some(Term::CondBr(c, t, f));
+                if passes & FOLD != 0
+                    && t != f
+                    && let Some(c2) = self.not_of(c)
+                {
+                    self.blocks[b].term = Some(Term::CondBr(c2, f, t));
+                    changed = true;
+                } else {
+                    self.blocks[b].term = Some(Term::CondBr(c, t, f));
+                }
             }
             steps.push(Step::Leave(added, learned));
             for &c in tree.children[b].iter().rev() {
@@ -905,6 +1251,52 @@ impl Module {
             }
         }
         true
+    }
+
+    /// [`MERGE`]: merges each linear block `b` whose sole reachable
+    /// predecessor jumps unconditionally to it (`a -> b`) and whose joins are
+    /// gone into `a`, updating `b`'s successors' joins to name `a`.
+    fn merge_blocks(&mut self) -> bool {
+        let mut reached = self.reached();
+        let mut pred_count = vec![0usize; self.blocks.len()];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &s in successors(blk.term).iter() {
+                pred_count[s] += 1;
+            }
+        }
+        let mut changed = false;
+        for a in 0..self.blocks.len() {
+            if !reached[a] {
+                continue;
+            }
+            while let Some(Term::Br(b)) = self.blocks[a].term {
+                if b == 0 || b == a || pred_count[b] != 1 || !self.blocks[b].phis.is_empty() {
+                    break;
+                }
+                let mut body = std::mem::take(&mut self.blocks[b].body);
+                self.blocks[a].body.append(&mut body);
+                let term = self.blocks[b].term.take();
+                self.blocks[a].term = term;
+                reached[b] = false;
+                for &s in successors(term).iter() {
+                    for n in 0..self.blocks[s].phis.len() {
+                        let p = self.blocks[s].phis[n];
+                        if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
+                            for (_, from) in incoming.iter_mut() {
+                                if *from == b {
+                                    *from = a;
+                                }
+                            }
+                        }
+                    }
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Whether instruction `i` must stay whatever reads it.
@@ -1520,7 +1912,7 @@ mod tests {
         let q = m.phi(join, i32t);
         m.set_phi(q, vec![(p, meet), (y, other)]);
         m.call(join, writes, vec![q, q]);
-        m.optimise(ALL);
+        m.optimise(FOLD | FACTS | DEAD);
         assert!(matches!(m.blocks[then].term, Some(Term::Br(t)) if t == deep));
         assert_eq!(stores(&m, meet), [[x, x]]);
         assert!(m.blocks[meet].phis.is_empty());
@@ -1529,6 +1921,14 @@ mod tests {
             panic!()
         };
         assert_eq!(incoming, &vec![(x, meet), (y, other)]);
+        // Merging single-predecessor blocks collapses `then -> deep -> meet` into `then`.
+        m.optimise(MERGE | DEAD);
+        assert!(matches!(m.blocks[then].term, Some(Term::Br(t)) if t == join));
+        assert_eq!(stores(&m, then), [[x, x]]);
+        let Op::Phi(incoming) = &m.insts[m.blocks[join].phis[0] as usize].op else {
+            panic!()
+        };
+        assert_eq!(incoming, &vec![(x, then), (y, other)]);
         let _ = b;
         m.write();
     }
@@ -2114,8 +2514,10 @@ mod tests {
                 REUSE,
                 FACTS,
                 LOADS,
+                MERGE,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
+                FOLD | MERGE | DEAD,
                 ALL,
             ] {
                 let mut m = random_program(seed);
@@ -2132,5 +2534,300 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn chained_constants_shifts_negations_and_clamps_fold() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let i1t = m.int(1);
+        let void = m.void();
+        let read_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let bin3_ty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        m.ptr(read_ty);
+        m.ptr(bin3_ty);
+        let reads = m.function("dx.op.bufferLoad.i32", read_ty, Some(Attr::ReadOnly), false);
+        let writes = m.function("dx.op.bufferStore.i32", read_ty, Some(Attr::NoUnwind), false);
+        let bin3 = m.function("dx.op.binary.i32", bin3_ty, Some(Attr::ReadNone), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        m.function("main", main_ty, None, true);
+        let b = m.new_block();
+        let (zero, one, two, four, eight) = (m.i32(0), m.i32(1), m.i32(2), m.i32(4), m.i32(8));
+        let (k16, k20, k31) = (m.i32(16), m.i32(20), m.i32(31));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        // Self-cancelling and mod-1.
+        let z1 = m.bin(b, Bin::Sub, x, x);
+        let z2 = m.bin(b, Bin::Xor, x, x);
+        let z3 = m.bin(b, Bin::URem, x, one);
+        let z = m.bin(b, Bin::Or, z1, z2);
+        let z = m.bin(b, Bin::Or, z, z3);
+        // Chained add/sub: ((x + 4) - 2) + 6 == x + 8, then - 8 == x.
+        let six = m.i32(6);
+        let a = m.bin(b, Bin::Add, x, four);
+        let a = m.bin(b, Bin::Sub, a, two);
+        let a = m.bin(b, Bin::Add, a, six);
+        let a = m.bin(b, Bin::Sub, a, eight);
+        // Chained masks and double boolean negation.
+        let (m1, m2) = (m.i32(0xFF), m.i32(0x0F));
+        let masked = m.bin(b, Bin::And, x, m1);
+        let masked = m.bin(b, Bin::And, masked, m2);
+        let c = m.cmp(b, pred::IULT, x, y);
+        let yes = m.bool(true);
+        let nc = m.bin(b, Bin::Xor, c, yes);
+        let nnc = m.bin(b, Bin::Xor, nc, yes);
+        let contr = m.bin(b, Bin::And, c, nc);
+        let taut = m.bin(b, Bin::Or, c, nc);
+        // Select with negated condition collapses with inner select on `c`.
+        let inner = m.select(b, c, y, x);
+        let flipped = m.select(b, nc, a, inner);
+        // Chained shifts: (x << 16) << 20 -> 0; (x >>s 20) >>s 20 -> x >>s 31.
+        let sh_zero = m.bin(b, Bin::Shl, x, k16);
+        let sh_zero = m.bin(b, Bin::Shl, sh_zero, k20);
+        let ash = m.bin(b, Bin::AShr, x, k20);
+        let ash = m.bin(b, Bin::AShr, ash, k20);
+        // ZExt(i1) compared with 0/1/2.
+        let zc = m.cast(b, Cast::ZExt, nnc, i32t);
+        let is_one = m.cmp(b, pred::EQ, zc, one);
+        let is_zero = m.cmp(b, pred::EQ, zc, zero);
+        let is_two = m.cmp(b, pred::EQ, zc, two);
+        let no = m.bool(false);
+        let is_not_zero = m.cmp(b, pred::NE, is_zero, no);
+        let pick_bit = m.select(b, is_one, is_not_zero, contr);
+        let pick_bit = m.select(b, taut, pick_bit, is_two);
+        let pick_i32 = m.cast(b, Cast::ZExt, pick_bit, i32t);
+        // 3-arg dx.op.binary.i32 UMin (opcode 40) constant and nested clamp.
+        let op_umin = m.i32(40);
+        let c_clamp = m.call(b, bin3, vec![op_umin, k20, k16]);
+        let cl1 = m.call(b, bin3, vec![op_umin, x, k20]);
+        let cl2 = m.call(b, bin3, vec![op_umin, cl1, k16]);
+        let (then, other) = (m.new_block(), m.new_block());
+        // Negated branch condition flips targets.
+        m.terminate(b, Term::CondBr(nc, then, other));
+        m.call(then, writes, vec![z, sh_zero]);
+        m.call(then, writes, vec![c_clamp, cl2]);
+        m.call(then, writes, vec![flipped, ash]);
+        m.call(then, writes, vec![masked, pick_i32]);
+        m.terminate(then, Term::Ret);
+        m.terminate(other, Term::Ret);
+        let _ = i1t;
+        m.optimise(FOLD | DEAD);
+        assert!(matches!(m.blocks[b].term, Some(Term::CondBr(cond, t, f)) if cond == c && t == other && f == then));
+        let st = stores(&m, then);
+        assert_eq!(st[0], [zero, zero], "x-x, x^x, x%1, and (x<<16)<<20 fold to 0");
+        assert_eq!(st[1][0], k16, "UMin(20, 16) folds to 16");
+        let V::Inst(cl2_i) = st[1][1] else { panic!() };
+        assert!(
+            matches!(&m.insts[cl2_i as usize].op, Op::Call(_, args) if args == &[op_umin, x, k16]),
+            "nested UMin(UMin(x, 20), 16) collapses to UMin(x, 16)"
+        );
+        let V::Inst(ash_i) = st[2][1] else { panic!() };
+        assert!(
+            matches!(m.insts[ash_i as usize].op, Op::Bin(Bin::AShr, v, s) if v == x && s == k31),
+            "(x >>s 20) >>s 20 clamps to x >>s 31"
+        );
+        let V::Inst(mask_i) = st[3][0] else { panic!() };
+        assert!(
+            matches!(m.insts[mask_i as usize].op, Op::Bin(Bin::And, v, k) if v == x && k == m2),
+            "(x & 0xff) & 0x0f folds to x & 0x0f"
+        );
+        // flipped = select(!c, x, select(c, y, x)) = select(c, select(c, y, x), x) -> select(c, y, x)
+        let V::Inst(flipped_i) = st[2][0] else { panic!() };
+        assert!(
+            matches!(m.insts[flipped_i as usize].op, Op::Select(cond, tv, fv) if cond == c && tv == y && fv == x),
+            "negated select collapses with inner select on `c`"
+        );
+        let _ = inner;
+        m.write();
+    }
+
+    #[test]
+    fn commutative_compares_reuse_and_learn_facts() {
+        let Diamond {
+            k:
+                Kit {
+                    mut m,
+                    b,
+                    writes,
+                    ..
+                },
+            x,
+            y,
+            c,
+            then,
+            other,
+            ..
+        } = diamond();
+        // `c` in entry is `x <u y`; `y >u x` is the exact same comparison,
+        // and `y <=u x` is its opposite.
+        let same_int = m.cmp(b, pred::IUGT, y, x);
+        let sel_top = m.select(b, same_int, x, y);
+        m.call(b, writes, vec![sel_top, sel_top]);
+        let opp_swapped = m.cmp(then, pred::IULE, y, x);
+        let sel_then = m.select(then, opp_swapped, y, x);
+        m.call(then, writes, vec![sel_then, sel_then]);
+        let same_swapped = m.cmp(other, pred::IUGT, y, x);
+        let sel_other = m.select(other, same_swapped, x, y);
+        m.call(other, writes, vec![sel_other, sel_other]);
+        m.optimise(FOLD | REUSE | FACTS | DEAD);
+        let V::Inst(sel_top_i) = stores(&m, b)[0][0] else {
+            panic!()
+        };
+        assert!(matches!(m.insts[sel_top_i as usize].op, Op::Select(g, ..) if g == c));
+        assert_eq!(stores(&m, then), [[x, x]]);
+        assert_eq!(stores(&m, other), [[y, y]]);
+        m.write();
+    }
+
+    #[test]
+    fn wave_lane_index_is_pure_and_disjoint_stores_keep_reads() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let arr = m.array(16, i32t);
+        let lds = m.global("lds", arr, 3);
+        let lane_ty = m.func_ty(i32t, vec![i32t]);
+        let rw_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let void1_ty = m.func_ty(void, vec![i32t]);
+        let void2_ty = m.func_ty(void, vec![i32t, i32t]);
+        for t in [lane_ty, rw_ty, void1_ty, void2_ty] {
+            m.ptr(t);
+        }
+        let lane_fn = m.function("dx.op.waveGetLaneIndex", lane_ty, Some(Attr::ReadOnly), false);
+        let ballot_fn = m.function("dx.op.waveReadLaneFirst.i32", rw_ty, Some(Attr::NoUnwind), false);
+        let buf_load = m.function("dx.op.rawBufferLoad.i32", rw_ty, Some(Attr::ReadOnly), false);
+        let buf_store = m.function("dx.op.rawBufferStore.i32", void2_ty, Some(Attr::NoUnwind), false);
+        let out_store = m.function("dx.op.storeOutput.i32", void2_ty, Some(Attr::NoUnwind), false);
+        let discard = m.function("dx.op.discard", void1_ty, Some(Attr::NoUnwind), false);
+        let barrier = m.function("dx.op.barrier", void1_ty, Some(Attr::NoDuplicate), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        m.function("main", main_ty, None, true);
+        let (entry, next) = (m.new_block(), m.new_block());
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let op111 = m.i32(111);
+        let l0 = m.call(entry, lane_fn, vec![op111]);
+        let p = m.element(entry, lds, zero);
+        let lds0 = m.load(entry, p);
+        let _mem0 = m.call(entry, buf_load, vec![one, two]);
+        let _w0 = m.call(entry, ballot_fn, vec![one, l0]);
+        // LDS store clobbers LDS only: buffer load and wave op survive.
+        m.store(entry, p, l0);
+        let mem1 = m.call(entry, buf_load, vec![one, two]);
+        let w1 = m.call(entry, ballot_fn, vec![one, l0]);
+        let lds1 = m.load(entry, p);
+        // Buffer store clobbers memory only: LDS load and wave op survive.
+        m.call(entry, buf_store, vec![mem1, w1]);
+        let lds2 = m.load(entry, p);
+        let w2 = m.call(entry, ballot_fn, vec![one, l0]);
+        // Output store clobbers nothing: LDS load, buffer load, wave op survive.
+        let mem2 = m.call(entry, buf_load, vec![one, two]);
+        m.call(entry, out_store, vec![lds2, w2]);
+        let lds3 = m.load(entry, p);
+        let mem3 = m.call(entry, buf_load, vec![one, two]);
+        // Discard clobbers lanes only: LDS load and buffer load survive, wave op re-runs.
+        m.call(entry, discard, vec![one]);
+        let w3 = m.call(entry, ballot_fn, vec![one, l0]);
+        let lds4 = m.load(entry, p);
+        let mem4 = m.call(entry, buf_load, vec![one, two]);
+        // Barrier clobbers LDS and memory.
+        m.call(entry, barrier, vec![one]);
+        let lds5 = m.load(entry, p);
+        let mem5 = m.call(entry, buf_load, vec![one, two]);
+        let s1 = m.bin(entry, Bin::Add, lds0, lds3);
+        let s2 = m.bin(entry, Bin::Add, mem3, mem4);
+        let s3 = m.bin(entry, Bin::Add, lds4, w3);
+        let s4 = m.bin(entry, Bin::Add, lds5, mem5);
+        m.call(entry, out_store, vec![s1, s2]);
+        m.call(entry, out_store, vec![s3, s4]);
+        let cond = m.cmp(entry, pred::NE, l0, zero);
+        m.terminate(entry, Term::CondBr(cond, next, next));
+        // `waveGetLaneIndex` in a dominated block reuses entry's `l0`.
+        let l_below = m.call(next, lane_fn, vec![op111]);
+        m.call(next, out_store, vec![l_below, mem2]);
+        m.terminate(next, Term::Ret);
+        m.optimise(REUSE | LOADS | DEAD);
+        // Count surviving loads/wave calls in entry + next.
+        let count_fn = |name: &str| {
+            m.blocks[entry]
+                .body
+                .iter()
+                .chain(&m.blocks[next].body)
+                .filter(|&&i| {
+                    matches!(m.insts[i as usize].op, Op::Call(f, _) if m.funcs[f as usize].name == name)
+                })
+                .count()
+        };
+        let lds_loads = m.blocks[entry]
+            .body
+            .iter()
+            .filter(|&&i| matches!(m.insts[i as usize].op, Op::Load(_)))
+            .count();
+        assert_eq!(count_fn("dx.op.waveGetLaneIndex"), 1, "reused across blocks");
+        assert_eq!(count_fn("dx.op.waveReadLaneFirst.i32"), 2, "kept across LDS/buffer/output stores, re-run after discard");
+        assert_eq!(count_fn("dx.op.rawBufferLoad.i32"), 3, "mem0, mem2 after buf_store, mem5 after barrier");
+        assert_eq!(lds_loads, 3, "lds0, lds1 after lds store, lds5 after barrier");
+        let _ = lds1;
+        m.write();
+    }
+
+    #[test]
+    fn single_predecessor_blocks_merge_and_update_phis() {
+        // 1. Linear chain entry -> mid -> tail collapses into entry, and
+        //    LOADS CSE then reuses the read across the merged boundary.
+        let Kit {
+            mut m,
+            b: entry,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (mid, tail) = (m.new_block(), m.new_block());
+        let (one, two) = (m.i32(1), m.i32(2));
+        let r0 = m.call(entry, reads, vec![one, two]);
+        m.terminate(entry, Term::Br(mid));
+        let r1 = m.call(mid, reads, vec![one, two]);
+        m.terminate(mid, Term::Br(tail));
+        m.call(tail, writes, vec![r0, r1]);
+        m.terminate(tail, Term::Ret);
+        m.optimise(LOADS | MERGE | DEAD);
+        assert!(matches!(m.blocks[entry].term, Some(Term::Ret)));
+        assert_eq!(stores(&m, entry), [[r0, r0]], "read reused after blocks merged");
+        assert_eq!(body(&m, mid), 0);
+        assert_eq!(body(&m, tail), 0);
+        m.write();
+
+        // 2. Two-block loop (head -> latch -> head/exit) merges into a
+        //    single-block self-loop with `head`'s PHI incoming updated.
+        let Kit {
+            mut m,
+            b: pre,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (head, latch, exit) = (m.new_block(), m.new_block(), m.new_block());
+        let (zero, one, four) = (m.i32(0), m.i32(1), m.i32(4));
+        m.terminate(pre, Term::Br(head));
+        let iv = m.phi(head, i32t);
+        m.terminate(head, Term::Br(latch));
+        let next = m.bin(latch, Bin::Add, iv, one);
+        let more = m.cmp(latch, pred::IULT, next, four);
+        m.terminate(latch, Term::CondBr(more, head, exit));
+        m.set_phi(iv, vec![(zero, pre), (next, latch)]);
+        let final_v = m.phi(exit, i32t);
+        m.set_phi(final_v, vec![(next, latch)]);
+        m.call(exit, writes, vec![final_v, four]);
+        m.terminate(exit, Term::Ret);
+        let before = run(&m, &[]);
+        m.optimise(ALL);
+        assert_eq!(run(&m, &[]), before);
+        assert!(matches!(m.blocks[head].term, Some(Term::CondBr(_, t, f)) if t == head && f == exit));
+        let Op::Phi(incoming) = &m.insts[m.blocks[head].phis[0] as usize].op else {
+            panic!()
+        };
+        assert_eq!(incoming, &vec![(zero, pre), (next, head)]);
+        m.write();
     }
 }
