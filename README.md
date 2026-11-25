@@ -244,6 +244,7 @@ Each is described in a comment where it is read.
 - Everything in shadow is black (see above).
 - The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
 - Around 24 GB of memory is in use during play.
+- Under Wine or Proton on NVIDIA, vkd3d-proton 3.1 crashes as gameplay starts; use a build with dxil-spirv's new structurizer ([docs/vkd3d-proton.md](docs/vkd3d-proton.md)).
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
