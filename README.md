@@ -1,17 +1,66 @@
-# VIctory fork (work in progress)
+# victory-mbt (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+**victory-mbt** is a fork of
+[victory-fork](https://github.com/fxceless/victory-fork) by fxceless, which is
+itself a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak:
+a compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies.
+
+    VIctory (Marvisak/VIctory)
+      -> victory-fork (fxceless/victory-fork)
+           -> victory-mbt (this repository)
+
+victory-mbt follows victory-fork's `main` and adds frame-rate and loading work
+on top of it (see [What victory-mbt adds](#what-victory-mbt-adds)). Everything
+below that section is victory-fork's own description, kept as it is.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## What victory-mbt adds
+
+Measured on one machine (Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
+32 GB RAM), first gameplay scene, Series X profile. Frame times are medians of
+the 5-second frame lines in steady gameplay; the scene and what it draws vary
+from run to run, so differences of 10-20 ms are noise.
+
+| | median frame |
+|---|---|
+| victory-fork `f85101b`, defaults | 294 ms (3.4 fps) |
+| victory-mbt, defaults | 213 ms (4.7 fps), best 174 ms |
+| victory-mbt, `VICTORY_SKIP_WC_COMPARE=1` (experiment) | 186 ms (5.4 fps), best 150 ms |
+
+- **Table constants on the card.** The console's constant buffers sit on 16
+  bytes, the host's must sit on 256; they were copied on the CPU at
+  submission, which waited for earlier GPU work (about 190 ms a frame). The
+  card now copies them itself (`VICTORY_TABLE_CBV_FILL=1` restores the old
+  copy).
+- **A parallel piece hash.** The card-side compare hashed each 64 KiB piece on
+  one thread; it now uses a group of 64 (307 -> 287 ms on its own).
+- **victory-fork's frame-rate switches on by default** (`VICTORY_ASYNC_SUBMIT`,
+  `VICTORY_QUEUE2`, `VICTORY_INDIRECT_WINDOW` with the driver watch,
+  `VICTORY_MERGE_GAP=64`, `VICTORY_MERGE_RUNS=4096`; each has an off switch).
+- **Loading.** Texture refreshes no longer wait for the runtime's remap lock
+  (frames of 4-9.5 s while a world loads went under 200 ms), and DirectStorage
+  writes into physical pages through one kept view per section instead of a
+  map and unmap per request (`VICTORY_WHOLE_VIEWS=0` maps per request).
+- **DirectStorage page arrays** are read when a request runs (after myokex's
+  `4d64efe` in victory-amd).
+- **Open pull requests of victory-fork taken in:** #911 (constant views at
+  most 64 KiB, which NVIDIA requires), #932, #936, #925, #768
+  (`VICTORY_WIDE_TEXTURES=1`, off) and #868 (`VICTORY_CENSUS=1`, and the
+  `VICTORY_SKIP_WC_COMPARE=1` experiment, off: not exact, read its comment).
+
+Not yet: shadowed areas are still black (the ray-traced lighting does not
+run), and loading is paced by the title itself.
+
 ## Credits
 
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless and
+  its contributors is what victory-mbt is built on; the pull requests taken in
+  are by douline (#911), avt0m4t48 (#932), faycalbaklouti (#936), alpz1000
+  (#925), KyleS98 (#768) and Chipsraine (#868).
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
@@ -28,7 +77,7 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Status of victory-fork (2026-11-25, as victory-fork describes it)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
