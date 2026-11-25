@@ -10,7 +10,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -22,7 +21,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, TableLayout};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -515,6 +514,86 @@ pub(crate) fn take_dropped() -> u64 {
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+
+/// Set of title root slots that need fresh descriptor tables. The whole u8
+/// range fits without allocating, and iteration preserves slot order.
+#[derive(Default)]
+struct TableSlots([u64; 4]);
+
+impl TableSlots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        self.0[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0
+    }
+
+    fn ordered(self) -> impl Iterator<Item = u8> {
+        self.0.into_iter().enumerate().flat_map(|(word, mut bits)| {
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some((word * 64 + bit as usize) as u8)
+            })
+        })
+    }
+}
+
+/// Remapped table offsets, with inline room for small sets.
+#[derive(Default)]
+struct MadeTables {
+    inline: [(u8, u32); 8],
+    len: usize,
+    overflow: Vec<(u8, u32)>,
+}
+
+impl MadeTables {
+    fn push(&mut self, entry: (u8, u32)) {
+        if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = entry;
+            self.len += 1;
+        } else {
+            self.overflow.push(entry);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(u8, u32)> {
+        self.inline[..self.len].iter().chain(self.overflow.iter())
+    }
+}
+
+#[test]
+fn fresh_table_offsets_preserve_slots_and_failure_marker() {
+    let mut made = MadeTables::default();
+    assert!(made.iter().next().is_none());
+    for slot in 0..8 {
+        made.push((slot, u32::from(slot) * 32));
+    }
+    assert!(made.overflow.is_empty());
+    made.push((255, u32::MAX));
+    assert_eq!(made.iter().count(), 9);
+    assert_eq!(made.iter().find(|entry| entry.0 == 0), Some(&(0, 0)));
+    assert_eq!(made.iter().last(), Some(&(255, u32::MAX)));
+}
+
+#[test]
+fn fresh_table_slots_preserve_sorted_unique_order() {
+    let mut slots = TableSlots::default();
+    assert_eq!(TableSlots::default().ordered().next(), None);
+    for slot in [255, 128, 63, 64, 0, 127, 191, 192, 63] {
+        slots.insert(slot);
+        assert!(slots.contains(slot));
+    }
+    assert!(!slots.contains(254));
+    assert_eq!(
+        slots.ordered().collect::<Vec<_>>(),
+        [0, 63, 64, 127, 128, 191, 192, 255]
+    );
+}
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -1160,7 +1239,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &stage.tables, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2651,25 +2730,23 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    pub(crate) fn tables(
+    fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
-        indexed: &[RootIndexedView],
+        layouts: &[TableLayout],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> MadeTables {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = TableSlots::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            fresh.insert(u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2683,26 +2760,23 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = MadeTables::default();
+        for slot in fresh.ordered() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let Ok(layout) = layouts.binary_search_by_key(&slot, |layout| layout.slot) else {
+                continue;
+            };
+            let layout = &layouts[layout];
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2712,28 +2786,33 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
+            let evaluate = |index: &victory_shader::resource::RootIndexedView| {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            };
+            let single;
+            let mut many;
+            let selected: &[u32] = match layout.indexed.as_slice() {
+                [] => &[],
+                [expression] => {
+                    single = evaluate(expression);
+                    std::slice::from_ref(&single)
+                }
+                expressions => {
+                    many = expressions.iter().map(evaluate).collect::<Vec<_>>();
+                    many.sort_unstable();
+                    many.dedup();
+                    &many
+                }
+            };
+            let n = layout.records.last().map_or(0, |entry| entry.0)
+                .max(selected.last().copied().unwrap_or(0))
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
@@ -2754,14 +2833,14 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in layout.entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in selected {
+                    if layout.records.binary_search_by_key(&k, |entry| entry.0).is_ok() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2788,9 +2867,16 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut records = layout.records.as_slice();
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = match records.split_first() {
+                    Some((&(record, kind), rest)) if record == k => {
+                        records = rest;
+                        Some(kind)
+                    }
+                    _ => None,
+                };
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -2802,7 +2888,7 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        let kind = used.map(|u| u.kind).or_else(|| {
+                        let kind = used.or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
