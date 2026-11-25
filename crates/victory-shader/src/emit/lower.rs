@@ -5168,25 +5168,12 @@ impl<'a> Lower<'a> {
                 "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let n = src32(self, 1)?;
-                    let i64t = self.s.m.int(64);
-                    self.s.flags |= flags::INT64;
-                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
-                    let k32 = self.s.m.int_const(i64t, 32);
-                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
-                    let x = self.s.m.bin(c, Bin::Or, a, b);
-                    let k63 = self.s.m.i32(63);
-                    let n = self.s.m.bin(c, Bin::And, n, k63);
-                    let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
                     let op = match name {
                         "s_lshl_b64" => Bin::Shl,
                         "s_lshr_b64" => Bin::LShr,
                         _ => Bin::AShr,
                     };
-                    let r = self.s.m.bin(c, op, x, n);
-                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
-                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
-                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    let (rl, rh) = self.shift64(a, b, n, op);
                     self.set(lo, Val::I32(rl));
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
@@ -6810,21 +6797,16 @@ impl<'a> Lower<'a> {
             }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
-                let x = self.src64(inst, 1)?;
-                let i64t = self.s.m.int(64);
-                let k63 = self.s.m.i32(63);
-                let n = self.s.m.bin(c, Bin::And, n, k63);
-                let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
+                let (a, b) = self.src64_dwords(inst, 1)?;
                 let op = match name {
                     "v_lshlrev_b64" => Bin::Shl,
                     "v_lshrrev_b64" => Bin::LShr,
                     _ => Bin::AShr,
                 };
-                let r = self.s.m.bin(c, op, x, n);
+                let (lo, hi) = self.shift64(a, b, n, op);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 64-bit result");
                 };
-                let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
@@ -7888,6 +7870,44 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, special, special_bits, r)
     }
 
+    /// A 64-bit VALU source as `(lo, hi)` dwords without `INT64` (same operand
+    /// extension and modifier checks as [`Self::src64`]).
+    fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(code @ 128..=208) => {
+                let x = crate::resource::inline(code).ok_or("a special operand")?;
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            // A signed 64-bit operand sign-extends its 32-bit literal, as
+            // the hardware does (LLVM's AMDGPU operand rules).
+            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            _ => {
+                let lo = self.operand(inst, &op)?;
+                Ok((lo, self.s.m.i32(0)))
+            }
+        }
+    }
+
     /// The low and high dwords of an i64.
     fn split64(&mut self, x: V) -> (V, V) {
         let c = self.cur;
@@ -7897,6 +7917,48 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, x, k32);
         let hi = self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32);
         (lo, hi)
+    }
+
+    /// Shifts a 64-bit value `(lo, hi)` by `shift & 63` using only 32-bit
+    /// operations (no `INT64`), keeping every 32-bit shift amount in `0..=31`.
+    fn shift64(&mut self, lo: V, hi: V, shift: V, op: Bin) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k0, k1, k31, k32) = (k(self, 0), k(self, 1), k(self, 31), k(self, 32));
+        let sh = self.s.m.bin(c, Bin::And, shift, k31);
+        let high_bit = self.s.m.bin(c, Bin::And, shift, k32);
+        let wide = self.s.m.cmp(c, pred::NE, high_bit, k0);
+        let inv = self.s.m.bin(c, Bin::Sub, k31, sh);
+        match op {
+            Bin::Shl => {
+                let lo_s = self.s.m.bin(c, Bin::Shl, lo, sh);
+                let hi_s = self.s.m.bin(c, Bin::Shl, hi, sh);
+                // `(lo >> 1) >> (31 - sh)` is `0` at `sh == 0` and `lo >> (32 - sh)` for `1..=31`.
+                let carry = self.s.m.bin(c, Bin::LShr, lo, k1);
+                let carry = self.s.m.bin(c, Bin::LShr, carry, inv);
+                let hi_s = self.s.m.bin(c, Bin::Or, hi_s, carry);
+                let out_lo = self.s.m.select(c, wide, k0, lo_s);
+                let out_hi = self.s.m.select(c, wide, lo_s, hi_s);
+                (out_lo, out_hi)
+            }
+            Bin::LShr | Bin::AShr => {
+                let lo_s = self.s.m.bin(c, Bin::LShr, lo, sh);
+                let hi_s = self.s.m.bin(c, op, hi, sh);
+                // `(hi << 1) << (31 - sh)` is `0` at `sh == 0` and `hi << (32 - sh)` for `1..=31`.
+                let carry = self.s.m.bin(c, Bin::Shl, hi, k1);
+                let carry = self.s.m.bin(c, Bin::Shl, carry, inv);
+                let lo_s = self.s.m.bin(c, Bin::Or, lo_s, carry);
+                let fill = if matches!(op, Bin::AShr) {
+                    self.s.m.bin(c, Bin::AShr, hi, k31)
+                } else {
+                    k0
+                };
+                let out_lo = self.s.m.select(c, wide, hi_s, lo_s);
+                let out_hi = self.s.m.select(c, wide, fill, hi_s);
+                (out_lo, out_hi)
+            }
+            _ => unreachable!("shift64 expects Shl, LShr, or AShr"),
+        }
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
@@ -11634,6 +11696,62 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn shifts_64_bit_need_no_int64() {
+        let sfi0 = |words: &[u32]| -> u64 {
+            let constants = RootParam {
+                sgprs: 4,
+                ..root(RootType::Constants, 0, 0)
+            };
+            let emitted = lower_with(words, vec![constants], vec![]).unwrap();
+            let container = crate::Container::parse(&emitted.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            u64::from_le_bytes(features.data.try_into().unwrap())
+        };
+        for (name, op) in [
+            ("s_lshl_b64", 0x1Fu32),
+            ("s_lshr_b64", 0x21),
+            ("s_ashr_i64", 0x23),
+        ] {
+            let words = [
+                0x8000_0000 | (op << 23) | (4 << 16) | (2 << 8),
+                0x8506_8081, // s_cselect_b32 s6, 1, 0
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0204, // v_mov_b32 v1, s4
+                0x7E04_0205, // v_mov_b32 v2, s5
+                0x7E06_0206, // v_mov_b32 v3, s6
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                0xD834_0000,
+                0x0000_0200, // ds_write_b32 v0, v2
+                0xD834_0000,
+                0x0000_0300, // ds_write_b32 v0, v3
+                S_ENDPGM,
+            ];
+            assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+        }
+        for (name, op) in [
+            ("v_lshlrev_b64", 0x2FFu32),
+            ("v_lshrrev_b64", 0x300),
+            ("v_ashrrev_i64", 0x301),
+        ] {
+            let words = [
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0200, // v_mov_b32 v1, s0
+                0x7E04_0201, // v_mov_b32 v2, s1
+                0x7E06_0202, // v_mov_b32 v3, s2
+                0xD400_0004 | (op << 16),
+                259 | (257 << 9), // v_<op> v[4:5], v3, v[1:2]
+                0xD834_0000,
+                0x0000_0400, // ds_write_b32 v0, v4
+                0xD834_0000,
+                0x0000_0500, // ds_write_b32 v0, v5
+                S_ENDPGM,
+            ];
+            assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+        }
     }
 
     #[test]

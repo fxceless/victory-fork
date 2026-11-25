@@ -1622,3 +1622,189 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+fn assert_no_int64(shader: &HostShader, label: &str) {
+    let container = crate::Container::parse(&shader.dxil).expect("DXBC container");
+    let features = container.part(crate::FourCC::SFI0).expect("SFI0 part");
+    let flags = u64::from_le_bytes(features.data.try_into().expect("u64 SFI0"));
+    assert_eq!(flags & 0x8000, 0, "{label} must not set SFI0 INT64");
+}
+
+#[derive(Clone, Copy)]
+enum Shift64Kind {
+    Shl,
+    LShr,
+    AShr,
+}
+
+impl Shift64Kind {
+    fn eval(self, val: u64, shift: u32) -> u64 {
+        let s = shift & 63;
+        match self {
+            Self::Shl => val << s,
+            Self::LShr => val >> s,
+            Self::AShr => ((val as i64) >> s) as u64,
+        }
+    }
+}
+
+fn shift64_inputs() -> Vec<[u32; 4]> {
+    const VALUES: [u64; 9] = [
+        0,
+        1,
+        u64::MAX,
+        i64::MIN as u64,
+        i64::MAX as u64,
+        0x8000_0000_0000_0001,
+        0x0000_0000_8000_0000,
+        0x1234_5678_9ABC_DEF0,
+        0xFEDC_BA98_7654_3210,
+    ];
+    const SHIFTS: [u32; 14] = [0, 1, 7, 15, 31, 32, 33, 47, 63, 64, 65, 95, 96, u32::MAX];
+    let mut cases = Vec::with_capacity(VALUES.len() * SHIFTS.len());
+    for v in VALUES {
+        for s in SHIFTS {
+            cases.push([v as u32, (v >> 32) as u32, s, 0]);
+        }
+    }
+    cases
+}
+
+#[test]
+fn v_shift_64_matches_rdna2_without_int64() {
+    let inputs = shift64_inputs();
+    for (name, op, kind) in [
+        ("v_lshlrev_b64", 0x2FFu16, Shift64Kind::Shl),
+        ("v_lshrrev_b64", 0x300, Shift64Kind::LShr),
+        ("v_ashrrev_i64", 0x301, Shift64Kind::AShr),
+    ] {
+        let [w0, w1] = vop3(op, 6, vgpr(3), vgpr(1), 0);
+        let lo_shader = build_valu_cs(&[w0, w1, vop1(0x001, 0, vgpr(6))]);
+        let hi_shader = build_valu_cs(&[w0, w1, vop1(0x001, 0, vgpr(7))]);
+        assert_no_int64(&lo_shader, name);
+        assert_no_int64(&hi_shader, name);
+
+        for (half, shader) in [("lo", &lo_shader), ("hi", &hi_shader)] {
+            run_cases(shader, &inputs, |backend, _, inp, got| {
+                let val = u64::from(inp[0]) | (u64::from(inp[1]) << 32);
+                let want_64 = kind.eval(val, inp[2]);
+                let want = if half == "lo" {
+                    want_64 as u32
+                } else {
+                    (want_64 >> 32) as u32
+                };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} {half}({val:#018x}, {}) = {got:#010x}, want {want:#010x}",
+                    inp[2]
+                );
+            });
+        }
+    }
+
+    // Inline negative constant (-1 = 193) and negative 32-bit literal (-100):
+    // _i64 sign-extends the literal while _b64 zero-extends it.
+    const MINUS_100: u32 = -100_i32 as u32;
+    let shift_inputs: Vec<[u32; 4]> = [0u32, 1, 4, 31, 32, 33, 63, 64]
+        .into_iter()
+        .map(|s| [s, 0, 0, 0])
+        .collect();
+    for (name, op, kind, src1, extra, val) in [
+        (
+            "v_lshrrev_b64 inline -1",
+            0x300u16,
+            Shift64Kind::LShr,
+            193u16,
+            None,
+            u64::MAX,
+        ),
+        (
+            "v_ashrrev_i64 inline -1",
+            0x301,
+            Shift64Kind::AShr,
+            193,
+            None,
+            u64::MAX,
+        ),
+        (
+            "v_lshrrev_b64 lit -100",
+            0x300,
+            Shift64Kind::LShr,
+            255,
+            Some(MINUS_100),
+            u64::from(MINUS_100),
+        ),
+        (
+            "v_ashrrev_i64 lit -100",
+            0x301,
+            Shift64Kind::AShr,
+            255,
+            Some(MINUS_100),
+            (-100_i64) as u64,
+        ),
+    ] {
+        let [w0, w1] = vop3(op, 6, vgpr(1), src1, 0);
+        let mut prefix = vec![w0, w1];
+        if let Some(lit) = extra {
+            prefix.push(lit);
+        }
+        let mut lo_body = prefix.clone();
+        lo_body.push(vop1(0x001, 0, vgpr(6)));
+        let mut hi_body = prefix;
+        hi_body.push(vop1(0x001, 0, vgpr(7)));
+        let lo_shader = build_valu_cs(&lo_body);
+        let hi_shader = build_valu_cs(&hi_body);
+        assert_no_int64(&lo_shader, name);
+        assert_no_int64(&hi_shader, name);
+        for (half, shader) in [("lo", &lo_shader), ("hi", &hi_shader)] {
+            run_cases(shader, &shift_inputs, |backend, _, inp, got| {
+                let want_64 = kind.eval(val, inp[0]);
+                let want = if half == "lo" {
+                    want_64 as u32
+                } else {
+                    (want_64 >> 32) as u32
+                };
+                assert_eq!(got, want, "{backend}: {name} {half} shift={}", inp[0]);
+            });
+        }
+    }
+}
+
+#[test]
+fn s_shift_64_matches_rdna2_without_int64() {
+    let inputs = shift64_inputs();
+    for (name, op, kind) in [
+        ("s_lshl_b64", 0x1Fu8, Shift64Kind::Shl),
+        ("s_lshr_b64", 0x21, Shift64Kind::LShr),
+        ("s_ashr_i64", 0x23, Shift64Kind::AShr),
+    ] {
+        let shift = sop2(op, 16, 0, 2);
+        let lo_shader = build_valu_cs(&[shift, vop1(0x001, 0, sgpr(16))]);
+        let hi_shader = build_valu_cs(&[shift, vop1(0x001, 0, sgpr(17))]);
+        let scc_shader = build_valu_cs(&[
+            shift,
+            sop2(0x0A, 18, 129, 128), // s_cselect_b32 s18, 1, 0
+            vop1(0x001, 0, sgpr(18)),
+        ]);
+        assert_no_int64(&lo_shader, name);
+        assert_no_int64(&hi_shader, name);
+        assert_no_int64(&scc_shader, name);
+
+        for (part, shader) in [("lo", &lo_shader), ("hi", &hi_shader), ("scc", &scc_shader)] {
+            run_cases(shader, &inputs, |backend, _, inp, got| {
+                let val = u64::from(inp[0]) | (u64::from(inp[1]) << 32);
+                let want_64 = kind.eval(val, inp[2]);
+                let want = match part {
+                    "lo" => want_64 as u32,
+                    "hi" => (want_64 >> 32) as u32,
+                    _ => u32::from(want_64 != 0),
+                };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} {part}({val:#018x}, {}) = {got:#010x}, want {want:#010x}",
+                    inp[2]
+                );
+            });
+        }
+    }
+}
