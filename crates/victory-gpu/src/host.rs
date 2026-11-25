@@ -7159,6 +7159,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if whole {
         return;
     }
+    // A guard set again over the destination since `writing` opened it
+    // (another copy's, over this or another view of the pages) refuses the
+    // kernel's write: opened, tried again.
+    if title_dst && crate::watch::kernel_write_refused(dst as usize, len) && read(src, dst, len) {
+        return;
+    }
     // The copy failed: a source page is not there, or the destination is
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
@@ -7172,7 +7178,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -7195,7 +7201,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -7205,15 +7211,22 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. Into title memory a
+    // piece the kernel refused because a guard lay over it again is opened
+    // and tried again first: zeros there would replace the title's bytes
+    // with nothing it wrote.
+    let read = |from: *const u8, to: *mut u8, n: usize| {
+        read(from, to, n)
+            || (title_dst && crate::watch::kernel_write_refused(to as usize, n) && read(from, to, n))
+    };
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
@@ -7294,6 +7307,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+    };
+    // A guard set again over the destination since the caller opened it
+    // (`crate::watch::writing`; another copy's, over this or another view
+    // of the pages) refuses the kernel's write: opened, tried again.
+    let write = |at: usize, n: usize| {
+        write(at, n) || (crate::watch::kernel_write_refused(at, n) && write(at, n))
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -7647,6 +7666,11 @@ impl Meter {
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
+                );
+                tracing::info!(
+                    refused = crate::watch::REFUSED.load(Ordering::Relaxed),
+                    read_beside = crate::watch::read_beside(),
+                    "kernel writes into title memory refused under a guard set again since they were opened, opened and tried again, since the start (VICTORY_READ_BESIDE)"
                 );
             }
             #[cfg(feature = "diagnostics")]

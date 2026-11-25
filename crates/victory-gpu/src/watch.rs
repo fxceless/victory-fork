@@ -947,6 +947,43 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Whether a kernel write into title memory that is refused is tried again
+/// once the guards over it are opened ([`kernel_write_refused`]), and the
+/// runtime reads files beside and copies them in (`victory-hle`'s `fread`
+/// and DirectStorage): `VICTORY_READ_BESIDE=0` turns both off, as before.
+pub fn read_beside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: kernel writes into title memory that were refused
+/// while a guard of ours lay over them, opened by [`kernel_write_refused`].
+pub(crate) static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A write into title memory `[at, at + len)` that goes through the kernel
+/// (our `ReadProcessMemory` copies, a title `ReadFile`) was refused: if a
+/// block of it is guarded now, it is opened and true is returned, and the
+/// write may be tried again. [`writing`] opened the blocks before the
+/// write, but a copy on another thread may guard them again before the
+/// kernel writes: since every view of a page is guarded together, any copy
+/// over another view of the same pages does (`protect`). The kernel does
+/// not fault into our handler: under Wine `NtReadVirtualMemory`,
+/// `NtWriteVirtualMemory` and `NtReadFile` check the buffer with
+/// `virtual_check_buffer_for_write` and copy under their own exception
+/// guard (dlls/ntdll/unix/virtual.c, file.c), so a read-only page fails the
+/// call. False if nothing of it was guarded (the write failed for another
+/// reason, such as an unmapped page), or with [`read_beside`] off.
+pub fn kernel_write_refused(at: usize, len: usize) -> bool {
+    if len == 0 || !read_beside() {
+        return false;
+    }
+    let opened = open(&mut guards(), at, at.saturating_add(len));
+    if opened {
+        REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    opened
+}
+
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
 /// not see once its bytes are there ([`title_memory_written`]), as bits:
 /// 1, the guarded blocks under it are opened and count as written (host
@@ -1668,6 +1705,35 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// Our kernel write into title memory (a copy-back's `write_mapped`)
+    /// whose destination was opened, then guarded again by a copy over
+    /// another view of the same pages before the write, is refused by the
+    /// kernel (under Wine too: it does not fault into our handler): the
+    /// guard is opened and the write made. Nothing guarded: not retried.
+    #[test]
+    fn a_kernel_write_refused_under_a_guard_set_again_is_made() {
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        // The copy-back opens its destination ...
+        writing(one, BLOCK);
+        assert!(writable(one));
+        // ... and another copy takes the other view, guarding every view.
+        guard(two, two + BLOCK).expect("a view");
+        if view_guard() {
+            assert!(!writable(one), "guarded again through the other view");
+        }
+        let bytes = [0x5au8; 256];
+        crate::host::write_mapped((one + 64) as *mut u8, bytes.as_ptr(), bytes.len());
+        // SAFETY: inside the view, readable.
+        let landed = unsafe { std::slice::from_raw_parts((one + 64) as *const u8, bytes.len()) };
+        assert_eq!(landed, &bytes[..], "the write landed");
+        // Through the other view as well: one physical page.
+        // SAFETY: as above.
+        assert_eq!(unsafe { *((two + 64) as *const u8) }, 0x5a);
+        assert!(!kernel_write_refused(one, BLOCK), "nothing guarded now: nothing to open");
+        drop_views(section, &[one, two], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by

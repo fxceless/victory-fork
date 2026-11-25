@@ -888,7 +888,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // at the failed request (runs amd-C and amd-C2, seconds after the
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
-        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        // (`VICTORY_READ_BESIDE=0`: read in place, as before.)
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0 && victory_gpu::read_beside();
         return into_destination(request, size, |out| {
             if !bounce {
                 return read_into(request, out).map(|()| size);

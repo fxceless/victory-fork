@@ -521,8 +521,9 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first. A block guarded again before the kernel writes it (the
 // guard over all the views of a page protects other views from other
-// threads) fails that `ReadFile`, and the title's retry opens it again;
-// `fread` has no such retry and reads beside instead (see there).
+// threads) fails that `ReadFile`: it is opened and the read made again
+// here ([`ReadFile`]); `fread` has no such retry and reads beside instead
+// (see there).
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -531,10 +532,32 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_USER_BUFFER, ERROR_NOACCESS, GetLastError};
+    let host = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    // A synchronous read refused for its buffer (under Wine `NtReadFile`
+    // checks the buffer before it reads, and `virtual_locked_pread` fails
+    // a read-only page with EFAULT: dlls/ntdll/unix/file.c, virtual.c)
+    // took nothing from the file and moved no file pointer: once a guard
+    // set again over the buffer is opened, it is made again. Not for any
+    // other failure, and not for an overlapped read: there a refused
+    // `pread` still posts a completion to the handle's port (`add_completion`
+    // at `done:`), and a second read would post a second one.
+    let mut tries = 0;
+    loop {
+        let ok = host(file, buffer, len, read, overlapped);
+        if ok != 0 || tries == 3 || !overlapped.is_null() {
+            return ok;
+        }
+        // SAFETY: a plain query of this thread's last error.
+        let error = unsafe { GetLastError() };
+        if !matches!(error, ERROR_NOACCESS | ERROR_INVALID_USER_BUFFER)
+            || !victory_gpu::kernel_write_refused(buffer as usize, len as usize)
+        {
+            return ok;
+        }
+        tries += 1;
+    }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -544,9 +567,15 @@ pub extern "system" fn ReadFile(
 /// user mode, where a guarded block faults into the guard like the title's
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
+/// `VICTORY_READ_BESIDE=0` (`victory_gpu::read_beside`): straight into the
+/// buffer, its guarded blocks opened first, as before.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
     let total = size.saturating_mul(count);
+    if !victory_gpu::read_beside() {
+        victory_gpu::kernel_will_write(buffer as usize, total);
+        return read(buffer, size, count, stream);
+    }
     if buffer.is_null() || total == 0 {
         // The CRT's own checks and answer (EINVAL, or nothing to read).
         return read(buffer, size, count, stream);
