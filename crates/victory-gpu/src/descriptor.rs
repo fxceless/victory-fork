@@ -179,13 +179,19 @@ fn mirror(handle: u64) {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+/// `VICTORY_HEAP_SYNC_PARALLEL=1` opts in to concurrent page scans for large batches.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    sync_heaps_inner(parallel_scan_on());
+}
+
+#[cfg(windows)]
+fn sync_heaps_inner(parallel: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
@@ -203,7 +209,30 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let ranges = written.take(start as usize, end as usize);
+        if page_at_once() && parallel && ranges.iter().map(|&(from, to)| {
+            if from >= to { return 0 }
+            (to - 1) / crate::watch::PAGE - from / crate::watch::PAGE + 1
+        }).sum::<usize>() >= 32 {
+            let mut bounds = ranges.iter().copied().flat_map(|(from, to)| {
+                ((from & !(crate::watch::PAGE - 1))..to).step_by(crate::watch::PAGE)
+                    .map(move |page| (page.max(from), (page + crate::watch::PAGE).min(to)))
+            });
+            loop {
+                let batch: Vec<_> = bounds.by_ref().take(256).collect();
+                if batch.is_empty() { break }
+                scan_descriptor_pages(&batch, (start as usize, step, mirrored_count), |records| {
+                    if let Some(records) = records {
+                        pages += 1;
+                        let (seen, made) = host.mirror_prepared_page(records, start, step);
+                        looked += seen;
+                        mirrored += made;
+                    }
+                });
+            }
+            continue;
+        }
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -252,6 +281,98 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+#[cfg(windows)]
+fn parallel_scan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PARALLEL").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PreparedRecord {
+    index: u32,
+    print: u64,
+    empty: bool,
+}
+
+#[cfg(windows)]
+fn prepare_descriptor_page(
+    (from, to): (usize, usize),
+    (start, step, count): (usize, u64, u32),
+    scratch: &mut Vec<u8>,
+) -> Option<Vec<PreparedRecord>> {
+    scratch.resize(to - from, 0);
+    if !crate::host::read_into(from as *const u8, scratch) {
+        return None;
+    }
+    let records = changed_slots(from, to, start, step, count).filter_map(|index| {
+        let at = (start + (index * step) as usize).checked_sub(from)?;
+        let record = scratch.get(at..at + step as usize)?;
+        Some(PreparedRecord {
+            index: index as u32,
+            print: host::record_print(record) | 1,
+            empty: record.iter().all(|&b| b == 0),
+        })
+    }).collect();
+    Some(records)
+}
+
+/// Workers own their input snapshots and have no access to host heaps.
+/// One queued page per worker bounds memory; round-robin consumption
+/// preserves the serial publishing order, even with clipped ranges.
+#[cfg(windows)]
+fn scan_descriptor_pages(
+    bounds: &[(usize, usize)],
+    spec: (usize, u64, u32),
+    mut publish: impl FnMut(Option<Vec<PreparedRecord>>),
+) {
+    if bounds.len() < 32 {
+        let mut scratch = Vec::new();
+        for &page in bounds {
+            publish(prepare_descriptor_page(page, spec, &mut scratch));
+        }
+        return;
+    }
+    const WORKERS: usize = 4;
+    std::thread::scope(|scope| {
+        let workers: [_; WORKERS] = std::array::from_fn(|worker| {
+            let (send, recv) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let mut scratch = Vec::new();
+                for &page in bounds.iter().skip(worker).step_by(WORKERS) {
+                    if send.send(prepare_descriptor_page(page, spec, &mut scratch)).is_err() {
+                        break;
+                    }
+                }
+            });
+            recv
+        });
+        for page in 0..bounds.len() {
+            publish(workers[page % WORKERS].recv().expect("descriptor page worker stopped"));
+        }
+    });
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn parallel_descriptor_pages_match_serial_with_clips_and_cap() {
+    let page = crate::watch::PAGE;
+    let data: Vec<u8> = (0..64 * page + 64).map(|i| (i ^ (i >> 13)) as u8).collect();
+    let start = data.as_ptr() as usize + 7;
+    let bounds: Vec<_> = (0..64).map(|p| {
+        let from = start + p * page + 11;
+        (from, from + page - 25)
+    }).collect();
+    let spec = (start, 32, (40 * page / 32 + 37) as u32);
+    let mut scratch = Vec::new();
+    let expected: Vec<_> = bounds.iter().map(|&b| prepare_descriptor_page(b, spec, &mut scratch)).collect();
+    let mut actual = Vec::new();
+    scan_descriptor_pages(&bounds, spec, |p| actual.push(p));
+    assert_eq!(actual, expected);
+    assert_eq!(actual[0].as_ref().unwrap()[0].index, 1);
+    assert!(actual[63].as_ref().unwrap().is_empty());
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
@@ -1282,6 +1403,63 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    #[ignore = "uses global heap counters; run alone for native A/B timings"]
+    fn parallel_descriptor_sync_on_placed_heap() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let page = crate::watch::PAGE;
+        let size = page * 300;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT | 0x20_0000, // MEM_WRITE_WATCH
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: VIEWS_KIND, count: (size / 32) as u32, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: size as u64 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut record = [0u64; 4];
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), record.as_mut_ptr() as u64);
+            let indices = |n: usize| (0..n).flat_map(|p| [p * page / 32, (p+1)*page/32-1]);
+            for n in [4, 40, 200, 300] {
+                let mut samples = [Vec::<u128>::new(), Vec::<u128>::new()];
+                for pair in 0..14 {
+                    for mode in [pair % 2, (pair + 1) % 2] {
+                        for i in indices(n) {
+                            // SAFETY: aligned slot in this mapped synthetic heap.
+                            unsafe { memory.cast::<[u64;4]>().add(i).write_volatile(record) };
+                            assert!(!host.made(i as u32));
+                        }
+                        let started = std::time::Instant::now();
+                        sync_heaps_inner(mode != 0);
+                        let ns = started.elapsed().as_nanos();
+                        for i in indices(n) {
+                            assert!(host.made(i as u32), "mode {mode}, page {}, slot {i}", i*32/page);
+                            // SAFETY: same allocation and slot as above.
+                            unsafe { memory.cast::<[u64;4]>().add(i).write_volatile([0;4]) };
+                        }
+                        sync_heaps_inner(false);
+                        if pair >= 2 { samples[mode].push(ns); }
+                    }
+                }
+                for (mode, s) in samples.iter_mut().enumerate() {
+                    s.sort_unstable();
+                    println!("FULL_PAGE_SYNC,{n},{mode},{:.4}", (s[5] + s[6]) as f64 / 2e6);
+                }
+            }
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.

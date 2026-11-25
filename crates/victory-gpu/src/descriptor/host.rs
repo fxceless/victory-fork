@@ -1918,6 +1918,42 @@ impl HostHeap {
         (looked, due.len() as u64)
     }
 
+    /// Publish pre-scanned fingerprints in page order. The cache and live
+    /// table-deferral decisions still belong to this one publishing thread.
+    pub(super) fn mirror_prepared_page(
+        &self,
+        records: Vec<super::PreparedRecord>,
+        start: u64,
+        step: u64,
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let looked = records.len() as u64;
+        let due = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let mut due = records;
+            due.retain(|record| {
+                let Some(last) = copied.get_mut(record.index as usize) else { return false };
+                if *last == record.print || (*last == 0 && record.empty) {
+                    return false;
+                }
+                if !tables && self.tabled_lately(record.index, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                *last = record.print;
+                true
+            });
+            due
+        };
+        for record in &due {
+            self.mirror(record.index, start + u64::from(record.index) * step, false);
+        }
+        (looked, due.len() as u64)
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -2241,7 +2277,7 @@ pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// equal records give equal prints, and two different records the same
 /// print about once in 2^64. Not a hash anyone can attack: the records
 /// are our own.
-fn record_print(record: &[u8]) -> u64 {
+pub(super) fn record_print(record: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut h = K ^ record.len() as u64;
     let mut words = record.chunks_exact(8);
