@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, RAY_PROBE_DWORDS};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -106,7 +106,7 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            faults: make(u64::from(MEMORY_FAULTS + RAY_PROBE_DWORDS), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
@@ -194,8 +194,45 @@ impl Memory {
         }
     }
 
+    /// The node tests' counts since the last frame (`VICTORY_RAY_PROBE=1`,
+    /// `victory_shader` `RAY_PROBE_DWORDS`), logged and cleared.
+    fn take_ray_probe(&mut self) {
+        let mut words = [0u32; RAY_PROBE_DWORDS as usize];
+        for (k, word) in words.iter_mut().enumerate() {
+            // SAFETY: inside the faults' mapping (it is that much longer);
+            // the GPU may be adding, a count missed now is logged next frame.
+            let at = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + k) };
+            // SAFETY: as above.
+            *word = unsafe { at.read_volatile() };
+            if *word != 0 {
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
+        if words.iter().all(|&w| w == 0) {
+            return;
+        }
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if said < 100 || said.is_multiple_of(20) {
+            let [tests, boxes, box_hits, triangles, triangle_hits, near, missing, _] = words;
+            tracing::info!(
+                frame = self.frame,
+                tests,
+                boxes,
+                box_hits,
+                triangles,
+                triangle_hits,
+                near,
+                missing,
+                "ray probe: node tests of title memory since the last frame"
+            );
+        }
+    }
+
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        self.take_ray_probe();
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,

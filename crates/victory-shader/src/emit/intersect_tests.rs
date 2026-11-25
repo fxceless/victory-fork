@@ -658,6 +658,26 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
+/// With the ray probe on, a node test of title memory also counts what it
+/// found into the words after the fault notes: the program still lowers
+/// and validates, with wave operations and the same root views; it is
+/// longer than without.
+#[test]
+fn the_ray_probe_counts_node_tests_and_still_validates() {
+    use super::lower::intersect::TEST_RAY_PROBE;
+    for wide in [true, false] {
+        TEST_RAY_PROBE.set(Some(false));
+        let (plain, _) = build(wide, WHOLE).expect("lowers without the probe");
+        TEST_RAY_PROBE.set(Some(true));
+        let probed = build(wide, WHOLE);
+        TEST_RAY_PROBE.set(None);
+        let (probed, _) = probed.expect("lowers with the probe");
+        assert!(probed.root_srvs.contains(&super::SLOT_MEMORY));
+        assert_eq!(probed.root_uavs, plain.root_uavs);
+        assert!(probed.dxil.len() > plain.dxil.len());
+    }
+}
+
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two

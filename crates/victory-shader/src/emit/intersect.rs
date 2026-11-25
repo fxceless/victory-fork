@@ -37,6 +37,21 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The tests' setting of [`ray_probe_on`] on this thread.
+    pub(in crate::emit) static TEST_RAY_PROBE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_RAY_PROBE=1`: node tests of title memory count what they find
+/// ([`Lower::ray_probe`]); the host logs the counts each frame. Part of the
+/// translation. A diagnostic: one atomic add per word and wave per test.
+pub(crate) fn ray_probe_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAY_PROBE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAY_PROBE").is_some_and(|v| v == "1"))
 }
 
 /// Where the instruction's node is.
@@ -134,6 +149,8 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // Whether the node's first half had no copy (title memory only).
+        let mut missing = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -163,7 +180,8 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                let (handle, byte, absent) = self.bvh_memory_parts(low, high, guard);
+                missing = Some(absent);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -214,6 +232,10 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, zero));
         }
+        if let Some(missing) = missing.filter(|_| ray_probe_on()) {
+            let found: Vec<V> = results.iter().map(|r| r.0).collect();
+            self.ray_probe(is_box, is_triangle, &found, &ray, missing);
+        }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
@@ -221,11 +243,66 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// [`ray_probe_on`]: counts this node test, per wave, into the words
+    /// after the fault notes (`shader.rs` [`super::shader::RAY_PROBE_DWORDS`]):
+    /// tests, box tests, boxes with a child hit, triangle tests, triangle
+    /// hits, triangle hits within the ray's extent, and nodes whose first
+    /// half had no copy. One atomic add per word from the wave's first
+    /// active lane.
+    fn ray_probe(&mut self, is_box: V, is_triangle: V, found: &[V], ray: &Ray, missing: V) {
+        use crate::emit::{MEMORY_FAULTS, SLOT_FAULTS};
+        let c = self.cur;
+        let none = self.s.m.i32(bvh::NONE);
+        let child = self.s.m.cmp(c, pred::NE, found[0], none);
+        let box_hit = self.s.m.bin(c, Bin::And, is_box, child);
+        let infinity = self.s.m.i32(f32::INFINITY.to_bits());
+        let finite = self.s.m.cmp(c, pred::NE, found[0], infinity);
+        let triangle_hit = self.s.m.bin(c, Bin::And, is_triangle, finite);
+        let (numerator, denominator) = (self.as_float(found[0]), self.as_float(found[1]));
+        // (a float division: the binary operation's code is the same)
+        let distance = self.s.m.bin(c, Bin::SDiv, numerator, denominator);
+        let near = self.s.m.cmp(c, pred::OLE, distance, ray.extent);
+        let near = self.s.m.bin(c, Bin::And, triangle_hit, near);
+        let yes = self.s.m.bool(true);
+        let counted = [yes, is_box, box_hit, is_triangle, triangle_hit, near, missing];
+        let i32t = self.s.t.i32;
+        let counts: Vec<V> = counted
+            .iter()
+            .map(|&bit| self.s.op(self.cur, "waveAllOp", Attr::NoUnwind, i32t, 135, &[bit]))
+            .collect();
+        let first = self
+            .s
+            .op(self.cur, "waveIsFirstLane", Attr::NoUnwind, self.s.t.i1, 110, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lane = self.begin_guarded(Some(first));
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let (add, undef) = (self.s.m.i32(0), self.s.m.undef(i32t));
+        for (k, &count) in counts.iter().enumerate() {
+            let byte = self.s.m.i32(4 * (MEMORY_FAULTS + k as u32));
+            self.s.op(
+                self.cur,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[faults, add, byte, undef, undef, count],
+            );
+        }
+        self.end_guarded(lane, &[]);
+    }
+
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
     fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
+        let (handle, byte, _) = self.bvh_memory_parts(low, high, guard);
+        (handle, byte)
+    }
+
+    /// [`Lower::bvh_memory`], and whether the page had no copy (false in
+    /// the tests' stand-in).
+    fn bvh_memory_parts(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -242,9 +319,10 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at);
+            let missing = self.s.m.bool(false);
+            return (handle, at, missing);
         }
-        self.memory(low, high, guard)
+        self.memory_parts(low, high, guard)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
