@@ -33,6 +33,7 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
+    sparse_host: std::sync::Weak<crate::resource::HostTexture>,
     buffer: ID3D12Resource,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
@@ -834,6 +835,31 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        // A stage may change during a refresh-only list. Mapping a newly
+        // nonzero level preserves the prior zero until an actual upload,
+        // as for a fresh committed texture. Promotion is monotonic.
+        let mut unavailable = 0;
+        if let Some(h) = self.sparse_host.upgrade()
+            && let Some(s) = &h.sparse
+        {
+            for i in 0..s.first() as usize {
+                let start = self.layout.mips[i].offset as usize;
+                let end = if i == 0 {
+                    self.layout.slice_size
+                } else {
+                    self.layout.mips[i - 1].offset
+                } as usize;
+                if tiled
+                    .get(start..end)
+                    .is_none_or(|part| part.iter().any(|&b| b != 0))
+                {
+                    if !s.promote(&h.texture, i as u32) {
+                        unavailable = s.first();
+                    }
+                    break;
+                }
+            }
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -852,6 +878,13 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
+            if mip < unavailable {
+                // This generation refused the heap. Its live SRVs can only
+                // select resident levels. Never write nonzero bytes into a
+                // NULL tile through a copy in a previously recorded list.
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -1095,6 +1128,17 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    if crate::sparse::enabled()
+        && let Some(s) = STAGING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&(resource as usize)).cloned())
+    {
+        return Some(s);
+    }
+    // Before STAGING: eviction takes the resource's made lock, then STAGING.
+    let sparse_host = crate::resource::sparse_staging(resource, texture);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -1148,6 +1192,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
+        sparse_host,
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
@@ -1170,6 +1215,119 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    #[ignore = "opt-in D3D12 sparse texture study, run in its own process"]
+    fn sparse_placed_bc_preserves_identity_and_promotes_for_views_and_bytes() {
+        use crate::descriptor::{View, host::placed_texture};
+        use crate::object::This;
+        use windows_sys::Win32::System::Memory::*;
+        assert!(crate::sparse::enabled());
+        let placed = |base: usize, first: u32, format: u32| {
+            let resource = [3, 0, 0, 0, 2048, 0, 2048, 0x3_0001, format, 1, 0, 0, 0, 0];
+            let mut view = [0; 16];
+            (
+                view[0], view[1], view[2], view[4], view[5], view[10], view[11],
+            ) = (
+                format,
+                4,
+                5768,
+                first,
+                3 - first,
+                base as u32,
+                (base as u64 >> 32) as u32,
+            );
+            let Some(View::Shader(object, _)) =
+                placed_texture(&View::Placed(false, resource, view))
+            else {
+                panic!("missing placed view")
+            };
+            object as This
+        };
+        // The process owns independent synthetic reservations. The title
+        // resource lookup intentionally retains them for its lifetime.
+        let memory = || unsafe {
+            let base = VirtualAlloc(core::ptr::null_mut(), 8 << 20, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base, 4096, MEM_COMMIT, PAGE_READWRITE), base);
+            base as usize
+        };
+        let a = memory();
+        let object = placed(a, 2, 71);
+        let h = crate::resource::host_copy(object).unwrap();
+        let s = h
+            .sparse
+            .as_ref()
+            .expect("restricted BC1 SRV reserves its missing top mips");
+        let first = s.first();
+        assert!(first > 0 && first <= 2);
+        let stage = super::staging(object, &h.texture).unwrap();
+        let mut tiled = vec![0u8; stage.layout.size as usize];
+        stage.detile(&tiled);
+        assert_eq!(s.first(), first, "all zero content does not need new tiles");
+        tiled[stage.layout.mips[0].offset as usize] = 7;
+        stage.detile(&tiled);
+        assert_eq!(
+            s.first(),
+            0,
+            "new source content is retained even for a hidden level"
+        );
+        assert_eq!(
+            h.texture,
+            crate::resource::host_copy(object).unwrap().texture
+        );
+        let b = memory();
+        let second = placed(b, 2, 71);
+        let original = crate::resource::host_copy(second).unwrap();
+        assert!(original.sparse.as_ref().unwrap().first() > 0);
+        assert_eq!(second, placed(b, 0, 71));
+        assert_eq!(original.sparse.as_ref().unwrap().first(), 0);
+        assert_eq!(
+            original.texture,
+            crate::resource::host_copy(second).unwrap().texture
+        );
+        assert!(
+            crate::resource::host_copy(placed(memory(), 0, 71))
+                .unwrap()
+                .sparse
+                .is_none()
+        );
+        assert!(
+            crate::resource::host_copy(placed(memory(), 2, 98))
+                .unwrap()
+                .sparse
+                .is_none()
+        );
+
+        let object = placed(memory(), 2, 71);
+        let h = crate::resource::host_copy(object).unwrap();
+        let s = h.sparse.as_ref().unwrap();
+        let first = s.first();
+        let stage = super::staging(object, &h.texture).unwrap();
+        let mut tiled = vec![0x7f; stage.layout.size as usize];
+        crate::sparse::FAIL_PROMOTION.with(|f| f.set(true));
+        stage.detile(&tiled);
+        assert_eq!(
+            s.first(),
+            first,
+            "failed allocation cannot change the mapped range"
+        );
+        let byte = |i: usize| unsafe { *stage.data.add(stage.footprints[i].Offset as usize) };
+        assert_eq!(
+            byte(0),
+            0,
+            "an unavailable tile must not receive nonzero copy data"
+        );
+        assert_eq!(
+            byte(first as usize),
+            0x7f,
+            "a resident mip still receives new data"
+        );
+        tiled.fill(0x42);
+        stage.detile(&tiled);
+        assert_eq!(byte(0), 0);
+        assert_eq!(byte(first as usize), 0x42);
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

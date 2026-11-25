@@ -1471,6 +1471,21 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            // A failed growth must not retire another working view of the
+            // same texture or record the refused generation as materialized.
+            if for_draw
+                && crate::sparse::enabled()
+                && let Some(refused) = sparse_refused(&view)
+            {
+                let same_resource = self.kept.lock().unwrap_or_else(|e| e.into_inner())
+                    [index as usize]
+                    .as_ref()
+                    == Some(&refused);
+                if !same_resource {
+                    self.unmake(&mut made, index);
+                }
+                return None;
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2202,7 +2217,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                if *unordered {
+                    once!(
+                        dimension = resource[0],
+                        "placed unordered texture view not mirrored"
+                    );
+                }
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -2254,7 +2274,32 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
+    crate::resource::sparse_view(texture, first_visible_mip(desc)).ok()?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+fn first_visible_mip(desc: &[u32; 16]) -> u32 {
+    if desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        && desc[5] > 0
+        && desc[6] == 0
+        && desc[7] == 0
+    {
+        desc[4]
+    } else {
+        0
+    }
+}
+
+fn sparse_refused(view: &View) -> Option<ID3D12Resource> {
+    let View::Placed(false, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] != 3 || !matches!(resource[8], 70..=72) {
+        return None;
+    }
+    let address = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+    let texture = crate::resource::texture_at(address, resource)?;
+    crate::resource::sparse_view(texture, first_visible_mip(desc)).err()
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -2428,6 +2473,85 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the opt-in D3D12 sparse backing in a dedicated test process"]
+    fn failed_sparse_promotion_keeps_the_last_usable_descriptor() {
+        use windows_sys::Win32::System::Memory::*;
+        assert!(crate::sparse::enabled());
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null_mut(), 8 << 20, MEM_RESERVE, PAGE_NOACCESS) }
+                as usize;
+        assert_ne!(base, 0);
+        assert_eq!(
+            unsafe { VirtualAlloc(base as _, 4096, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            base
+        );
+        let resource = [3, 0, 0, 0, 2048, 0, 2048, 0x3_0001, 71, 1, 0, 0, 0, 0];
+        let at = |base: usize, first| {
+            let mut desc = [0; 16];
+            (
+                desc[0], desc[1], desc[2], desc[4], desc[5], desc[10], desc[11],
+            ) = (
+                71,
+                4,
+                5768,
+                first,
+                3 - first,
+                base as u32,
+                (base as u64 >> 32) as u32,
+            );
+            // ResourceDesc padding can differ between writes for this same allocation.
+            let mut resource = resource;
+            resource[1] = 0x1234 + first;
+            resource[13] = 0xabcd - first;
+            let view = View::Placed(false, resource, desc);
+            let [i, g] = super::super::words_for(view);
+            [VIEW_TAG, i, g, 0, 0, 0, 0, 0]
+        };
+        let low_words = at(base, 2);
+        let wide_words = at(base, 0);
+        let low = low_words.as_ptr() as u64;
+        let wide = wide_words.as_ptr() as u64;
+        let heap = HostHeap::new(false, 8).expect("test device");
+        assert!(heap.mirror(1, low, true).is_some());
+        assert!(heap.texture_slot_made_from(1, low));
+        crate::sparse::FAIL_PROMOTION.with(|f| f.set(true));
+        assert!(heap.mirror(1, wide, true).is_none());
+        assert!(
+            !heap.texture_slot_made_from(1, wide),
+            "the refused key was not stored as ready"
+        );
+        assert!(
+            heap.texture_slot_made_from(1, low),
+            "the old slot still holds its resource"
+        );
+        assert!(heap.mirror(1, low, true).is_some());
+        let other =
+            unsafe { VirtualAlloc(std::ptr::null_mut(), 8 << 20, MEM_RESERVE, PAGE_NOACCESS) }
+                as usize;
+        assert_ne!(other, 0);
+        assert_eq!(
+            unsafe { VirtualAlloc(other as _, 4096, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            other
+        );
+        let other_words = at(other, 2);
+        let other_handle = other_words.as_ptr() as u64;
+        assert!(heap.mirror(2, other_handle, true).is_some());
+        assert!(heap.texture_slot_made_from(2, other_handle));
+        assert!(heap.mirror(2, wide, true).is_none());
+        assert!(
+            !heap.texture_slot_made_from(2, other_handle),
+            "an unrelated resource cannot survive in the refused slot"
+        );
+        assert!(heap.mirror(3, wide, true).is_none());
+        assert!(!heap.texture_slot_made_from(3, wide));
+        assert!(
+            !heap.texture_slot_made_from(2, wide),
+            "a new slot must not expose missing mip data"
+        );
+        assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

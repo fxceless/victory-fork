@@ -1118,6 +1118,7 @@ struct Resource {
 /// lists that name it).
 #[cfg(windows)]
 pub(crate) struct HostTexture {
+    pub(crate) sparse: Option<crate::sparse::Sparse>,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
@@ -1155,6 +1156,7 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    first_view: std::sync::atomic::AtomicU32,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1303,7 +1305,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let sparse = if sparse_candidate(r) {
+            sparse_host(r)
+        } else {
+            None
+        };
+        let (texture, sparse) = if let Some((tex, sparse)) = sparse {
+            (Some(tex), Some(sparse))
+        } else {
+            (host_texture(&r.desc, r.host.state, clear), None)
+        };
+        let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1321,6 +1333,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.sparse = sparse;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1338,6 +1351,161 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     r.host.used.store(crate::host::moment(), Relaxed);
     made.clone()
+}
+
+#[cfg(windows)]
+// Only a wholly uncommitted range is eligible. Guarded and no-access
+// committed pages can still contain bytes. A failed query conservatively
+// keeps the conventional allocation.
+fn region_present(start: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::*;
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    if len > 0 && crate::texture::committed(start as *const u8, 1) {
+        return true;
+    }
+    let mut at = start;
+    while at < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+        if unsafe { VirtualQuery(at as _, &mut mbi, size_of_val(&mbi)) } == 0 {
+            return true;
+        }
+        if mbi.State == MEM_COMMIT {
+            return true;
+        }
+        let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if next <= at {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn sparse_host(
+    r: &Resource,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    crate::sparse::Sparse,
+)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let first = r.host.first_view.load(Relaxed);
+    if first == 0 || first >= u32::from(r.desc.mip_levels) {
+        return None;
+    }
+    let layout = texture_layout(&r.desc)?.planes[0].layout.clone();
+    if layout.slices != 1 || layout.desc.swizzle.xor() {
+        return None;
+    }
+    let base = r.data() as usize;
+    let mut absent = 0;
+    for (i, m) in layout
+        .mips
+        .iter()
+        .enumerate()
+        .take(first.min(layout.first_tail_mip) as usize)
+    {
+        let end = if i == 0 {
+            layout.slice_size
+        } else {
+            layout.mips[i - 1].offset
+        };
+        // A guarded or no-access committed page can still hold data. Only
+        // wholly uncommitted spans qualify, regardless of permissions.
+        if end <= m.offset
+            || region_present(
+                base.checked_add(m.offset as usize)?,
+                (end - m.offset) as usize,
+            )
+        {
+            break;
+        }
+        absent += 1;
+    }
+    if absent == 0 {
+        return None;
+    }
+    // The repr(C) resource description is also used by host_texture; normalize
+    // the title-specific fields exactly as the committed BC path does.
+    let mut d = r.desc;
+    d.alignment = 0;
+    d.layout = 0;
+    d.flags &= 0xf;
+    d.format = pc_format(d.format);
+    let desc = unsafe {
+        (&raw const d)
+            .cast::<D3D12_RESOURCE_DESC>()
+            .read_unaligned()
+    };
+    let state = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(r.host.state),
+    ) as i32);
+    crate::sparse::Sparse::try_new(desc, state, absent)
+}
+
+#[cfg(windows)]
+fn sparse_candidate(r: &Resource) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::sparse::enabled()
+        && r.host.placed.load(Relaxed)
+        && r.desc.dimension == 3
+        && r.desc.depth_or_array_size == 1
+        && r.desc.sample_count == 1
+        && (r.desc.flags & 0xf) == 0
+        && matches!(r.desc.format, 70..=72)
+        && r.desc.mip_levels >= 2
+        && r.desc.width >= 512
+        && r.desc.height >= 512
+}
+
+#[cfg(windows)]
+pub(crate) fn sparse_view(
+    this: This,
+    first: u32,
+) -> Result<(), windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::sparse::enabled() {
+        return Ok(());
+    }
+    let r = resource(this);
+    if !sparse_candidate(r) {
+        return Ok(());
+    }
+    r.host.first_view.fetch_min(first, Relaxed);
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((h, _)) = made.as_ref()
+        && let Some(s) = &h.sparse
+        && !s.promote(&h.texture, first)
+    {
+        return Err(h.texture.clone());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn sparse_staging(
+    this: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> std::sync::Weak<HostTexture> {
+    if !crate::sparse::enabled() {
+        return std::sync::Weak::new();
+    }
+    let made = resource(this)
+        .host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((h, _)) = made.as_ref()
+        && h.texture == *texture
+        && h.sparse.is_some()
+    {
+        return std::sync::Arc::downgrade(h);
+    }
+    std::sync::Weak::new()
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1768,6 +1936,7 @@ impl HostTexture {
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
+            sparse: None,
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
@@ -1995,6 +2164,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            first_view: std::sync::atomic::AtomicU32::new(u32::MAX),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
