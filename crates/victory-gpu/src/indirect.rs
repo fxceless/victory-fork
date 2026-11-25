@@ -4,9 +4,17 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled by the system's compiler as a 5.1
+//! shader; its root signature is made beside it), leaving the title's
+//! argument and count buffers untouched.
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! Wine's has no methods on writable buffers but `Store*` (no `Load*`, no
+//! `Interlocked*` methods: those only as functions) and ignores a
+//! `[RootSignature]`. So the two buffers the shader writes are structured
+//! buffers of `uint` indexed in words (a root descriptor can be either; the
+//! callers refuse offsets, strides and addresses that are not multiples of
+//! 4), and the root signature is serialized here.
 //!
 //! The scratch buffer is left readable as indirect arguments after a clamp
 //! and stays so until the next clamp into it, which moves it straight back
@@ -37,7 +45,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -53,10 +60,11 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+// Both written ones in words.
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
+// records run empty. Word 0; words 1 and 2 are diagnostics (below).
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -73,7 +81,6 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
@@ -91,7 +98,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if ((has_count & 4u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
     }
-    uint dst_at = id.x * stride;
+    // In words: the stride is a multiple of 4.
+    uint dst_at = id.x * (stride / 4);
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -167,8 +175,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // record that does not fit whole runs empty and takes the rest.
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // No `[allow_uav_condition]`: Wine's compiler stops at it ("not
+        // yet implemented"), and Microsoft's builds the loop without it.
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -179,7 +188,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -197,8 +206,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -208,17 +217,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     }
 }
@@ -257,8 +269,14 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
-/// replaced).
+/// replaced), with the clamp's root signature.
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    make_with(device, source, root_signature(device)?)
+}
+
+/// `source` (a compute shader whose entry is `main`) compiled and made with
+/// `root`.
+fn make_with(device: &ID3D12Device, source: &str, root: ID3D12RootSignature) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -291,11 +309,10 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -306,6 +323,36 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         })?;
         Ok(Clamp { root, pso })
     }
+}
+
+/// The clamp's root signature, as `record_clamp_as` binds it: the record
+/// constants (six at b0), the source arguments and the count as root SRVs
+/// (t0, t1), the clamped arguments and the budget as root UAVs (u0, u1).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_view};
+    let params = [
+        root_constants(0, 6),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    crate::host::root_signature(device, &params, "argument clamp")
+}
+
+/// The window check's root signature ([`CHECK_SOURCE`]): the word count (one
+/// constant at b0), the two records as root SRVs (t0, t1), the results and
+/// the fresh clamp's budget as root UAVs (u0, u1).
+fn check_root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_view};
+    let params = [
+        root_constants(0, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    crate::host::root_signature(device, &params, "window check")
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -713,15 +760,15 @@ pub(crate) fn window_check() -> bool {
 /// that differs there (eight dwords of each), and zeroes the fresh clamp's
 /// own budget (`u1`) for the next check.
 const CHECK_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Check : register(b0) {
     uint words;
 };
 ByteAddressBuffer window_record : register(t0);
 ByteAddressBuffer fresh_record : register(t1);
-RWByteAddressBuffer results : register(u0);
-RWByteAddressBuffer fresh_budget : register(u1);
-[RootSignature(RS)]
+// In words, written with what Wine's compiler takes too (see the module's
+// notes); the root signature is [`check_root_signature`].
+RWStructuredBuffer<uint> results : register(u0);
+RWStructuredBuffer<uint> fresh_budget : register(u1);
 [numthreads(1, 1, 1)]
 void main() {
     bool same = true;
@@ -731,18 +778,20 @@ void main() {
         }
     }
     uint was;
-    results.InterlockedAdd(4, 1, was);
+    InterlockedAdd(results[1], 1u, was);
     if (!same) {
         uint before;
-        results.InterlockedAdd(0, 1, before);
+        InterlockedAdd(results[0], 1u, before);
         if (before == 0) {
             for (uint k = 0; k < min(words, 8u); k++) {
-                results.Store(8 + 4 * k, window_record.Load(4 * k));
-                results.Store(40 + 4 * k, fresh_record.Load(4 * k));
+                results[2 + k] = window_record.Load(4 * k);
+                results[10 + k] = fresh_record.Load(4 * k);
             }
         }
     }
-    fresh_budget.Store3(0, uint3(0, 0, 0));
+    fresh_budget[0] = 0u;
+    fresh_budget[1] = 0u;
+    fresh_budget[2] = 0u;
 }
 "#;
 
@@ -751,7 +800,7 @@ fn compare() -> Option<&'static Clamp> {
     COMPARE
         .get_or_init(|| {
             let device = &host()?.device;
-            match make_from(device, CHECK_SOURCE) {
+            match check_root_signature(device).and_then(|root| make_with(device, CHECK_SOURCE, root)) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "no window check");
@@ -927,16 +976,23 @@ mod tests {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
+    // In the form Wine's compiler builds too (see the module's notes): the
+    // hit count is word 0 of a structured buffer, the root signature (one
+    // root UAV at u0) is made by [`worker`].
     const WORKER_CS: &str = r#"
-#define RS "UAV(u0)"
-RWByteAddressBuffer hits : register(u0);
-[RootSignature(RS)]
+RWStructuredBuffer<uint> hits : register(u0);
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
-    hits.InterlockedAdd(0, 1, prev);
+    InterlockedAdd(hits[0], 1u, prev);
 }
 "#;
+
+    /// [`WORKER_CS`] with its root signature.
+    fn worker(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+        let params = [crate::host::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)];
+        make_with(device, WORKER_CS, crate::host::root_signature(device, &params, "test worker")?)
+    }
 
     struct WarpHarness {
         device: ID3D12Device,
@@ -979,7 +1035,7 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let worker = worker(&device).expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -2017,7 +2073,7 @@ void main() {
             return;
         };
         let _ = host.log_messages();
-        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let worker = worker(&host.device).expect("worker shader must compile");
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
         let signature = {
@@ -2262,7 +2318,7 @@ void main() {
         let Ok(list) = host.new_list() else {
             return;
         };
-        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let worker = worker(&host.device).expect("worker shader must compile");
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
         const STEP: u32 = 32;
@@ -2339,6 +2395,86 @@ void main() {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
+    }
+
+    /// The clamp's output on the host GPU (the WARP tests above need a WARP
+    /// adapter, which Wine has not): records at offsets into the source,
+    /// a count read at an offset into its buffer, strides past the
+    /// smallest, and every kind, word for word as clamped.
+    #[test]
+    fn clamped_records_land_word_for_word_on_the_host() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().expect("command list");
+        let (src, src_ptr) = host.shared_buffer(256).expect("source buffer");
+        let (count, count_ptr) = host.shared_buffer(256).expect("count buffer");
+        let back = host.read_back_buffer(256).expect("read-back buffer");
+        let words = src_ptr.cast::<u32>();
+        let put = |at: usize, record: &[u32]| {
+            // SAFETY: inside the mapped 256 bytes.
+            unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), words.add(at / 4), record.len()) };
+        };
+        // An indexed draw (kind 1, stride 20) at byte 16, and one of 2^32 - 1
+        // indices at byte 40; two dispatches (kind 2, stride 16) at byte
+        // 64, of which the count (one, at byte 8 of its buffer) lets the
+        // first run; a mesh dispatch (kind 10, stride 12) at byte 128.
+        put(16, &[1 << 22, 100, 11, 12, 13]);
+        put(40, &[u32::MAX, 5, 21, 22, 23]);
+        put(64, &[70_000, 2, 3, 0xab, 1, 1, 1, 0xcd]);
+        put(128, &[65_535, 7, 9]);
+        // SAFETY: inside the mapped 256 bytes.
+        unsafe { count_ptr.cast::<u32>().add(2).write_volatile(1) };
+        let cases: [(u64, Option<u64>, (u32, u32, u32), u64); 4] = [
+            (16, None, (1, 20, 1), 0),
+            (40, None, (1, 20, 1), 32),
+            (64, Some(8), (2, 16, 2), 64),
+            (128, None, (10, 12, 1), 128),
+        ];
+        for (at, count_at, spec, out) in cases {
+            let clamped = bound(&list, (&src, at), count_at.map(|c| (&count, c)), spec).expect("clamped");
+            // The scratch buffer is the same one each time: its record is
+            // copied out before the next clamp.
+            // SAFETY: an open list; live buffers in the states named.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&back, out, &clamped, 0, u64::from(spec.1));
+                l.ResourceBarrier(&[transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+            // (The scratch buffer stays readable as arguments: the next
+            // clamp moves it back, and the list's close to common.)
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the list has written and the host has
+        // waited for (`execute`).
+        unsafe { back.Map(0, None, Some(&mut mapped)) }.expect("mapped");
+        // SAFETY: the 256 mapped bytes.
+        let read = |at: usize, n: usize| unsafe { std::slice::from_raw_parts(mapped.cast::<u32>().add(at / 4), n).to_vec() };
+        // 2^22 vertices; instances cut to 2^26 / 2^22; the rest copied.
+        assert_eq!(read(0, 5), [1 << 22, 16, 11, 12, 13]);
+        // 2^32 - 1 vertices, cut to 2^24: at or past 2^23 vertices an
+        // instance a record is no draw of the title's and runs empty
+        // (fxceless f85101b6; before, it ran 2^24 vertices 4 times).
+        assert_eq!(read(32, 5), [0, 0, 21, 22, 23]);
+        // Groups cut to 65,535 per dimension; the fourth word copied. The
+        // second record is past the count and not looked at.
+        assert_eq!(read(64, 4), [65_535, 2, 3, 0xab]);
+        // A mesh dispatch: one-dimensional, at most 65,535 groups.
+        assert_eq!(read(128, 3), [65_535, 1, 1]);
+        // SAFETY: mapped above.
+        unsafe { back.Unmap(0, None) };
+        list.reset();
     }
 }
 

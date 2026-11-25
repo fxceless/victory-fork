@@ -1069,6 +1069,88 @@ pub(crate) fn compile(
     Ok(bytes.to_vec())
 }
 
+/// A root signature (version 1.1) of `params`, for a shader of ours.
+/// Made here and not taken from the shader: Wine's compiler, which is
+/// `D3DCompile` under Wine, does not embed a `[RootSignature]`, so the
+/// shader's blob has none.
+pub(crate) fn root_signature(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    what: &str,
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: the description points at the live `params`; the blobs are
+    // read in full before they are released.
+    unsafe {
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(
+                    error.GetBufferPointer().cast::<u8>(),
+                    error.GetBufferSize(),
+                );
+                tracing::warn!("{what} root signature: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
+/// A root parameter of `count` 32-bit constants at `b<register>`.
+pub(crate) fn root_constants(register: u32, count: u32) -> D3D12_ROOT_PARAMETER1 {
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Num32BitValues: count,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// A root descriptor (`kind`: SRV or UAV) at `t<register>` or `u<register>`,
+/// with the flags a root signature string's `SRV(...)` or `UAV(...)` gets
+/// by default in version 1.1: an SRV's data static while set at execute,
+/// a UAV's volatile.
+pub(crate) fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32) -> D3D12_ROOT_PARAMETER1 {
+    let flags = if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+        D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE
+    } else {
+        D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE
+    };
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Flags: flags,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
