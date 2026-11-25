@@ -127,12 +127,6 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
-    /// `watch::writes` kernel askings that failed (the range is not
-    /// write-watched: view memory or not watchable).
-    WatchFailed,
-    /// `watch::writes` askings not made because the range's first block is
-    /// already known to be guarded view memory (no kernel call).
-    WatchKnownView,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1271,7 +1265,10 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // `VICTORY_GPU_TIMING_TOP`: how many (40).
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let top = *TOP.get_or_init(|| std::env::var("VICTORY_GPU_TIMING_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(40));
+    for (what, (n, us, longest)) in by.into_iter().take(top) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,

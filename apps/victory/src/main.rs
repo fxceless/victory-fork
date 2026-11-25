@@ -84,6 +84,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate containers whose label or hash matches a pattern
+        /// (case-insensitive substring or hash prefix; repeatable or comma-separated).
+        #[arg(long)]
+        filter: Vec<String>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
@@ -114,6 +118,25 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Probe what this PC's card and Windows allow for title memory in
+    /// place (the in-place design's Stage 0), on a device of its own; no
+    /// title is run. One line per probe.
+    InplaceProbe {
+        /// Size of the first probe's cost measurement, in MB.
+        #[arg(long, default_value_t = 1024)]
+        mb: usize,
+        /// Leave out the probes that lock or commit gigabytes (P1, P2's
+        /// 4 GiB part, P7).
+        #[arg(long)]
+        small: bool,
+        /// Also map a tile into an opened heap (removes this probe's own
+        /// device on the software adapter; runs last).
+        #[arg(long)]
+        tiles: bool,
+        /// With the D3D12 debug layer (its errors are counted per probe).
+        #[arg(long)]
+        debug_layer: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -159,6 +182,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            filter,
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -172,7 +196,12 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            let filters: Vec<String> = filter
+                .into_iter()
+                .flat_map(|s| s.split(',').map(|t| t.trim().to_owned()).collect::<Vec<_>>())
+                .filter(|s| !s.is_empty())
+                .collect();
+            translate::run(paths, validate, pipelines, list, jobs, filters)
         }
         Command::Run {
             exe,
@@ -183,6 +212,20 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::InplaceProbe {
+            mb,
+            small,
+            tiles,
+            debug_layer,
+        } => {
+            #[cfg(windows)]
+            for line in victory_gpu::inplace_probe(mb, !small, tiles, debug_layer) {
+                println!("in place probe: {line}");
+            }
+            #[cfg(not(windows))]
+            let _ = (mb, small, tiles, debug_layer);
+            Ok(())
+        }
     }
 }
 
