@@ -455,7 +455,7 @@ fn library() -> Option<&'static Library> {
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
-                tracing::warn!("no host pipeline library: pipelines are not kept");
+                tracing::warn!("no host pipeline library: pipelines are not kept by us (the early list still is)");
             }
             library
         })
@@ -506,12 +506,19 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // RenderDoc's device refused the card's library, an empty one was
     // saved over 366 MB of built pipelines, and the next run drew black
     // until they were built again).
-    if rejected && let Some(dir) = DIR.get() {
-        if let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
-            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
-        }
+    if rejected
+        && let Some(dir) = DIR.get()
+        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE))
+    {
+        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
     }
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "the host makes no pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -593,7 +600,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -605,6 +612,26 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    // A host that makes no pipeline library (vkd3d-proton under Wine) keeps
+    // pipelines in caches of its own; the early list is kept all the same,
+    // so the next run starts making what this one drew as soon as the title
+    // creates it, and finds it in those caches.
+    let Some(library) = library() else {
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            let used: Vec<String> =
+                USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+            match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
+                Err(e) => {
+                    // Kept dirty, so the next save tries again even when no
+                    // new pipeline is drawn with.
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "early pipeline list not saved")
+                }
+            }
+        }
+        return;
+    };
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
