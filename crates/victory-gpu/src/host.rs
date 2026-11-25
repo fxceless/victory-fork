@@ -7557,8 +7557,28 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+fn present_sync_interval() -> u32 {
+    static INTERVAL: OnceLock<u32> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let Some(value) = std::env::var_os("VICTORY_PRESENT_SYNC") else {
+            return 0;
+        };
+        let interval = match value.to_str().and_then(|v| v.parse::<u32>().ok()) {
+            Some(n @ 0..=4) => n,
+            _ => {
+                tracing::warn!(?value, "invalid VICTORY_PRESENT_SYNC; expected 0..=4, using 0");
+                0
+            }
+        };
+        tracing::info!("present: sync interval={interval} (was 0)");
+        interval
+    })
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    // None disables logging; Some(None) waits for the first Present.
+    present_log: Option<Option<(u32, u32)>>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -8004,7 +8024,15 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let (sync_interval, flags) = (present_sync_interval(), DXGI_PRESENT(0));
+            if let Some(last) = &mut p.present_log {
+                let current = (sync_interval, flags.0);
+                if *last != Some(current) {
+                    tracing::info!("VICTORY_LOG_PRESENT Present SyncInterval={sync_interval} Flags={:#x}", flags.0);
+                    *last = Some(current);
+                }
+            }
+            let _ = p.swap_chain.Present(sync_interval, flags);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8043,12 +8071,52 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let log_present = std::env::var_os("VICTORY_LOG_PRESENT").is_some_and(|v| v == "1");
+            if log_present {
+                match swap_chain.GetDesc1() {
+                    Ok(d) => {
+                        let effect = match d.SwapEffect {
+                            DXGI_SWAP_EFFECT_FLIP_DISCARD => "FLIP_DISCARD",
+                            DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL => "FLIP_SEQUENTIAL",
+                            DXGI_SWAP_EFFECT_DISCARD => "DISCARD",
+                            DXGI_SWAP_EFFECT_SEQUENTIAL => "SEQUENTIAL",
+                            _ => "unknown",
+                        };
+                        tracing::info!(
+                            "VICTORY_LOG_PRESENT SwapEffect={effect}({}) BufferCount={} Format={} Width={} Height={} SampleDesc={}/{}",
+                            d.SwapEffect.0, d.BufferCount, d.Format.0, d.Width, d.Height,
+                            d.SampleDesc.Count, d.SampleDesc.Quality
+                        );
+                        tracing::info!(
+                            "VICTORY_LOG_PRESENT SwapChainFlags={:#x} ALLOW_TEARING={} FRAME_LATENCY_WAITABLE_OBJECT={} Scaling={} AlphaMode={} Stereo={}",
+                            d.Flags, d.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 != 0,
+                            d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 != 0,
+                            d.Scaling.0, d.AlphaMode.0, d.Stereo.as_bool()
+                        );
+                    }
+                    Err(_) => tracing::info!(
+                        "VICTORY_LOG_PRESENT SwapEffect=unknown BufferCount=unknown Format=unknown Width=unknown Height=unknown SampleDesc=unknown SwapChainFlags=unknown ALLOW_TEARING=unknown FRAME_LATENCY_WAITABLE_OBJECT=unknown Scaling=unknown AlphaMode=unknown Stereo=unknown"
+                    ),
+                }
+                let latency = swap_chain.GetMaximumFrameLatency().map(|v| v.to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                let mut info = WINDOWINFO { cbSize: std::mem::size_of::<WINDOWINFO>() as u32, ..Default::default() };
+                let style = GetWindowInfo(hwnd, &mut info).ok().map(|()| info.dwExStyle);
+                let style_bit = |bit: WINDOW_EX_STYLE| style.map(|v| (v.0 & bit.0 != 0).to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                // No SetMaximumFrameLatency call exists in this host path.
+                tracing::info!(
+                    "VICTORY_LOG_PRESENT SetMaximumFrameLatency=not_called MaximumFrameLatency={latency} WS_EX_NOREDIRECTIONBITMAP={} layered={}",
+                    style_bit(WS_EX_NOREDIRECTIONBITMAP), style_bit(WS_EX_LAYERED)
+                );
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                present_log: log_present.then_some(None),
                 width,
                 height,
                 format,
