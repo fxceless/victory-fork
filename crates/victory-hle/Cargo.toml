@@ -46,6 +46,7 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).

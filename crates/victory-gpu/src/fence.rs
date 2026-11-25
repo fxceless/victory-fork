@@ -35,6 +35,29 @@ struct Fence {
     asked: Mutex<Vec<pace::Asked>>,
 }
 
+/// Keep a console fence alive while a queue or a late host flight names it.
+#[cfg(windows)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_ptr(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        object::release_boxed::<Fence>(self.as_ptr());
+    }
+}
+
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }

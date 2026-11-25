@@ -577,10 +577,17 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+/// Serialize the first host publication with mappings made before it exists.
+static HOST_INIT: Mutex<()> = Mutex::new(());
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
+    if let Some(host) = HOST.get() {
+        return host.as_ref();
+    }
+    let _initializing = HOST_INIT.lock().unwrap_or_else(|e| e.into_inner());
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -2483,7 +2490,7 @@ enum Late {
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -3074,7 +3081,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -3082,7 +3089,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    line.line.push(Late::Signal(crate::fence::FenceRef::new(fence), value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -3176,6 +3183,29 @@ pub(crate) fn settle_for_present() {
 }
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
+}
+
+/// Change title memory after already submitted flights and their deferred
+/// writes. There is one host flight line, shared by the emulated queues.
+/// Keep another submission from preparing new reads between the settle
+/// and the map. The closure may acquire title-memory locks, not submit.
+pub(crate) fn with_page_mapping<T>(map: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    // If the host doesn't exist yet, keep it from being published until
+    // this map finishes. This doesn't trigger GPU initialization for a map.
+    let initializing = HOST.get().is_none().then(|| HOST_INIT.lock().unwrap_or_else(|e| e.into_inner()));
+    let host = HOST.get();
+    let initializing = if host.is_some() { drop(initializing); None } else { initializing };
+    let submitted = host.and_then(Option::as_ref).map(|host| {
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.settle(&mut submitted, WHY_SYNC);
+        submitted
+    });
+    crate::framelog::add(crate::framelog::T::MapQueueWaitUs, started.elapsed().as_micros() as u64);
+    let result = map();
+    drop(submitted);
+    drop(initializing);
+    result
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -4951,7 +4981,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.as_ptr(), value),
             }
         }
         if last > 0 {
@@ -5392,7 +5422,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_ptr(), value),
                 }
             }
             if last > 0 {
@@ -8095,6 +8125,9 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         let showing = std::time::Instant::now();
+        // Draining may itself present a queued frame. Do it before taking
+        // the presenter mutex, never from the synchronous copy below.
+        crate::queue::before_sync();
         let shown = self.present_now(texture, state, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
@@ -8175,6 +8208,11 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            // A queued present may be the title texture's last owner. A
+            // submit-ahead copy still refers to it after this call returns.
+            if slot.is_some() {
+                copy.keep(texture);
+            }
             let list = &copy.list;
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -8210,7 +8248,9 @@ impl Host {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
                 }
-                None => self.execute(&[copy]),
+                None => {
+                    self.submit(&[copy], false);
+                }
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {

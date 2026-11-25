@@ -769,9 +769,84 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// Maps consecutive slices at `base`. A single backing run can span several
+/// destination placeholders left by earlier page-by-page mappings.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    match map_view(physical, base, len, slice) {
+        Ok(()) => true,
+        Err(MapError::Commit) => false,
+        Err(MapError::Replace(error, slice)) => {
+            // Keep the single-view fast path. Only partition a failed request
+            // if the first reserved region really ends within it. Do not
+            // coalesce placeholders or retry a commitment failure.
+            if len > PAGE
+                && let Some(first) = reserved_prefix(base)
+                && first < len
+            {
+                let mut offset = 0;
+                let mut size = first;
+                loop {
+                    let at = base + offset;
+                    let start = Slice {
+                        index: slice.index + offset / PAGE,
+                        section: slice.section.clone(),
+                    };
+                    // As with multiple backing runs, any installed prefix
+                    // remains valid and tracked if a later replacement fails.
+                    match map_view(physical, at, size, start) {
+                        Ok(()) => (),
+                        Err(MapError::Commit) => return false,
+                        Err(MapError::Replace(error, _)) => return replace_failed(at, size, error),
+                    }
+                    offset += size;
+                    if offset == len {
+                        return true;
+                    }
+                    let Some(next) = reserved_prefix(base + offset) else {
+                        return replace_failed(base, len, error);
+                    };
+                    size = next.min(len - offset);
+                }
+            }
+            replace_failed(base, len, error)
+        }
+    }
+}
+
+/// This is only an upper bound on a replaceable span: a reserved region need
+/// not be a placeholder. MapViewOfFile3 still validates each replacement.
+fn reserved_prefix(base: usize) -> Option<usize> {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: querying our process, with a live, correctly sized output buffer.
+    let queried = unsafe {
+        VirtualQueryEx(GetCurrentProcess(), base as *const c_void, &mut info, size_of_val(&info))
+    };
+    (queried != 0
+        && info.State == MEM_RESERVE
+        && info.BaseAddress as usize == base
+        && info.RegionSize >= PAGE
+        && info.RegionSize.is_multiple_of(PAGE))
+    .then_some(info.RegionSize)
+}
+
+enum MapError {
+    Replace(std::io::Error, Slice),
+    Commit,
+}
+
+fn replace_failed(base: usize, len: usize, error: std::io::Error) -> bool {
+    tracing::warn!(
+        address = format_args!("{base:#x}"),
+        len,
+        %error,
+        "mapping physical pages failed (not a placeholder?)"
+    );
+    false
+}
+
+/// Replaces part or all of one placeholder, and records only the view the
+/// host actually installed. Callers hold the page table and remapping guard.
+fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> Result<(), MapError> {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -793,19 +868,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             0,
         )
     };
-    if view.Value as usize != base {
-        tracing::warn!(
-            address = format_args!("{base:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "mapping physical pages failed (not a placeholder?)"
-        );
-        return false;
+    if view.Value.is_null() || view.Value as usize != base {
+        return Err(MapError::Replace(std::io::Error::last_os_error(), slice));
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+        return Err(MapError::Commit);
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -815,7 +884,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
-    true
+    Ok(())
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1033,6 +1102,9 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    mod gpu;
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
@@ -1327,6 +1399,151 @@ mod tests {
         );
         assert_eq!(given, n);
         pages
+    }
+
+    /// Owns a small reservation, possibly split into multiple placeholders.
+    struct AliasWindow {
+        base: usize,
+        pages: usize,
+    }
+
+    impl AliasWindow {
+        fn new(pages: usize) -> Self {
+            let base = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                pages * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!base.is_null());
+            Self { base: base as usize, pages }
+        }
+
+        fn at(&self, page: usize) -> *mut c_void {
+            assert!(page < self.pages);
+            (self.base + page * PAGE) as *mut c_void
+        }
+
+        fn assert_bytes(&self, page: usize, byte: u8) {
+            let at = self.at(page);
+            assert_eq!(query(at).host.State, MEM_COMMIT, "page {page} is not mapped");
+            // SAFETY: the fixture owns a committed page and does not remap it concurrently.
+            let bytes = unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE) };
+            assert!(bytes.iter().all(|&b| b == byte), "wrong bytes in page {page}");
+        }
+    }
+
+    impl Drop for AliasWindow {
+        fn drop(&mut self) {
+            XMemMapPhysicalPages(self.at(0), self.pages, std::ptr::null());
+            let end = self.base + self.pages * PAGE;
+            let mut at = self.base;
+            while at < end {
+                let mut info = MEMORY_BASIC_INFORMATION::default();
+                // SAFETY: query our window; the output is a live structure of the supplied size.
+                let queried = unsafe {
+                    VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size_of_val(&info))
+                };
+                if queried == 0 || info.AllocationBase as usize != at || info.State != MEM_RESERVE
+                    || info.RegionSize == 0 || info.RegionSize > end - at
+                {
+                    break;
+                }
+                // SAFETY: this is the base of a remaining placeholder owned by the window.
+                unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+                at += info.RegionSize;
+            }
+        }
+    }
+
+    struct FixturePages(Vec<usize>);
+
+    impl Drop for FixturePages {
+        fn drop(&mut self) {
+            XMemFreePhysicalPages(self.0.len(), self.0.as_ptr());
+        }
+    }
+
+    #[test]
+    fn regrouped_pages_cross_old_placeholder_boundaries() {
+        let original = FixturePages(allocate(3));
+        let replacement = FixturePages(allocate(4));
+        let pool = AliasWindow::new(4);
+        let mapped = AliasWindow::new(3);
+        let other = AliasWindow::new(3);
+        for (set, first) in [(&original.0, 0x10), (&replacement.0, 0x20)] {
+            for (i, id) in set.iter().enumerate() {
+                assert!(write_physical(std::slice::from_ref(id), 0, &vec![first + i as u8; PAGE]));
+            }
+        }
+
+        assert_eq!(XMemMapPhysicalPages(pool.at(0), 4, replacement.0.as_ptr()), pool.at(0));
+        // Three distinct installed views, with distinct placeholders when unmapped.
+        for (i, id) in original.0.iter().enumerate() {
+            assert_eq!(XMemMapPhysicalPages(mapped.at(i), 1, id), mapped.at(i));
+            mapped.assert_bytes(i, 0x10 + i as u8);
+        }
+        assert_eq!(
+            XMemMapPhysicalPages(mapped.at(0), 3, replacement.0.as_ptr()),
+            mapped.at(0),
+            "a contiguous backing run must work across three old single-page views"
+        );
+        assert!(map_alias(other.base as u64, pool.base as u64, (3 * PAGE) as u64));
+        for i in 0..3 {
+            mapped.assert_bytes(i, 0x20 + i as u8);
+            other.assert_bytes(i, 0x20 + i as u8);
+        }
+
+        // Remap the middle pool page. Copied aliases must stay on its old backing.
+        assert_eq!(XMemMapPhysicalPages(pool.at(1), 1, &replacement.0[3]), pool.at(1));
+        pool.assert_bytes(1, 0x23);
+        // The mapped page is still writable through either other view.
+        // SAFETY: both fixture-owned views of this page are committed and writable.
+        unsafe { mapped.at(1).cast::<u8>().write_bytes(0x42, PAGE) };
+        other.assert_bytes(1, 0x42);
+        assert!(write_physical(&replacement.0[1..2], 0, &vec![0x65; PAGE]));
+        mapped.assert_bytes(1, 0x65);
+        other.assert_bytes(1, 0x65);
+        pool.assert_bytes(1, 0x23);
+        assert_eq!(XMemMapPhysicalPages(mapped.at(1), 1, std::ptr::null()), mapped.at(1));
+        assert_eq!(query(mapped.at(1)).host.State, MEM_RESERVE);
+        mapped.assert_bytes(0, 0x20);
+        mapped.assert_bytes(2, 0x22);
+        other.assert_bytes(1, 0x65);
+    }
+
+    #[test]
+    fn regrouped_pages_keep_larger_views_and_an_untouched_suffix() {
+        let original = FixturePages(allocate(5));
+        let replacement = FixturePages(allocate(4));
+        let placed = AliasWindow::new(5);
+        let alias = AliasWindow::new(1);
+        for (pages, start) in [(&original.0, 0x10), (&replacement.0, 0x20)] {
+            for (i, id) in pages.iter().enumerate() {
+                assert!(write_physical(std::slice::from_ref(id), 0, &vec![start + i as u8; PAGE]));
+            }
+        }
+        for (at, pages) in [(0, &original.0[..2]), (2, &original.0[2..])] {
+            assert_eq!(XMemMapPhysicalPages(placed.at(at), pages.len(), pages.as_ptr()), placed.at(at));
+        }
+        assert_eq!(XMemMapPhysicalPages(placed.at(0), 4, replacement.0.as_ptr()), placed.at(0));
+        // The four pages should fit in two views, not four single-page views.
+        let sizes: Vec<_> = physical()
+            .views
+            .range(placed.base..placed.base + 5 * PAGE)
+            .map(|(_, (len, _))| *len)
+            .collect();
+        assert_eq!(sizes, [2 * PAGE, 2 * PAGE, PAGE]);
+        // Installed views continue to own the backing after the page IDs are freed.
+        drop(replacement);
+        drop(original);
+        assert!(map_alias(alias.base as u64, placed.at(3) as u64, PAGE as u64));
+        alias.assert_bytes(0, 0x23);
+        for page in 0..4 {
+            placed.assert_bytes(page, 0x20 + page as u8);
+        }
+        placed.assert_bytes(4, 0x14);
     }
 
     /// The bytes of one page, through a view of our own.
