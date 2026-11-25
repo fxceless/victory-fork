@@ -177,38 +177,85 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
-/// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Loads and validates one committed version directory: its manifest must
+/// parse cleanly and every referenced blob file must exist.
+fn load_version(version: PathBuf, number: u64) -> std::io::Result<Version> {
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
+    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    for i in 0..blobs.len() {
+        if !version.join(i.to_string()).is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing save blob",
+            ));
+        }
+    }
+    Ok(Version {
+        dir: version,
+        number,
+        name,
+        display,
+        blobs,
+    })
+}
+
+/// The container's newest intact committed version, if any. Validates
+/// newest-first before removing older or damaged versions so a corrupt
+/// newest version never destroys the last known-good save.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+            remove_path(&entry.path())?;
+        } else if entry.file_type().is_ok_and(|t| t.is_dir())
+            && let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok())
+        {
             committed.push(n);
         }
     }
     committed.sort_unstable();
-    let Some(&number) = committed.last() else {
+    if committed.is_empty() {
         return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    let mut last_err = None;
+    let mut chosen = None;
+    for &number in committed.iter().rev() {
+        let version = dir.join(format!("v{number}"));
+        match load_version(version, number) {
+            Ok(v) => {
+                chosen = Some(v);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(version = number, error = %e, "ignoring damaged save version");
+                last_err = Some(e);
+            }
+        }
+    }
+    let Some(chosen) = chosen else {
+        return Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest")
+        }));
+    };
+    for &other in &committed {
+        if other != chosen.number {
+            let _ = std::fs::remove_dir_all(dir.join(format!("v{other}")));
+        }
+    }
+    Ok(Some(chosen))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -243,7 +290,7 @@ fn commit(
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
     if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+        remove_path(&staged)?;
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -1351,5 +1398,50 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    #[test]
+    fn damaged_newest_version_falls_back_to_previous_good_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_dir = dir.path().join("slot");
+        // Commit a valid v1 with one blob.
+        commit(
+            &container_dir,
+            1,
+            "Slot_1",
+            "Chapter 1",
+            &[("world", Source::Data(b"good-save"))],
+        )
+        .unwrap();
+
+        // Create a damaged v2 (truncated manifest) plus stray regular files
+        // named `v99` and `v3.new` that previously caused `remove_dir_all`
+        // to fail and `current` to delete v1 before failing.
+        let v2 = container_dir.join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join(MANIFEST), b"\x05\x00").unwrap();
+        std::fs::write(container_dir.join("v99"), b"stray").unwrap();
+        std::fs::write(container_dir.join("v3.new"), b"stray").unwrap();
+
+        let v = current(&container_dir).unwrap().expect("must recover v1");
+        assert_eq!(v.number, 1);
+        assert_eq!(v.name, "Slot_1");
+        assert_eq!(v.blobs, ["world"]);
+        assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"good-save");
+        assert!(!v2.exists(), "damaged v2 should be pruned after v1 is validated");
+        assert!(!container_dir.join("v3.new").exists(), "stray .new file cleaned up");
+
+        // Also test a v2 whose manifest parses cleanly but whose blob file is missing.
+        let v2_missing = container_dir.join("v2");
+        std::fs::create_dir_all(&v2_missing).unwrap();
+        std::fs::write(
+            v2_missing.join(MANIFEST),
+            manifest("Slot_1", "Chapter 2", &["world"]),
+        )
+        .unwrap();
+        let v = current(&container_dir).unwrap().expect("must still recover v1");
+        assert_eq!(v.number, 1);
+        assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"good-save");
+        assert!(!v2_missing.exists());
     }
 }
