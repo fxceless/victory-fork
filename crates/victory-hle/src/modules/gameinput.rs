@@ -1202,38 +1202,124 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>` drives the same keys live: each line
+    /// appended to the file, `<key>` or `<key> <seconds held>`, is pressed
+    /// once after the keys before it (0.6 s apart), so a tool can play the
+    /// title while it runs in the background.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key_code(key)?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
+            .collect();
+        down.extend(live_keys());
+        down
+    }
+
+    /// A key name of `VICTORY_KEYS` as a virtual key.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// The keys `VICTORY_KEYS_FILE` holds now. The file is read again at
+    /// most every 50 ms, and only when it has grown.
+    #[cfg(feature = "diagnostics")]
+    fn live_keys() -> Vec<u8> {
+        struct Live {
+            path: Option<std::path::PathBuf>,
+            read: usize,
+            checked: Option<Instant>,
+            /// (from, until, key), in press order.
+            presses: Vec<(Instant, Instant, u8)>,
+        }
+        static LIVE: std::sync::Mutex<Option<Live>> = std::sync::Mutex::new(None);
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let live = live.get_or_insert_with(|| Live {
+            path: std::env::var_os("VICTORY_KEYS_FILE").map(Into::into),
+            read: 0,
+            checked: None,
+            presses: Vec::new(),
+        });
+        let Some(path) = &live.path else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        if live
+            .checked
+            .is_none_or(|at| now - at >= Duration::from_millis(50))
+        {
+            live.checked = Some(now);
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.len() > live.read
+            {
+                // Whole lines only: a line still being written waits.
+                let fresh = &text[live.read..];
+                let complete = fresh.rfind('\n').map_or(0, |end| end + 1);
+                for line in fresh[..complete].lines() {
+                    let mut words = line.split_whitespace();
+                    let Some(vk) = words.next().and_then(key_code) else {
+                        continue;
+                    };
+                    let held = words
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                        .unwrap_or(Duration::from_millis(200));
+                    // The title's menus ignore a press that comes less than
+                    // about half a second after the one before (a `Down`
+                    // then `Enter` 0.15 s apart moved the focus and lost
+                    // the `Enter`).
+                    let from = live
+                        .presses
+                        .last()
+                        .map_or(now, |&(_, until, _)| until + Duration::from_millis(600))
+                        .max(now);
+                    live.presses.push((from, from + held, vk));
+                }
+                live.read += complete;
+            }
+        }
+        // Presses that ended stay until a later one replaces them as the
+        // last (its end orders the next press).
+        let keep = live.presses.len().saturating_sub(1);
+        let mut i = 0;
+        live.presses.retain(|&(_, until, _)| {
+            i += 1;
+            i > keep || until > now
+        });
+        live.presses
+            .iter()
+            .filter(|&&(from, until, _)| (from..until).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 

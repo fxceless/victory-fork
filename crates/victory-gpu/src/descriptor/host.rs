@@ -2382,6 +2382,12 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         return null_view(at);
     }
     let Some(host) = host() else { return };
+    #[cfg(feature = "diagnostics")]
+    if let Some(debug) = debug_null()
+        && debug.view(&debug.known, words[1], at)
+    {
+        return;
+    }
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -2407,6 +2413,12 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    #[cfg(feature = "diagnostics")]
+    if let Some(debug) = debug_null()
+        && debug.view(&debug.unknown, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, at)
+    {
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -2423,6 +2435,155 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// `VICTORY_DEBUG_NULL_VIEWS=1` (diagnostics builds): texture slots that
+/// would read zeros read a checkerboard instead, so a surface whose texture
+/// is missing shows as a pattern where it would be black, and black that is
+/// left is the title's own (unlit, or drawn black):
+/// - magenta: the title made a texture view there, and the host has no
+///   copy of the texture (not uploaded yet, unmapped, refused, of a format
+///   or kind it cannot make);
+/// - cyan: no view the host knows at all (never written, or past the host
+///   heap's cap).
+///
+/// 2D and 2D-array slots only; 1D, 3D, cube and multisampled ones still
+/// read zeros (a stand-in of another dimension is a mismatch the hardware
+/// need not survive).
+#[cfg(feature = "diagnostics")]
+struct DebugNull {
+    known: ID3D12Resource,
+    unknown: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded; these are only read.
+#[cfg(feature = "diagnostics")]
+unsafe impl Send for DebugNull {}
+// SAFETY: as above.
+#[cfg(feature = "diagnostics")]
+unsafe impl Sync for DebugNull {}
+
+#[cfg(feature = "diagnostics")]
+impl DebugNull {
+    /// An 8x8 checkerboard of `colour` and black, RGBA8, in memory the CPU
+    /// writes once and shaders read from then on.
+    fn checker(device: &ID3D12Device, colour: [u8; 4]) -> windows::core::Result<ID3D12Resource> {
+        const SIDE: u32 = 8;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(SIDE),
+            Height: SIDE,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let texels: Vec<u8> = (0..SIDE * SIDE)
+            .flat_map(|i| {
+                if (i % SIDE + i / SIDE).is_multiple_of(2) {
+                    colour
+                } else {
+                    [0, 0, 0, 255]
+                }
+            })
+            .collect();
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: creation of a CPU-writable texture, then one write of
+        // `texels` (SIDE rows of SIDE * 4 bytes) into its only subresource.
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                None,
+                &mut texture,
+            )?;
+            let texture = texture.ok_or_else(windows::core::Error::empty)?;
+            texture.Map(0, None, None)?;
+            let written = texture.WriteToSubresource(
+                0,
+                None,
+                texels.as_ptr().cast(),
+                SIDE * 4,
+                SIDE * SIDE * 4,
+            );
+            texture.Unmap(0, None);
+            written?;
+            Ok(texture)
+        }
+    }
+
+    /// Makes `at` a view of `texture` if `dimension` (the title's SRV
+    /// dimension) is 2D or a 2D array; whether it did.
+    fn view(&self, texture: &ID3D12Resource, dimension: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+        let Some(host) = host() else { return false };
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        match D3D12_SRV_DIMENSION(dimension as i32) {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                };
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                };
+            }
+            _ => return false,
+        }
+        // SAFETY: a slot of our heap and a live texture the view fits.
+        unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
+        true
+    }
+}
+
+/// The stand-ins, if `VICTORY_DEBUG_NULL_VIEWS=1` (made on first use).
+#[cfg(feature = "diagnostics")]
+fn debug_null() -> Option<&'static DebugNull> {
+    static DEBUG: std::sync::LazyLock<Option<DebugNull>> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("VICTORY_DEBUG_NULL_VIEWS").is_none_or(|v| v != "1") {
+            return None;
+        }
+        let device = &host()?.device;
+        match (
+            DebugNull::checker(device, [255, 0, 255, 255]),
+            DebugNull::checker(device, [0, 255, 255, 255]),
+        ) {
+            (Ok(known), Ok(unknown)) => {
+                tracing::info!(
+                    "VICTORY_DEBUG_NULL_VIEWS: texture slots without a host texture read a magenta checkerboard, \
+                     slots without any view a cyan one"
+                );
+                Some(DebugNull { known, unknown })
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(error = %e, "VICTORY_DEBUG_NULL_VIEWS: no stand-in textures");
+                None
+            }
+        }
+    });
+    DEBUG.as_ref()
 }
 
 #[cfg(test)]

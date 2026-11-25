@@ -450,7 +450,22 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let stage = if self.mesh.is_some() {
+            "ms"
+        } else if self.geometry.is_some() {
+            "gs"
+        } else if self.pixel {
+            "ps"
+        } else if self.threads.is_some() {
+            "cs"
+        } else {
+            "vs"
+        };
+        let passes = if super::shader_opt_stages() & super::opt_stage(stage) != 0 {
+            super::shader_opt() & super::bitcode::opt::MODULE
+        } else {
+            0
+        };
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();

@@ -183,7 +183,27 @@ info and above).
 
 ## Debugging
 
-A release build has no debugging aids. Build them in with
+Every build has an on-screen panel of where the frame goes, shown from the
+start: F3 hides or shows it (`VICTORY_OVERLAY=0` starts with it hidden).
+Once a second it shows the card, window size, uptime and frame; frames per
+second, ms per frame and the last 240 frames' median, 95th percentile,
+worst and hitches; our costs per frame with the largest named the
+bottleneck: preparing on the submitting thread (title memory copies,
+texture refreshes and what they waited for), GPU (how busy the card was,
+how long it stood idle behind us), copy-back, and the heap passes draws make
+in the title's recording threads; how much of the
+frame the submitting thread waited for the title; the processor time the
+process takes; draws, draws dropped (and why, in a diagnostics
+build); pipelines being made, made and loaded, and the driver's slow
+compiles; textures picked by index and their queue; title buffer copies;
+process, video and shared memory; and a bar per frame for the last frames'
+times (green to 34 ms, yellow to 100 ms, red above; a grey line at 33 ms).
+It is copied onto the window's image, not into saved frames. Each second's
+panel is also appended, shown or hidden, to `overlay.log` in the cache
+folder (`VICTORY_OVERLAY_LOG=<file>` elsewhere, `0` not at all;
+`scripts/bench.ps1` puts it in the run's folder).
+
+A release build has no other debugging aids. Build them in with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
@@ -195,11 +215,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<file>` | presses each key (`Enter`, or `Enter 0.5` to hold it half a second) appended to the file as a line, in order and 0.6 s apart (the title's menus ignore quicker presses), focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`); a file named `now` put in the folder saves the next frame |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer (needs Windows' Graphics Tools: `Add-WindowsCapability -Online -Name Tools.Graphics.DirectX~~~~0.0.1.0`) |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_PIX=<dir>` | loads the installed PIX's GPU capturer; a file named `capture` put in the folder (holding a frame count, 1 if empty) saves the next frames as `frame-<n>.wpix` there, to open in PIX (every draw's DXIL, views, targets, pixel history) |
+| `VICTORY_DEBUG_NULL_VIEWS=1` | 2D texture slots that would read zeros read a checkerboard: magenta where the title made a view the host has no texture for, cyan where there is no view at all; black that is left is the title's own |
+| `VICTORY_SHADER_OPT=<bits>` | clean-up passes over translated shaders (1 dead code, 2 constants, 4 reuse, 8 branch facts, 16 loads, 32 wave64 first lane; `0` none); `VICTORY_SHADER_OPT_STAGES=ps,ms` limits them to those stages (own shader cache entries) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
@@ -211,6 +235,26 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+### Unattended runs
+
+`scripts\bench.ps1` runs the title with the diagnostics build, presses
+through the start screens into the saved game, measures a window of world
+frames and writes `summary.md` and `summary.json` beside the log and a frame
+every 20 seconds (under `<cache_dir>\bench\`). Each run starts from a copy of
+the data folder, so runs load the same checkpoint and do not overwrite each
+other's saves; the shader and pipeline caches are shared, so the first run of
+a build compiles and later runs measure.
+
+```powershell
+.\scripts\bench.ps1 -FirstBoot -Label seed -Seconds 60   # no saves yet: makes one
+.\scripts\bench.ps1 -Seed <seed run folder>\data -Label baseline
+.\scripts\bench.ps1 -Seed <seed run folder>\data -Label relay-off -Switches @{ VICTORY_RELAY = '0' }
+.\scripts\bench.ps1 -Compare <run folder>,<run folder>    # a table of medians
+```
+
+`Get-Help .\scripts\bench.ps1 -Full` lists the options (`-Seconds`,
+`-Warmup`, `-SkipCutscenes`, `-CaptureEvery`, `-Build`, ...).
 
 ## License
 

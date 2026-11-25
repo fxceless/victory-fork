@@ -181,11 +181,37 @@ pub fn group_sync() -> u8 {
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
 ///
-/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// `VICTORY_SHADER_OPT_STAGES` (`cs,ms,vs,ps,gs`, comma-separated): only
+/// programs of those stages get the passes over the module (1-16); unset:
+/// every stage. For finding which stage a clean-up fault is in without
+/// making every other stage's host pipelines again (the compute ones take
+/// the driver seconds each).
+///
+/// Part of the translation: the shader cache keys on both (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// The stages [`shader_opt`]'s passes run on, as [`opt_stage`] bits.
+pub fn shader_opt_stages() -> u8 {
+    static STAGES: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        parse_opt_stages(std::env::var("VICTORY_SHADER_OPT_STAGES").ok().as_deref())
+    });
+    *STAGES
+}
+
+/// A stage's bit in [`shader_opt_stages`].
+pub(crate) fn opt_stage(name: &str) -> u8 {
+    match name {
+        "cs" => 1,
+        "ms" => 2,
+        "vs" => 4,
+        "ps" => 8,
+        "gs" => 16,
+        _ => 0,
+    }
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -198,6 +224,17 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             None => v.parse().ok(),
         });
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
+/// `VICTORY_SHADER_OPT_STAGES`'s value; every stage when it is unset or
+/// names none. Pure, for testing.
+fn parse_opt_stages(value: Option<&str>) -> u8 {
+    let named = value.map_or(0, |v| {
+        v.split(',')
+            .map(|s| opt_stage(&s.trim().to_ascii_lowercase()))
+            .fold(0, |all, bit| all | bit)
+    });
+    if named == 0 { u8::MAX } else { named }
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -769,6 +806,17 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn the_clean_up_stage_switch_names_stages_or_takes_every_one() {
+        assert_eq!(parse_opt_stages(None), u8::MAX);
+        assert_eq!(parse_opt_stages(Some("")), u8::MAX);
+        assert_eq!(parse_opt_stages(Some("ps")), opt_stage("ps"));
+        assert_eq!(parse_opt_stages(Some(" PS , ms")), opt_stage("ps") | opt_stage("ms"));
+        // A name that is no stage does not narrow the passes to nothing.
+        assert_eq!(parse_opt_stages(Some("pixel")), u8::MAX);
+        assert_eq!(parse_opt_stages(Some("cs,pixel")), opt_stage("cs"));
     }
 
     #[test]

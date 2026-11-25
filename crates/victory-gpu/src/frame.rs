@@ -224,9 +224,12 @@ mod tests {
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip takes its own tick. The interval is
+        // long enough that a loaded machine's late wake-up (Windows sleeps
+        // to its 15.6 ms timer) stays inside one tick: at 5 ms the flips
+        // were 7 ticks apart while a shader translation ran beside the test.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {

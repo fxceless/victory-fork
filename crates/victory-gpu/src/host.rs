@@ -434,15 +434,17 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. The card's percent busy, ms idle behind us and ms we stood
+/// waiting for it (for the overlay).
+fn card_clock_line(frames: f64, ms: f64) -> [f64; 3] {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {busy:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
-         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms"
     );
+    [busy, behind, stood]
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -482,9 +484,9 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
-fn private_bytes() -> u64 {
+/// The process's private bytes (diagnostics around the making of lists,
+/// and the overlay).
+pub(crate) fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -550,6 +552,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // PIX sees only devices made after its capturer is loaded.
+    #[cfg(feature = "diagnostics")]
+    crate::pix::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -2503,12 +2508,14 @@ fn relay_hand_back(back: &[Declared]) {
 }
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
-/// per frame since the last one.
-fn late_line(frames: f64) {
+/// per frame since the last one. Flights and settles per frame and the ms
+/// settles waited for the card (for the overlay).
+fn late_line(frames: f64) -> [f64; 3] {
     if !late() {
-        return;
+        return [0.0; 3];
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let figures = [s[0], s[1], s[12] / 1000.0];
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
@@ -2575,6 +2582,7 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    figures
 }
 
 #[cfg(test)]
@@ -5721,6 +5729,9 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// The overlay's pixels for `copy` (first), then for each of `ahead`:
+    /// one per list, so a present in the air keeps its own.
+    panels: Vec<Option<crate::overlay::Panel>>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -5791,9 +5802,9 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
-        late_line(frames);
-        card_clock_line(frames, ms);
-        crate::shadow::back_line(frames);
+        let [flights, settles, settle_ms] = late_line(frames);
+        let [card_busy, idle_behind, stood] = card_clock_line(frames, ms);
+        let scanned_mb = crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -5804,33 +5815,29 @@ impl Meter {
                 );
             }
         }
-        {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
-                tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
-                );
-            }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
-                tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
-                );
-            }
+        let [own, asking, still, all] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        if all >= 1.0 {
+            tracing::info!(
+                "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                 hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+            );
         }
-        {
-            let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if copies > 0.0 {
-                tracing::info!(
-                    "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                    if join_copies() { "on" } else { "off" }
-                );
-            }
+        let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if through + left > 0.0 {
+            tracing::info!(
+                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+            );
+        }
+        let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if copies > 0.0 {
+            tracing::info!(
+                "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
+                 (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                if join_copies() { "on" } else { "off" }
+            );
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
@@ -5848,6 +5855,41 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        crate::overlay::update(crate::overlay::Stats {
+            fps,
+            ms,
+            preparing: cpu,
+            copy_ms,
+            copy_mb,
+            texture_ms,
+            texture_mb,
+            refresh: [all, own, asking, still],
+            gpu,
+            back_ms,
+            back_mb,
+            scanned_mb,
+            heap_pass_ms: picked_ms,
+            heap_passes: picked,
+            heap_parts: [0, 1, 2, 3, 4].map(|i| {
+                crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e3, 1e3, 1e6, 1e6][i] / frames
+            }),
+            draws,
+            dropped,
+            indirect,
+            mesh_groups,
+            card_busy,
+            idle_behind,
+            stood,
+            sent_ahead: [flights, settles, settle_ms],
+            copies: [copies, joined],
+            twin_copies: twin_to_depth + twin_to_colour + planes,
+            card_sent_mb: card[0] as f64 / 1e6 / frames,
+            making: crate::pipeline::making() as u64,
+            #[cfg(feature = "diagnostics")]
+            drops: drops.iter().map(|(why, n)| (why.clone(), *n as f64 / frames)).collect(),
+            #[cfg(not(feature = "diagnostics"))]
+            drops: Vec::new(),
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -6038,6 +6080,8 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
+            crate::pix::at_present(frame);
+            #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
@@ -6067,6 +6111,13 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            if crate::overlay::presented(width, height) {
+                let at = slot.map_or(0, |i| i + 1);
+                if p.panels.len() <= at {
+                    p.panels.resize_with(at + 1, || None);
+                }
+                crate::overlay::record(&self.device, list, &back, &mut p.panels[at], (width, height, format));
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -6145,6 +6196,7 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                panels: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
             })
@@ -6200,6 +6252,14 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The card's name, as the system gives it.
+    pub(crate) fn card_name(&self) -> Option<String> {
+        // SAFETY: a plain query.
+        let desc = unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?;
+        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        Some(String::from_utf16_lossy(&desc.Description[..len]))
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

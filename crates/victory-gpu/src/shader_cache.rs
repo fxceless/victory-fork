@@ -77,8 +77,10 @@ fn build() -> &'static [u8; 32] {
                     }
                     bytes.push(0);
                 }
-                // And which clean-up passes ran over the translated code.
+                // And which clean-up passes ran over the translated code, on
+                // which stages.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                bytes.push(victory_shader::emit::shader_opt_stages());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

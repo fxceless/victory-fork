@@ -62,6 +62,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder of the pipeline library, once given.
+pub(crate) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -441,6 +446,15 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            // PIX's capturer wraps the device: the runtime rejects a library
+            // saved without it, and what it saves is not a library of ours
+            // (one PIX run replaced a 426 MB library with 848 bytes, and the
+            // next run made every pipeline again). No library under PIX.
+            #[cfg(feature = "diagnostics")]
+            if crate::pix::loaded() {
+                tracing::warn!("VICTORY_PIX: no host pipeline library this run (every pipeline is made; the saved one is left as it is)");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -517,7 +531,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let compiling = std::time::Instant::now();
+        let made = create();
+        slow_compile(compiling.elapsed());
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -541,11 +558,13 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    let compiling = std::time::Instant::now();
     let pso = {
         let _call = call("make", name);
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    slow_compile(compiling.elapsed());
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -562,6 +581,26 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+/// Driver compiles slower than this are named in the log: a pipeline that
+/// takes the driver seconds keeps its draws dropped all that time, and
+/// holds a worker (and a processor) the title's frames then lack.
+const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Logs the pipeline this thread made (its [`label`]) if `took` was slow,
+/// and counts it for the overlay.
+fn slow_compile(took: std::time::Duration) {
+    if took >= SLOW_COMPILE {
+        use std::sync::atomic::Ordering::Relaxed;
+        let label = LABEL.with(|l| l.borrow().clone());
+        tracing::info!(seconds = took.as_secs_f64(), shaders = %label, "slow driver compile of a host pipeline");
+        let ms = took.as_millis() as u64;
+        crate::overlay::SLOW[0].fetch_add(1, Relaxed);
+        crate::overlay::SLOW[1].fetch_add(ms, Relaxed);
+        crate::overlay::SLOW[2].fetch_max(ms, Relaxed);
+        *crate::overlay::LAST_SLOW.lock().unwrap_or_else(|e| e.into_inner()) = label;
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the

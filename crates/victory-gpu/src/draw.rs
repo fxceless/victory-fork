@@ -363,6 +363,11 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of those microseconds: making the slots' buffer views and finding their
+/// ranges, refreshing the host copies they cover (and the bytes of the
+/// spans, of them in copies not write-watched, which are read whole), and
+/// the textures picked by index.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1436,6 +1441,7 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let viewed = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1447,6 +1453,7 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let unwatched: u64 = spans.values().filter(|s| s.0.unwatched()).map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1479,9 +1486,22 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let refreshed = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        for (i, n) in [
+            (viewed - started).as_micros() as u64,
+            (refreshed - viewed).as_micros() as u64,
+            refreshed.elapsed().as_micros() as u64,
+            bytes,
+            unwatched,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            HEAP_PASS_PARTS[i].fetch_add(n, Ordering::Relaxed);
+        }
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);

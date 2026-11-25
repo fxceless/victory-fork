@@ -37,6 +37,10 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod overlay;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod pix;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

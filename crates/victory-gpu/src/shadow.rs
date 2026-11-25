@@ -1221,11 +1221,12 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
-/// window outside buffers cannot as the code stands.
-pub(crate) fn back_line(frames: f64) {
+/// window outside buffers cannot as the code stands. The MB compared per
+/// frame, in windows and in buffers' copies (for the overlay).
+pub(crate) fn back_line(frames: f64) -> f64 {
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
-        return;
+        return 0.0;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
     tracing::info!(
@@ -1240,6 +1241,7 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    mb(c[2] + c[3])
 }
 
 #[cfg(test)]
