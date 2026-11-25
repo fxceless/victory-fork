@@ -539,11 +539,19 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
+    HOST.get_or_init(|| {
+        if cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_NO_HOST_GPU").is_some_and(|value| value == "1")
+        {
+            tracing::info!("host D3D12 disabled for CPU profiling");
+            return None;
+        }
+        match create() {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+                None
+            }
         }
     })
     .as_ref()

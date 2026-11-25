@@ -292,12 +292,22 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers on first use. VICTORY_PIPELINE_WORKERS can select
+/// a count or "all" to use every logical processor available to the process.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
-        let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let available = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let default = (available / 2).clamp(2, 8).min(available);
+        let workers = match std::env::var("VICTORY_PIPELINE_WORKERS").as_deref() {
+            Ok("all") => available,
+            Ok(value) => value
+                .trim()
+                .parse::<std::num::NonZeroUsize>()
+                .map_or(default, |count| count.get().min(available)),
+            Err(_) => default,
+        };
+        let mut started = 0;
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -320,10 +330,11 @@ fn workers() -> bool {
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
-                running = true;
+                started += 1;
             }
         }
-        running
+        tracing::info!(started, available, "host pipeline workers");
+        started > 0
     })
 }
 
