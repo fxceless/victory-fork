@@ -228,6 +228,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+#[cfg(windows)] // the host formats it asks about are Windows'
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
         118 => 45,
@@ -251,6 +252,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
+#[cfg(windows)] // the host is asked which it refuses on Windows
 pub(crate) fn target_format(format: u32) -> u32 {
     const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
@@ -313,6 +315,7 @@ pub(crate) fn stands_in(this: This) -> bool {
 /// cleared as depth, and asked for an unordered access view the host could
 /// not give. Measured to decide what such textures need (a colour twin, or
 /// to be colour textures altogether).
+#[cfg(windows)] // the host unordered access it measures is Windows'
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -573,6 +576,7 @@ fn twin_texture(
 }
 
 /// The typeless format of a format's family (itself if it has none).
+#[cfg(windows)] // the host's typeless families
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -609,11 +613,13 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
+#[cfg(windows)] // the host's typeless copies ask for them
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)] // the host copy it asks about is Windows'
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -627,6 +633,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
+#[cfg(windows)] // the host's typeless depth copies ask for them
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
 /// Mip levels, the full chain for 0.
@@ -662,6 +669,7 @@ pub(crate) struct PlacedFootprint {
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
+    #[cfg(windows)] // the host reads it back on Windows
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
@@ -673,6 +681,7 @@ impl PlacedFootprint {
     /// with its rows pitched as the host wants them (multiples of 256
     /// bytes), then the bytes that buffer needs, the bytes of a row, the
     /// rows, and the title's own pitch.
+    #[cfg(windows)] // the host reads the rows back on Windows
     pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
         let (element, block) = element(self.format)?;
         let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
@@ -2221,6 +2230,7 @@ impl OnDemand {
 }
 
 /// A texture's console memory and description; `None` for buffers.
+#[cfg(windows)] // the host texture it names is Windows'
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
         return None;
@@ -2548,8 +2558,10 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 #[cfg(windows)]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// See [`PLACED_TWINS`].
+/// See [`PLACED_TWINS`]: only `copystat`'s diagnostics line reads this,
+/// so without the feature it is dead (as in `shadow` and `pipeline`).
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

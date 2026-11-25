@@ -76,15 +76,20 @@ extern "system" fn launch_new_game(
 ) {
     let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
     tracing::info!(exe, args, "XLaunchNewGame");
-    let current = runtime::main_image()
-        .and_then(runtime::image_path)
-        .unwrap_or_default();
-    let ours: Vec<_> = std::env::args_os().skip(1).collect();
-    let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
+    // Relaunch needs the lifecycle's window and process control, which
+    // only Windows has; off it there is no title to end either.
+    #[cfg(windows)]
+    {
+        let current = runtime::main_image()
+            .and_then(runtime::image_path)
+            .unwrap_or_default();
+        let ours: Vec<_> = std::env::args_os().skip(1).collect();
+        let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+    }
     loop {
         std::thread::park();
     }
@@ -92,6 +97,7 @@ extern "system" fn launch_new_game(
 
 /// Our own arguments for the relaunch: the title's executable replaced by
 /// `exe`, earlier title arguments dropped, `args` after `--`.
+#[cfg_attr(not(windows), allow(dead_code))] // the lib relaunches on Windows; the tests everywhere
 fn relaunch_args(
     ours: Vec<std::ffi::OsString>,
     current: &std::ffi::OsStr,

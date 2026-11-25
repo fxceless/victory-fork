@@ -111,9 +111,15 @@ fn limit(typed: &str, max: u32) -> String {
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))] // the dialog below is Windows'
 fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
     dialog::ask(title, description, default, max)
+}
+
+/// No host to ask off Windows: the entry counts as dismissed.
+#[cfg(all(not(test), not(windows)))]
+fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
+    None
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
@@ -123,6 +129,7 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
+#[cfg(windows)] // the Win32 dialog it wraps
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;

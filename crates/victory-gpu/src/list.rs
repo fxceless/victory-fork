@@ -624,6 +624,7 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+#[cfg_attr(not(windows), allow(unused_variables))] // the host list is asked on Windows
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
@@ -735,6 +736,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
+#[cfg(windows)] // it is translated for the host's barrier call
 const UAV_BARRIER: Barrier = Barrier {
     kind: 2,
     flags: 0,
@@ -744,6 +746,7 @@ const UAV_BARRIER: Barrier = Barrier {
 };
 
 /// Returns the console's barrier "actions" (none).
+#[cfg_attr(not(windows), allow(unused_variables))] // the host barriers are asked on Windows
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
@@ -1734,6 +1737,7 @@ extern "system" fn draw(_: This) {
 /// through the host's indirect execution (`State::execute_indirect`).
 /// shortcut: signatures that change root arguments are dropped (logged
 /// once per signature).
+#[cfg_attr(not(windows), allow(unused_variables, unused_mut))] // the host's indirect execution, which runs them, is Windows'
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1788,6 +1792,7 @@ extern "system" fn execute_indirect(
 }
 
 /// Indirect executions dropped since the last call.
+#[cfg(windows)] // the diagnostics that report them are Windows'
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -1811,6 +1816,7 @@ pub(crate) fn take_counts() -> (u64, u64) {
 
 /// A GPU wait for a memory value: the list's commands after it run when
 /// the 32 or 64 bits at `address` compare as asked with `reference`.
+#[cfg_attr(not(windows), allow(dead_code))] // off Windows a wait is recorded, never asked
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ValueWait {
     address: u64,
@@ -1837,6 +1843,7 @@ impl ValueWait {
     /// 36-49: "between its submissions ... kernel"; 47 of 110 looks at
     /// that thread in run 49 found it in this question).
     /// `VICTORY_WAIT_ASK=1` asks first, as before.
+    #[cfg(windows)]
     pub(crate) fn met(&self) -> bool {
         #[cfg(all(windows, feature = "diagnostics"))]
         let started = std::time::Instant::now();
@@ -1850,6 +1857,7 @@ impl ValueWait {
         met
     }
 
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
@@ -1877,6 +1885,7 @@ impl ValueWait {
 
     /// Whether the wait is met with `value` at its address (its low half
     /// for a 32-bit wait).
+    #[cfg(windows)]
     pub(crate) fn holds_for(&self, value: u64) -> bool {
         let (value, reference) = if self.wide {
             (value, self.reference)
@@ -1907,6 +1916,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// buffer and nothing was lit).
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
+#[cfg(windows)]
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
@@ -1949,12 +1959,18 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
     };
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+        // The wait's memory is read through the host, which Windows alone
+        // has; elsewhere nothing is mapped to hold a list back.
+        #[cfg(windows)]
+        let met = wait.met();
+        #[cfg(not(windows))]
+        let met = true;
         tracing::info!(
             address = format_args!("{address:#x}"),
             comparison,
             reference,
             wide,
-            met = wait.met(),
+            met,
             "a list waits for a memory value"
         );
     }

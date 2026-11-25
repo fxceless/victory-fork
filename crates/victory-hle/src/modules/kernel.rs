@@ -592,7 +592,7 @@ mod host {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test round-trips Windows-shaped paths and names
 mod tests {
     use super::*;
 
@@ -619,7 +619,6 @@ mod tests {
         text.encode_utf16().chain(Some(0)).collect()
     }
 
-    #[cfg(windows)]
     #[test]
     fn host_lookups_by_name_get_our_overrides() {
         let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());

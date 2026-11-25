@@ -318,12 +318,11 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test needs the host
 mod tests {
     use super::*;
     use crate::object::slot;
 
-    #[cfg(windows)]
     #[test]
     fn signals_set_waiting_events() {
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};

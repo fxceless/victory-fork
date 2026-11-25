@@ -51,6 +51,7 @@ type SerializeVersioned =
     unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 
 /// An export of the host's `d3d12.dll` in System32, looked up once.
+#[cfg_attr(not(windows), allow(unused_variables))] // the host dll is Windows'
 fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     *cache.get_or_init(|| {
         #[cfg(windows)]
@@ -212,13 +213,12 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test needs the host
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
     /// One 32-bit constant at b0, serialized by the host, then created.
-    #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
         use windows::Win32::Graphics::Direct3D12::{
@@ -260,7 +260,6 @@ mod tests {
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).
-    #[cfg(windows)]
     #[test]
     fn our_blobs_deserialize_on_the_host() {
         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
@@ -298,7 +297,6 @@ mod tests {
     }
 
     /// Version 1.0 through the versioned entry point, with a console flag.
-    #[cfg(windows)]
     #[test]
     fn versioned_descriptions_serialize_on_the_host() {
         let desc = VersionedDesc {

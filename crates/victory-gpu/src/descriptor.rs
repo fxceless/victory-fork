@@ -72,6 +72,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)] // the host heaps are asked on Windows
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -111,6 +112,7 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)] // the host tables are asked on Windows
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -525,6 +527,7 @@ const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 /// view of placed memory: its address and the number of its shape.
 const KIND_SHIFT: u32 = 30;
 /// Table generations stay below the kind bits (and above 0).
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 const GENERATIONS: u32 = (1 << KIND_SHIFT) - 1;
 const CONSTANT: u32 = 1;
 const PLACED: u32 = 2;
@@ -559,6 +562,7 @@ fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
 }
 
 /// The 62 bits two record words carry beside their kind.
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 fn payload(i: u32, generation: u32) -> u64 {
     u64::from(generation & GENERATIONS) << 32 | u64::from(i)
 }
@@ -583,6 +587,7 @@ fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
 }
 
 /// The constant buffer view [`constant_words`] named.
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 fn constant_of(i: u32, generation: u32) -> View {
     let payload = payload(i, generation);
     let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
@@ -624,6 +629,7 @@ impl Views {
     }
 
     /// The view of placed memory [`placed_words`] named.
+    #[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
@@ -866,6 +872,7 @@ fn record(handle: u64, view: View) {
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
     WAITING
@@ -894,6 +901,7 @@ pub(crate) fn forget(resource: usize) {
 
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
@@ -908,6 +916,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg_attr(not(windows), allow(dead_code))] // the lib asks on Windows; the tests everywhere
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -1061,15 +1070,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)] // the host target views are asked on Windows
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)] // the host depth views are asked on Windows
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)] // the host target views are asked on Windows
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;

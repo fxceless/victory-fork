@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(windows)] // the run path it adds context to is Windows'
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
