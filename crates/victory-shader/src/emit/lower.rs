@@ -450,6 +450,11 @@ fn need(block: usize) {
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// Also what a shared-memory read at such an address loads where the shared memory has
+/// settled ([`lds_settled`]): both halves of a console wave read the same dwords, whenever
+/// each gets there (the ray-tracing structure builder's scans sum the waves' totals this way
+/// inside a loop each console wave leaves together, and broadcast the sum with
+/// `v_readfirstlane`).
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
 fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
@@ -465,6 +470,19 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = inst.fields
+                && name.starts_with("ds_read")
+                && st.guards[b][i].is_none()
+                && inst.read(Reg::V(reg)).is_some_and(|a| same.contains(&a))
+                && lds_settled(p, (b, i))
+            {
+                same.extend(inst.writes.iter().map(|w| w.1));
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -480,11 +498,18 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
+            // the registers of one operand: two for a 64-bit operation (its sources are pairs),
+            // else one (not the destination's old value, which the IR also reads: an unguarded
+            // write replaces it in every lane that arrives)
+            let width = if name.contains("64") { 2 } else { 1 };
             let alike = ops.iter().all(|op| match *op {
                 Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    let read: Vec<Value> = inst
+                        .reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && x < reg.saturating_add(width)))
+                        .map(|r| r.1)
+                        .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
@@ -499,6 +524,82 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether the shared memory a read at `read` (block, instruction) sees can no longer change
+/// while the thread group runs it: no shared-memory write follows it on any path (the read's
+/// own wave writes nothing after), and every write before it reaches it only through an
+/// `s_barrier` (the group's other waves have written theirs before any wave reads). Then two
+/// host waves that read the same address get the same dwords, whenever each gets there.
+fn lds_settled(p: &Program, read: (usize, usize)) -> bool {
+    let writes = |i: &Inst| {
+        let n = i.name();
+        matches!(i.fields, Fields::Ds { .. })
+            && !(n.starts_with("ds_read")
+                || n.starts_with("ds_swizzle")
+                || n.starts_with("ds_permute")
+                || n.starts_with("ds_bpermute")
+                || n == "ds_nop")
+    };
+    let barrier = |i: &Inst| i.name() == "s_barrier";
+    let n = p.blocks.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for &q in &block.preds {
+            if q < n && !succ[q].contains(&b) {
+                succ[q].push(b);
+            }
+        }
+    }
+    // a write after the read, on any path (around a loop too)
+    let after = (read.0, read.1 + 1);
+    if reaches(p, &succ, after, &|b, i| writes(&p.blocks[b].insts[i]), None) {
+        return false;
+    }
+    // a write before it that reaches it without a barrier between
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let hit = |bb, ii| (bb, ii) == read;
+            if writes(inst) && reaches(p, &succ, (b, i + 1), &hit, Some(&barrier)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a path from instruction `start` (block, index) on meets an instruction `hit`
+/// holds, before one `cut` holds (paths that pass such an instruction stop there).
+fn reaches(
+    p: &Program,
+    succ: &[Vec<usize>],
+    start: (usize, usize),
+    hit: &dyn Fn(usize, usize) -> bool,
+    cut: Option<&dyn Fn(&Inst) -> bool>,
+) -> bool {
+    let mut entered = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    while let Some((b, from)) = stack.pop() {
+        let mut stopped = false;
+        for (i, inst) in p.blocks[b].insts.iter().enumerate().skip(from) {
+            if hit(b, i) {
+                return true;
+            }
+            if cut.is_some_and(|cut| cut(inst)) {
+                stopped = true;
+                break;
+            }
+        }
+        if !stopped {
+            for &s in &succ[b] {
+                if !entered[s] {
+                    entered[s] = true;
+                    stack.push((s, 0));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1282,6 +1383,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -11892,5 +11994,74 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A wave64 program of `words` (`ir::build`'s console form).
+    fn wave64(words: &[u32]) -> ir::Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ir::build(&code, true, 8).unwrap()
+    }
+
+    /// DS `op vdst, addr, data0` at offset 0.
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+    const V_MOV_V1_S0: u32 = 0x7E02_0200; // v_mov_b32 v1, s0
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    const DS_WRITE_B32: u32 = 0x0D;
+    const DS_READ_B32: u32 = 0x36;
+
+    /// The site of the program's `ds_read_b32` and the value it loads into v3.
+    fn the_read(p: &ir::Program) -> ((usize, usize), ir::Value) {
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if inst.name() == "ds_read_b32" {
+                    return ((b, i), inst.write(ir::Reg::V(3)).unwrap());
+                }
+            }
+        }
+        panic!("no ds_read_b32");
+    }
+
+    #[test]
+    fn a_shared_read_at_a_uniform_address_after_a_barrier_is_uniform() {
+        // every wave writes, the group meets, then each reads one address
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.push(S_BARRIER);
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let (site, loaded) = the_read(&p);
+        assert!(super::lds_settled(&p, site));
+        assert!(super::lane_uniform(&p, &st, &all).contains(&loaded));
+    }
+
+    #[test]
+    fn a_shared_read_another_wave_may_race_is_not_uniform() {
+        // no barrier between the writes and the read: another wave may
+        // still be writing while the two halves of this one read
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let (site, loaded) = the_read(&p);
+        assert!(!super::lds_settled(&p, site));
+        assert!(!super::lane_uniform(&p, &st, &all).contains(&loaded));
+        // a write after the read: the second half may read it, the first not
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.push(S_BARRIER);
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.extend(ds(DS_WRITE_B32, 0, 1, 3));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let (site, _) = the_read(&p);
+        assert!(!super::lds_settled(&p, site));
     }
 }

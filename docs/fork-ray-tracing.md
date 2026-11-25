@@ -63,9 +63,13 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- With `VICTORY_BVH_BUILDER=1` the builder now runs on a 32-lane GPU (all 52
+  of its programs translate there: the last three, block-wide scans, read a
+  first lane of a value `lane_uniform` proves the same in both halves of a
+  console wave), but a stage stores outside the structures' buffers: the
+  title faults within seconds, and with `VICTORY_BVH_QUARANTINE=1` the layer
+  runs out of memory copying what those stores name. See
+  [fork-findings-6gb-laptop.md](fork-findings-6gb-laptop.md).
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
