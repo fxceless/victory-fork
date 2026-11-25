@@ -253,6 +253,36 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Whether `[start, start + len)` lies in a `MEM_WRITE_WATCH` allocation
+/// (title GPU memory reserved via `XMemVirtualAlloc`), without clearing dirty bits.
+#[cfg(windows)]
+pub(crate) fn is_write_watched(start: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if len == 0 {
+        return false;
+    }
+    let mut buf = [std::ptr::null_mut(); 16];
+    let mut count = buf.len();
+    let mut gran = 0u32;
+    // SAFETY: read-only query (`flags = 0`) into a 16-entry pointer buffer; the
+    // kernel validates `[start, start + len)`.
+    unsafe {
+        GetWriteWatch(
+            0,
+            start as *const _,
+            len,
+            buf.as_mut_ptr(),
+            &mut count,
+            &mut gran,
+        ) == 0
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_write_watched(_start: usize, _len: usize) -> bool {
+    false
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -351,31 +381,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // View memory the guards already hold cannot be write-watched: the
-    // kernel asking would only fail. Copies of it are flushed many times a
-    // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        if known_view {
-            crate::copystat::C::WatchKnownView
-        } else {
-            crate::copystat::C::WatchFailed
-        },
-        failed as u64,
-    );
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -450,25 +466,6 @@ impl Tracked {
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
-
-/// Whether the block holding `start` is view memory the guards already
-/// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
-/// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
-fn known_view(start: usize) -> bool {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
-        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
-            .iter()
-            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
-        return false;
-    }
-    let g = guards();
-    let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
-}
 
 struct Guards {
     /// Blocks we made read-only.
@@ -1495,6 +1492,29 @@ mod tests {
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn is_write_watched_distinguishes_watch_allocs_from_heap() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let heap_buf = vec![0u8; PAGE];
+        assert!(!super::is_write_watched(heap_buf.as_ptr() as usize, PAGE));
+        // SAFETY: standalone write-watched reservation/commit freed below.
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!watched.is_null());
+        assert!(super::is_write_watched(watched as usize, PAGE));
+        // SAFETY: matches `VirtualAlloc` above.
+        unsafe { VirtualFree(watched, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
