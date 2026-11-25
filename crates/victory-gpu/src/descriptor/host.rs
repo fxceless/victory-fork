@@ -90,6 +90,88 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Levels on demand (`crate::tiles`): whether any slot of this heap was
+    /// made against a tiled texture (fast gate for non-tiled heaps).
+    has_tiled: std::sync::atomic::AtomicBool,
+    /// Levels on demand: slots currently backed by a tiled texture, their
+    /// optional placed start address (including tabled slots excluded from
+    /// `placed`), and the `first_shown` level baked into each host descriptor.
+    tiled_shown: Mutex<TiledSlots<crate::resource::OnDemand>>,
+}
+
+struct TiledSlot<T> {
+    start: Option<u64>,
+    resource: T,
+    shown: Option<u32>,
+}
+
+struct TiledSlots<T> {
+    by_slot: std::collections::HashMap<u32, TiledSlot<T>>,
+    by_start: std::collections::HashMap<u64, std::collections::BTreeSet<u32>>,
+}
+
+impl<T> Default for TiledSlots<T> {
+    fn default() -> Self {
+        Self {
+            by_slot: std::collections::HashMap::new(),
+            by_start: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T> TiledSlots<T> {
+    fn note(&mut self, slot: u32, start: Option<u64>, resource: T, shown: Option<u32>) {
+        self.forget(slot);
+        if let Some(at) = start {
+            self.by_start.entry(at).or_default().insert(slot);
+        }
+        self.by_slot.insert(slot, TiledSlot { start, resource, shown });
+    }
+
+    fn forget(&mut self, slot: u32) {
+        if let Some(old) = self.by_slot.remove(&slot)
+            && let Some(at) = old.start
+            && let Some(set) = self.by_start.get_mut(&at)
+        {
+            set.remove(&slot);
+            if set.is_empty() {
+                self.by_start.remove(&at);
+            }
+        }
+    }
+
+    fn slots_at(&self, start: u64) -> Vec<u32> {
+        self.by_start
+            .get(&start)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn is_stale(&self, slot: u32, current: impl Fn(&T) -> Option<u32>) -> bool {
+        self.by_slot
+            .get(&slot)
+            .is_some_and(|entry| current(&entry.resource) != entry.shown)
+    }
+}
+
+struct Made {
+    kept: Kept,
+    tiled: Option<(crate::resource::OnDemand, Option<u32>)>,
+}
+
+impl Made {
+    fn plain(kept: Kept) -> Self {
+        Self { kept, tiled: None }
+    }
+}
+
+fn placed_start(view: &View) -> Option<u64> {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            Some(u64::from(desc[10]) | u64::from(desc[11]) << 32)
+        }
+        _ => None,
+    }
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -973,6 +1055,8 @@ impl HostHeap {
                 }
                 spans
             },
+            has_tiled: std::sync::atomic::AtomicBool::new(false),
+            tiled_shown: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1380,10 +1464,18 @@ impl HostHeap {
         if starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
+        if self.has_tiled.load(std::sync::atomic::Ordering::Relaxed) {
+            let tiled = self.tiled_shown.lock().unwrap_or_else(|e| e.into_inner());
+            for &start in &starts {
+                slots.extend(tiled.slots_at(start));
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let mut remade = 0;
         for slot in slots {
@@ -1396,12 +1488,52 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.cpu(slot)) {
-                self.keep(slot, kept);
+            if let Some(m) = make(&view, self.cpu(slot)) {
+                self.record_tiled(slot, &view, m.tiled);
+                self.keep(slot, m.kept);
                 remade += 1;
             }
         }
         remade
+    }
+
+    fn record_tiled(
+        &self,
+        slot: u32,
+        view: &View,
+        tiled: Option<(crate::resource::OnDemand, Option<u32>)>,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match tiled {
+            Some((on_demand, shown)) => {
+                self.tiled_shown
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note(slot, placed_start(view), on_demand, shown);
+                self.has_tiled.store(true, Relaxed);
+            }
+            None => self.forget_tiled(slot),
+        }
+    }
+
+    fn forget_tiled(&self, slot: u32) {
+        if !self.has_tiled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.tiled_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(slot);
+    }
+
+    fn tiled_stale(&self, slot: u32) -> bool {
+        if !self.has_tiled.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.tiled_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_stale(slot, |on_demand| on_demand.tiled().and_then(|t| t.first_shown()))
     }
 
     /// The memory of the texture title slot `index` views is not mapped
@@ -1431,6 +1563,7 @@ impl HostHeap {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
+        self.forget_tiled(index);
         self.keep(index, None);
     }
 
@@ -1640,11 +1773,11 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
-        if kept.is_none() {
+        let made = make(view, self.cpu(index));
+        if made.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        self.keep(index, made.and_then(|m| m.kept));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -1948,6 +2081,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.forget_tiled(index);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1990,15 +2124,31 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
+            let built = if later {
                 None
             } else {
                 make(&view, self.cpu(index))
             };
-            if kept.is_none() && !self.sampler {
+            if built.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
+            let (kept, tiled) = match built {
+                Some(m) => (m.kept, m.tiled),
+                None => (None, None),
+            };
+            self.record_tiled(index, &view, tiled);
+            self.keep(index, kept);
+        } else if self.tiled_stale(index) {
+            let built = make(&view, self.cpu(index));
+            if built.is_none() && !self.sampler {
+                null_for(&view, self.cpu(index));
+            }
+            let (kept, tiled) = match built {
+                Some(m) => (m.kept, m.tiled),
+                None => (None, None),
+            };
+            self.record_tiled(index, &view, tiled);
+            self.keep(index, kept);
         }
         Some(view)
     }
@@ -2703,7 +2853,7 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Made> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -2723,7 +2873,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Made::plain(Some(shadow.buffer.clone())))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -2761,7 +2911,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
                 // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
+                let first = crate::resource::first_shown(resource);
+                let tiled = crate::resource::host_tiled(resource).map(|on_demand| (on_demand, first));
+                if let Some(first) = first
                     && first > 0
                 {
                     // SAFETY: a live resource.
@@ -2790,11 +2942,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Made {
+                    kept: Some(texture.clone()),
+                    tiled,
+                })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at).map(Made::plain)
             } else {
                 None
             }
@@ -2804,7 +2959,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at).map(Made::plain)
                     }
                     _ => None,
                 };
@@ -2852,7 +3007,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Made::plain(Some(texture.clone())))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -2863,13 +3018,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Made::plain(None))
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Made::plain(None))
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -2893,9 +3048,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return None;
             }
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at).map(Made::plain)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at).map(Made::plain)
             }
         }
     }
@@ -3585,6 +3740,120 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn tiled_slots_tracks_tabled_starts_and_detects_first_shown_changes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mut slots: TiledSlots<Arc<AtomicU32>> = TiledSlots::default();
+        let shown = Arc::new(AtomicU32::new(u32::MAX));
+        let read = |v: &Arc<AtomicU32>| {
+            let n = v.load(Ordering::Relaxed);
+            (n != u32::MAX).then_some(n)
+        };
+
+        // Slot built before any tiles were mapped (first_shown == None).
+        slots.note(7, Some(0x1000_0000), shown.clone(), None);
+        assert_eq!(slots.slots_at(0x1000_0000), vec![7]);
+        assert!(!slots.is_stale(7, read));
+
+        // First upload maps mips 3..10 (first_shown == Some(3)): slot is stale.
+        shown.store(3, Ordering::Relaxed);
+        assert!(slots.is_stale(7, read));
+
+        // After remaking with Some(3), slot is fresh again.
+        slots.note(7, Some(0x1000_0000), shown.clone(), Some(3));
+        assert!(!slots.is_stale(7, read));
+
+        // Finer mips 0..2 stream in (first_shown == Some(0)): slot is stale again.
+        shown.store(0, Ordering::Relaxed);
+        assert!(slots.is_stale(7, read));
+
+        // Re-pointing slot 7 to a different start cleans up the old start index.
+        slots.note(7, Some(0x2000_0000), shown.clone(), Some(0));
+        assert!(slots.slots_at(0x1000_0000).is_empty());
+        assert_eq!(slots.slots_at(0x2000_0000), vec![7]);
+
+        // Forgetting slot 7 cleans both maps.
+        slots.forget(7);
+        assert!(slots.slots_at(0x2000_0000).is_empty());
+        assert!(!slots.is_stale(7, read));
+    }
+
+    /// End-to-end check with `VICTORY_LEVELS_ON_DEMAND=1`: a tabled slot holding
+    /// a placed tiled texture is excluded from `Spans` (`placed`), yet must still
+    /// be remade by `texture_views_remade()` and `mirror()` once `first_shown()`
+    /// changes after upload.
+    #[test]
+    fn tabled_tiled_slot_remakes_when_first_shown_changes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !crate::tiles::wanted() {
+            return; // only runs under VICTORY_LEVELS_ON_DEMAND=1
+        }
+        use windows_sys::Win32::System::Memory::*;
+        // 1024x1024 BC7, 11 mips (~1.33 MiB >= 1 MiB default floor), partly mapped
+        // so `resource::texture_at` builds a levels-on-demand `Tiled` texture.
+        let rdesc: [u32; 14] = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).unwrap() as usize;
+        // SAFETY: private reservation with only the tail committed (partly mapped).
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: commit the first 64 KiB only so the texture is partly mapped.
+        let committed = unsafe { VirtualAlloc(base, 65536, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+
+        let addr = base as u64;
+        let mut sdesc = [0u32; 16];
+        sdesc[0] = 98; // BC7_UNORM
+        sdesc[1] = 4; // TEXTURE2D
+        sdesc[2] = 5768; // default component mapping
+        sdesc[4] = 0; // MostDetailedMip = 0
+        sdesc[5] = 11; // MipLevels = 11
+        sdesc[10] = addr as u32;
+        sdesc[11] = (addr >> 32) as u32;
+
+        // Write title descriptor handle for slot 3 and mark slot 3 tabled_lately.
+        let mut handle_words = [0u32; 8];
+        let handle = handle_words.as_mut_ptr() as u64;
+        super::super::record(handle, View::Placed(false, rdesc, sdesc));
+        heap.texture_slot_tabled(3, true);
+
+        // First mirror before upload: builds slot 3 with first_shown == None.
+        let mirrored = heap.mirror(3, handle, true);
+        assert!(mirrored.is_some());
+        // Confirm slot 3 was excluded from `placed` (`Spans`), yet tracked in `tiled_shown`.
+        assert!(heap.placed.lock().unwrap().slots_at(addr).is_empty());
+        assert_eq!(heap.tiled_shown.lock().unwrap().slots_at(addr), vec![3]);
+
+        // Simulate upload giving mips 3..11 tiles -> first_shown becomes Some(3).
+        let placed = crate::resource::texture_at(addr, &rdesc).unwrap();
+        let on_demand = crate::resource::host_tiled(placed).expect("expected tiled texture");
+        let mask = ((1u32 << 11) - 1) & !0b111; // mips 3..10
+        let _ = on_demand.uploaded(mask, addr);
+        assert_eq!(on_demand.tiled().unwrap().first_shown(), Some(3));
+        assert!(heap.tiled_stale(3));
+
+        // 1) `texture_views_remade()` now finds and remakes tabled slot 3!
+        assert!(heap.texture_views_remade() >= 1);
+        assert!(!heap.tiled_stale(3));
+
+        // 2) When mips 0..2 later arrive (`first_shown` -> Some(0)), calling
+        //    `mirror()` alone (without `texture_views_remade()`) detects staleness
+        //    and refreshes slot 3 in place!
+        let _ = on_demand.uploaded((1u32 << 11) - 1, addr);
+        assert_eq!(on_demand.tiled().unwrap().first_shown(), Some(0));
+        assert!(heap.tiled_stale(3));
+        assert!(heap.mirror(3, handle, true).is_some());
+        assert!(!heap.tiled_stale(3));
+
+        // Clean up RESHOWN + reservation.
+        let _ = heap.texture_views_remade();
+        // SAFETY: freeing our private reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }
 
