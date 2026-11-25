@@ -1638,9 +1638,14 @@ unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
+/// Give both shader compilations the same piece size as the CPU plan.
+pub(crate) fn card_shader(source: &str, bytes: usize) -> String {
+    format!("#define CARD_PIECE_BYTES {bytes}u\n{source}")
+}
+
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
+/// its bytes from before, one thread per card piece (aligned in title
+/// memory as `Shadow::card_piece` cuts them): `differs`
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
@@ -1664,9 +1669,9 @@ RWByteAddressBuffer differs : register(u1);
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= pieces) return;
     uint piece = first + id.x;
-    uint lo = piece * 65536u;
+    uint lo = piece * CARD_PIECE_BYTES;
     lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
+    uint hi = min((piece + 1u) * CARD_PIECE_BYTES - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
@@ -1726,9 +1731,9 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     uint i = group.x;
     if (i >= pieces) return;
     uint piece = first + i;
-    uint lo = piece * 65536u;
+    uint lo = piece * CARD_PIECE_BYTES;
     lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
+    uint hi = min((piece + 1u) * CARD_PIECE_BYTES - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
@@ -1816,7 +1821,7 @@ fn inflight_fetch_bytes() -> u64 {
     })
 }
 
-/// A slot of [`CARD_FETCH`]: a 64 KiB piece as the compare cuts it, widened
+/// A slot of [`CARD_FETCH`]: the largest supported piece (64 KiB), as the compare cuts it, widened
 /// to 16 bytes at both ends (one more 16-byte step where the copy does not
 /// start at a multiple of 16 in its piece).
 pub(crate) const INFLIGHT_SLOT: u64 = (64 << 10) + 16;
@@ -1842,7 +1847,7 @@ pub(crate) const INFLIGHT_NONE: u32 = 0xffff_ffff;
 /// What `Shadow::card_piece` gives for the piece lies at or above it, and
 /// within [`INFLIGHT_SLOT`] of it.
 pub(crate) fn inflight_piece_from(span: &crate::shadow::CardSpan, i: u32) -> usize {
-    let lo = (span.first + i) as usize * 65536;
+    let lo = (span.first + i) as usize * crate::shadow::card_piece_bytes();
     let lo = lo.saturating_sub(span.skew as usize);
     lo & !15
 }
@@ -1906,9 +1911,9 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (k != NONE && (k - landed) < slots) {
             uint piece = first + i;
-            uint lo = piece * 65536u;
+            uint lo = piece * CARD_PIECE_BYTES;
             lo = lo > skew ? lo - skew : 0u;
-            uint hi = min((piece + 1u) * 65536u - skew, size);
+            uint hi = min((piece + 1u) * CARD_PIECE_BYTES - skew, size);
             lo = lo & ~15u;
             hi = (hi + 15u) & ~15u;
             uint into = (k % slots) * SLOT;
@@ -4059,11 +4064,11 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let source = card_shader(card_compare_source(), crate::shadow::card_piece_bytes());
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
-            let source = card_compare_source();
             D3DCompile(
                 source.as_ptr().cast(),
                 source.len(),
@@ -4119,13 +4124,14 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<CardInflight> {
+            let source = card_shader(CARD_FETCH, crate::shadow::card_piece_bytes());
             let mut code: Option<ID3DBlob> = None;
             // SAFETY: the source and names live through the call; the out
             // pointer is ours.
             unsafe {
                 D3DCompile(
-                    CARD_FETCH.as_ptr().cast(),
-                    CARD_FETCH.len(),
+                    source.as_ptr().cast(),
+                    source.len(),
                     windows::core::s!("card fetch in flight"),
                     None,
                     None,
@@ -4358,7 +4364,7 @@ impl Host {
                         };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
+                        // of each card piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.

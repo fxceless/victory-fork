@@ -351,11 +351,23 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// Granularity shared by the card shaders, fetch plan, and hash table.
+/// `VICTORY_CARD_PIECE_KB=4|16|64` (default 64) sets how much of a
+/// changed buffer a flagged piece fetches; CPU snapshot pages stay 64 KiB.
+pub(crate) fn card_piece_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| match std::env::var("VICTORY_CARD_PIECE_KB").as_deref() {
+        Ok("4") => 4 << 10,
+        Ok("16") => 16 << 10,
+        _ => 64 << 10,
+    })
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
+/// for each card piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / card_piece_bytes() as u64 + 2) * 16
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -641,9 +653,9 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
-/// card takes it: its offsets in the copy, its first 64 KiB piece (pieces
-/// are cut at multiples of 64 KiB of title memory; piece 0 holds offset
-/// 0), how many pieces hold it, and where the copy starts in piece 0.
+/// card takes it: its offsets in the copy, the first piece and number
+/// of pieces, and where the copy starts in piece 0. Pieces align to
+/// multiples of [`card_piece_bytes`] in title memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardSpan {
     pub(crate) from: u32,
@@ -656,13 +668,14 @@ pub(crate) struct CardSpan {
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
 fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
-    let pieces = pieces_of(start, from, to);
+    let bytes = card_piece_bytes();
+    let pieces = pieces_of(start, from, to, bytes);
     CardSpan {
         from: from as u32,
         to: to as u32,
         first: pieces.start as u32,
         pieces: pieces.len() as u32,
-        skew: (start % PIECE) as u32,
+        skew: (start % bytes) as u32,
     }
 }
 
@@ -670,7 +683,7 @@ fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
 /// `len` bytes of title memory from `start` on: what is fetched and merged
 /// of a piece the compare found differing.
 fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
-    let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
+    let (lo, hi) = piece_at(start, len, (span.first + i) as usize, card_piece_bytes());
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
@@ -704,9 +717,9 @@ mod card_tests {
     /// in host.rs), before it widens them to 16 bytes.
     fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
         let piece = span.first + i;
-        let lo = piece * 65536;
+        let lo = piece * super::card_piece_bytes() as u32;
         let lo = if lo > span.skew { lo - span.skew } else { 0 };
-        let hi = (piece + 1) * 65536 - span.skew;
+        let hi = (piece + 1) * super::card_piece_bytes() as u32 - span.skew;
         (lo.max(span.from), hi.min(span.to))
     }
 
@@ -2501,17 +2514,17 @@ fn kept_most() -> u64 {
 /// The 64 KiB pieces, cut at multiples of 64 KiB of title memory, that
 /// hold offsets `[from, to)` of a copy of memory from `start` on
 /// (`from < to`); piece 0 holds offset 0.
-fn pieces_of(start: usize, from: usize, to: usize) -> std::ops::Range<usize> {
-    let first = start / PIECE;
-    (start + from) / PIECE - first..(start + to - 1) / PIECE - first + 1
+fn pieces_of(start: usize, from: usize, to: usize, bytes: usize) -> std::ops::Range<usize> {
+    let first = start / bytes;
+    (start + from) / bytes - first..(start + to - 1) / bytes - first + 1
 }
 
 /// The offsets that piece `piece` holds of a copy of `len` bytes of memory
 /// from `start` on.
-fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
-    let first = start / PIECE;
-    let lo = ((first + piece) * PIECE).saturating_sub(start);
-    let hi = ((first + piece + 1) * PIECE - start).min(len);
+fn piece_at(start: usize, len: usize, piece: usize, bytes: usize) -> (usize, usize) {
+    let first = start / bytes;
+    let lo = ((first + piece) * bytes).saturating_sub(start);
+    let hi = ((first + piece + 1) * bytes - start).min(len);
     (lo, hi)
 }
 
@@ -2525,20 +2538,20 @@ mod piece_tests {
     fn pieces_cover_the_copy_as_the_compare_cuts_it() {
         for start in [0usize, 1, 4096, PIECE - 1, PIECE, PIECE + 77, 5 * PIECE + 12345] {
             for len in [1usize, 100, PIECE - 1, PIECE, PIECE + 1, 3 * PIECE + 500] {
-                let count = pieces_of(start, 0, len).end;
+                let count = pieces_of(start, 0, len, PIECE).end;
                 let mut at = 0;
                 for piece in 0..count {
-                    let (lo, hi) = piece_at(start, len, piece);
+                    let (lo, hi) = piece_at(start, len, piece, PIECE);
                     assert_eq!(lo, at, "{start} {len} {piece}");
                     // As `Shadow::differing` cuts: to the next multiple.
                     let n = (PIECE - (start + at) % PIECE).min(len - at);
                     assert_eq!(hi, at + n, "{start} {len} {piece}");
-                    assert_eq!(pieces_of(start, lo, hi), piece..piece + 1);
-                    assert_eq!(pieces_of(start, hi - 1, hi), piece..piece + 1);
+                    assert_eq!(pieces_of(start, lo, hi, PIECE), piece..piece + 1);
+                    assert_eq!(pieces_of(start, hi - 1, hi, PIECE), piece..piece + 1);
                     at = hi;
                 }
                 assert_eq!(at, len, "{start} {len}");
-                assert_eq!(pieces_of(start, 0, len), 0..count);
+                assert_eq!(pieces_of(start, 0, len, PIECE), 0..count);
             }
         }
     }
@@ -3331,12 +3344,12 @@ impl Shadow {
     /// [`Shadow::differing`] cuts them) that hold offsets `[from, to)` of
     /// the copy; `from < to`.
     fn pieces(&self, from: usize, to: usize) -> std::ops::Range<usize> {
-        pieces_of(self.start as usize, from, to)
+        pieces_of(self.start as usize, from, to, PIECE)
     }
 
     /// The offsets in the copy that piece `piece` holds.
     fn piece(&self, piece: usize) -> (usize, usize) {
-        piece_at(self.start as usize, self.len as usize, piece)
+        piece_at(self.start as usize, self.len as usize, piece, PIECE)
     }
 
     /// The copy's bytes at offsets `[from, to)` change: a kept snapshot is
