@@ -717,7 +717,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::room_lately() {
+            if crate::resource::room_lately() || crate::tiles::reuse_available() {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);

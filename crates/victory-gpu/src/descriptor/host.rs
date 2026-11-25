@@ -133,6 +133,14 @@ pub(crate) fn levels_changed(start: u64) {
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn take_levels_changed(start: u64) -> bool {
+    let mut changed = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let found = changed.contains(&start);
+    changed.retain(|&at| at != start);
+    found
+}
+
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose last upload left a held level without tiles (the card had no
 /// room, or no heap could be had), and when (`crate::host::moment`). A

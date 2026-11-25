@@ -27,6 +27,23 @@ developer or publisher.
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The deferred release of tiled-texture backing is from **LeonardoS11**,
+  [PR #795](https://github.com/fxceless/victory-fork/pull/795), commit `32772d9`.
+
+### Experimental mip reclamation
+
+`VICTORY_LEVELS_ON_DEMAND=1 VICTORY_LEVELS_RECLAIM=1` lets the sweep replace idle,
+read-only placed texture copies which retain at least 1 MiB of unheld mip levels
+(`VICTORY_LEVELS_MIN_KB` controls that threshold). The replacement keeps the same
+texture dimensions and mip numbering, and its first use uploads the held levels.
+Old descriptors and recorded command lists retain the old copy and backing until
+they release it. Indexed views switch after the upload's GPU fence completes.
+GPU-written or claimed levels prevent replacement. The pool
+must already have room for the retained levels; a full card may reuse free tiles
+without creating another heap. Reclamation is off by default. It is tested with
+synthetic textures on WARP; gameplay performance and the native NVIDIA path have
+not been verified.
+The reclamation change and its synthetic tests were developed with Codex.
 
 ## Status of this fork (2026-11-25)
 

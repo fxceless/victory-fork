@@ -1182,6 +1182,76 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Compact idle read-only placed copies without changing mappings which old
+/// lists may still read. As in `let_go_idle`, the idle grace protects callers
+/// borrowing `host_resource` before recording a reference. Descriptor references
+/// may remain: they keep the old version's tiles via `tiles::let_go` (PR #795).
+#[cfg(windows)]
+pub(crate) fn reclaim_mips() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RECLAIM").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    reclaim_mips_after(idle_ms, 4);
+}
+
+#[cfg(windows)]
+fn reclaim_mips_after(idle_ms: u64, idle_frames: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(device) = crate::host::host().map(|h| &h.device) else {
+        return;
+    };
+    let all = textures();
+    let mut remade = 0;
+    for &at in all.iter() {
+        // SAFETY: the table lock prevents the title resource being freed.
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((old, _)) = made.as_ref() else {
+            continue;
+        };
+        // Deferred uploads/writes keep the Arc. They must finish before the
+        // held mask is used to construct a replacement version.
+        if std::sync::Arc::strong_count(old) != 1
+            || !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+        {
+            continue;
+        }
+        let Some((texture, tiled)) = old
+            .tiled
+            .as_ref()
+            .and_then(|t| t.reclaimed_on(device, &old.texture))
+        else {
+            continue;
+        };
+        crate::texture::unstage(at as This);
+        let mut replacement = HostTexture::new_tiled(texture, 0, tiled);
+        replacement.filled = true;
+        KINDS[0].fetch_add(1, Relaxed);
+        KINDS[6].fetch_add(1, Relaxed);
+        let old = made.replace((std::sync::Arc::new(replacement), None));
+        r.host.used.store(crate::host::moment(), Relaxed);
+        drop(made);
+        drop(old);
+        let memory = r.data() as usize;
+        // Requeue the upload even though title bytes did not change. Keep old
+        // indexed views until OnDemand::uploaded reports initialized levels;
+        // remaking them here would expose an empty copy for a frame.
+        crate::descriptor::host::remapped(memory, 1);
+        remade += 1;
+    }
+    if remade != 0 {
+        tracing::debug!(
+            remade,
+            "idle texture copies remade without unheld mips; old readers retain their backing"
+        );
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1417,15 +1487,10 @@ pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    if let Some(limit) = texture_limit() {
         return filled < limit;
     }
     if filled < FLOOR {
@@ -1441,6 +1506,16 @@ pub(crate) fn room() -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// An explicit logical byte limit also forbids reusing pool tiles past it.
+#[cfg(windows)]
+pub(crate) fn texture_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1980,6 +2055,12 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // A texture with levels on demand: its tiles are in heaps of ours,
+        // not in the texture, so they stay given until nothing names the
+        // texture any more (`crate::tiles::let_go`).
+        if let Some(tiled) = self.tiled.take() {
+            crate::tiles::let_go(self.texture.clone(), tiled);
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2168,13 +2249,37 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
 /// (`crate::tiles::Tiled::first_shown`).
 #[cfg(windows)]
 pub(crate) fn first_shown(this: This) -> Option<u32> {
-    host_tiled(this)?.tiled()?.first_shown()
+    host_tiled(this)?.tiled()?.view_first()
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
+
+/// `host::retire` drops this after the current submission's fence completes.
+/// Until then indexed slots keep the initialized old version, and this Arc
+/// prevents the replacement from being compacted while its upload is pending.
+#[cfg(windows)]
+struct MipViewsAfterUpload {
+    copy: std::sync::Arc<HostTexture>,
+    memory: u64,
+}
+
+#[cfg(windows)]
+impl Drop for MipViewsAfterUpload {
+    fn drop(&mut self) {
+        if self
+            .copy
+            .tiled
+            .as_ref()
+            .and_then(|t| t.first_shown())
+            .is_some()
+        {
+            crate::descriptor::host::levels_changed(self.memory);
+        }
+    }
+}
 
 // SAFETY: the host texture is named only in queue calls, which any thread
 // may make; what it has been given is behind a lock of its own.
@@ -2186,6 +2291,14 @@ unsafe impl Sync for OnDemand {}
 
 #[cfg(windows)]
 impl OnDemand {
+    fn levels_changed(&self, memory: u64) {
+        if self.0.tiled.as_ref().is_some_and(|t| t.reclaimed) {
+            crate::host::retire(MipViewsAfterUpload { copy: self.0.clone(), memory });
+        } else {
+            crate::descriptor::host::levels_changed(memory);
+        }
+    }
+
     pub(crate) fn tiled(&self) -> Option<&crate::tiles::Tiled> {
         self.0.tiled.as_ref()
     }
@@ -2202,7 +2315,7 @@ impl OnDemand {
         };
         let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room());
         if changed {
-            crate::descriptor::host::levels_changed(memory);
+            self.levels_changed(memory);
         }
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2215,7 +2328,7 @@ impl OnDemand {
         if let Some(tiled) = &self.0.tiled
             && tiled.card_wrote(&self.0.texture, levels)
         {
-            crate::descriptor::host::levels_changed(memory);
+            self.levels_changed(memory);
         }
     }
 }
@@ -2895,6 +3008,140 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn mip_sweep_replaces_the_copy_only_after_deferred_users_let_go() {
+        let _exclusive = crate::tiles::TILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The process-wide host obeys VICTORY_D3D12_WARP only in diagnostics.
+        if std::env::var_os("VICTORY_D3D12_WARP").is_none() {
+            eprintln!("mip sweep: requires diagnostics and VICTORY_D3D12_WARP=1; skipped");
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let host = crate::host::host().expect("a D3D12 adapter is required");
+        let memory = vec![0x22u8; 2 << 20];
+        let desc = texture(1024, 1024, 98, 11);
+        let mut title = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                memory.as_ptr() as u64,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut title
+            ),
+            S_OK
+        );
+        let host_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 11,
+            Format: DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            ..Default::default()
+        };
+        let mut copy: Option<ID3D12Resource> = None;
+        // SAFETY: a reserved synthetic texture, on this test's host device.
+        unsafe {
+            host.device
+                .CreateReservedResource(&host_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut copy)
+                .unwrap()
+        };
+        let copy = copy.unwrap();
+        let tiled = crate::tiles::Tiled::make(&host.device, &copy, 11).unwrap();
+        tiled.uploaded_on(host.queue(), &host.device, &copy, (1 << 11) - 1, true);
+        tiled.uploaded_on(
+            host.queue(),
+            &host.device,
+            &copy,
+            ((1 << 11) - 1) & !7,
+            false,
+        );
+        // Finish the mapping operations before this test lets any resource go.
+        let fence: ID3D12Fence =
+            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        unsafe { host.queue().Signal(&fence, 1).unwrap() };
+        let started = std::time::Instant::now();
+        while unsafe { fence.GetCompletedValue() } < 1 {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "mapping fence did not complete"
+            );
+            std::thread::yield_now();
+        }
+        let old_bytes = tiled.given_bytes();
+        let old_reader = copy.clone();
+        let mut old = HostTexture::new_tiled(copy, 0, tiled);
+        old.filled = true;
+        KINDS[0].fetch_add(1, Relaxed);
+        let r = resource(title);
+        r.host.placed.store(true, Relaxed);
+        let pending = std::sync::Arc::new(old);
+        *r.host.made.lock().unwrap() = Some((pending.clone(), None));
+        reclaim_mips_after(0, 0);
+        assert_eq!(
+            r.host.made.lock().unwrap().as_ref().unwrap().0.texture,
+            old_reader,
+            "a pending upload keeps its version"
+        );
+        drop(pending);
+        reclaim_mips_after(0, 0);
+        {
+            let made = r.host.made.lock().unwrap();
+            let replacement = &made.as_ref().unwrap().0;
+            assert_ne!(
+                replacement.texture, old_reader,
+                "the production sweep replaced the idle copy"
+            );
+            assert_eq!(replacement.tiled.as_ref().unwrap().given_bytes(), 0);
+            assert_eq!(r.desc.width, 1024, "the title's dimensions did not change");
+        }
+        let old_id = windows::core::Interface::as_raw(&old_reader) as usize;
+        crate::tiles::give_back_let_go();
+        assert_eq!(
+            crate::tiles::retained_bytes(old_id),
+            Some(old_bytes),
+            "old readers still retain the tiles"
+        );
+        drop(old_reader);
+        crate::tiles::give_back_let_go();
+        assert_eq!(crate::tiles::retained_bytes(old_id), None);
+        // Exercise the real submission/retirement boundary. Publishing the
+        // new indexed view during run_deferred would precede its GPU copy.
+        let memory_at = memory.as_ptr() as u64;
+        assert!(!crate::descriptor::host::take_levels_changed(memory_at));
+        let demand = OnDemand(r.host.made.lock().unwrap().as_ref().unwrap().0.clone());
+        let list = host.new_list().unwrap();
+        list.defer_host(move || {
+            demand.uploaded(((1 << 11) - 1) & !7, memory_at);
+            assert!(
+                !crate::descriptor::host::take_levels_changed(memory_at),
+                "the view must not change before the upload submission finishes"
+            );
+        });
+        list.close();
+        host.execute(&[&list]);
+        assert!(
+            crate::descriptor::host::take_levels_changed(memory_at),
+            "the completed submission publishes its initialized version"
+        );
+        list.reset();
+        let release: Release = slot(title, 0x10);
+        release(title);
     }
 
     fn heap(size: u64) -> This {

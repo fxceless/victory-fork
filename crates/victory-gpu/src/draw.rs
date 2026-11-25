@@ -1893,7 +1893,7 @@ impl State {
         host.texture_views_remade();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
-        if room {
+        if room || crate::tiles::reuse_available() {
             host.texture_slots_waiting(frame);
         }
         let (due, census) = host.texture_slots_due(frame, 4096);
