@@ -1948,6 +1948,14 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Host view heaps and write intent from `crate::memory::ready` calls on
+    /// this list, plus how many numbered copies have refresh/gpu_writes set.
+    memory_heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
+    memory_writes: bool,
+    memory_prepared: usize,
+    memory_writes_prepared: usize,
+    /// Directory delta copied in this list's prelude before commands execute.
+    memory_dir_patch: Option<crate::memory::DirectoryPatch>,
 }
 
 impl Deferred {
@@ -5399,6 +5407,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        crate::memory::prepare_submission(self, runs);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -6341,7 +6350,8 @@ impl HostList {
         // The records the list's draws read from slots (`crate::indirect::gather`).
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if barriers.is_empty() && syncs.is_empty() && !gathered {
+        let dir_patch = self.deferred().memory_dir_patch.take();
+        if barriers.is_empty() && syncs.is_empty() && !gathered && dir_patch.is_none() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6356,6 +6366,27 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if let Some(patch) = &dir_patch {
+                    list.ResourceBarrier(&[transition(
+                        &patch.directory,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    for &(dst_offset, src_offset, byte_len) in &patch.regions {
+                        list.CopyBufferRegion(
+                            &patch.directory,
+                            dst_offset,
+                            &patch.upload,
+                            src_offset,
+                            byte_len,
+                        );
+                    }
+                    list.ResourceBarrier(&[transition(
+                        &patch.directory,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -6867,6 +6898,58 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Records a host view heap and write intent from `crate::memory::ready`
+    /// so later submissions can reconcile newly numbered copies onto this list.
+    pub(crate) fn record_memory(
+        &self,
+        heap: std::sync::Arc<crate::descriptor::host::HostHeap>,
+        writes: bool,
+    ) {
+        let mut d = self.deferred();
+        if !d.memory_heaps.iter().any(|h| std::sync::Arc::ptr_eq(h, &heap)) {
+            d.memory_heaps.push(heap);
+        }
+        d.memory_writes |= writes;
+    }
+
+    /// Whether any draw recorded on this list used `crate::memory::ready`.
+    pub(crate) fn uses_memory(&self) -> bool {
+        !self.deferred().memory_heaps.is_empty()
+    }
+
+    /// Clones the host view heaps used by `crate::memory::ready` on this list,
+    /// or `None` if this list has not used raw title-memory addressing.
+    pub(crate) fn memory_heaps(
+        &self,
+    ) -> Option<Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>> {
+        let d = self.deferred();
+        if d.memory_heaps.is_empty() {
+            None
+        } else {
+            Some(d.memory_heaps.clone())
+        }
+    }
+
+    /// How many numbered copies already have `refresh` and `gpu_writes` set on
+    /// this list, plus whether any draw on this list writes raw memory.
+    pub(crate) fn memory_prepared(&self) -> (usize, usize, bool) {
+        let d = self.deferred();
+        (d.memory_prepared, d.memory_writes_prepared, d.memory_writes)
+    }
+
+    /// Updates how many numbered copies have `refresh` and `gpu_writes` set on
+    /// this list.
+    pub(crate) fn set_memory_prepared(&self, reads: usize, writes: usize) {
+        let mut d = self.deferred();
+        d.memory_prepared = reads;
+        d.memory_writes_prepared = writes;
+    }
+
+    /// Attaches a directory delta to copy in this list's prelude at submission.
+    pub(crate) fn set_memory_dir_patch(&self, patch: crate::memory::DirectoryPatch) {
+        self.deferred().memory_dir_patch = Some(patch);
     }
 
     /// Whether this is the first time since the reset that the list asks

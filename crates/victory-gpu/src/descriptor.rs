@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -81,26 +81,35 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+        self.host_slot().as_deref()
+    }
+
+    /// Strong reference to [`Heap::host`], for work kept until submission.
+    #[cfg(windows)]
+    pub(crate) fn host_arc(&self) -> Option<std::sync::Arc<host::HostHeap>> {
+        self.host_slot().clone()
+    }
+
+    #[cfg(windows)]
+    fn host_slot(&self) -> &Option<std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h;
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
-            return None;
+            return self.host.get_or_init(|| None);
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized. Publish only after replaying the queued writes.
-        self.host
-            .get_or_init(|| {
-                let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
-                }
-                Some(h)
-            })
-            .as_ref()
+        self.host.get_or_init(|| {
+            let step = u64::from(increment(self.desc.kind)?);
+            let h = std::sync::Arc::new(host::HostHeap::new(self.samplers(), self.desc.count)?);
+            for i in pending.drain(..) {
+                h.mirror(i, self.start + u64::from(i) * step, false);
+            }
+            Some(h)
+        })
     }
 
     /// The handle of descriptor `index` of this heap.

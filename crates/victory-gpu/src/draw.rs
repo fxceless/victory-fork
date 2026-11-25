@@ -979,7 +979,7 @@ impl State {
     fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
-            h => crate::descriptor::heap(h as This).host(),
+            h => crate::descriptor::heap(h as This).host_arc(),
         }?;
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         for root in self.roots_ref(compute) {
@@ -989,7 +989,7 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, &heap, &addresses, &constants, writes)
     }
 
     /// The bound heap holding `handle`.
