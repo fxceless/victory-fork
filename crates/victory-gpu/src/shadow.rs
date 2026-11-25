@@ -1557,6 +1557,52 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// `VICTORY_BACK_JOIN=<bytes>`: when shader writes are put back into title
+/// memory, runs of the GPU's bytes no further apart than that are written
+/// with one kernel call, the gap between them included (title bytes read
+/// a moment before, in [`back_piece`]). 0 or unset: each run alone, as
+/// upstream #2009 wants.
+///
+/// Why: each run is one `NtWriteVirtualMemory`. With the ray-tracing
+/// structure builder on, a frame put back about 350 pieces holding
+/// 780,000-910,000 runs (about 2,400 a 64 KiB piece: the builder changes a
+/// few bytes here and there in each node), 248 ms a frame on an RTX 4080.
+/// With 256 the same frames took 1,300 calls and 1.8 ms of writing.
+///
+/// shortcut: a title write landing in a gap between the read and the write
+/// (microseconds) is overwritten with the byte read before it. The gaps are
+/// at most this many bytes, and only between bytes the GPU wrote; the
+/// relay's merge ([`Shadow::relay_merge`]) writes whole stretches already.
+fn back_join() -> usize {
+    static JOIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *JOIN.get_or_init(|| std::env::var("VICTORY_BACK_JOIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Calls `write(offset, end)` for `runs` (offsets and lengths, in order,
+/// not overlapping) joined where the gap to the next run is at most `join`
+/// bytes; returns the number of calls.
+fn joined_runs(runs: &[(usize, usize)], join: usize, mut write: impl FnMut(usize, usize)) -> usize {
+    let (mut calls, mut i) = (0, 0);
+    while i < runs.len() {
+        let (off, mut end) = (runs[i].0, runs[i].0 + runs[i].1);
+        let mut j = i + 1;
+        while j < runs.len() && runs[j].0 - end <= join {
+            end = runs[j].0 + runs[j].1;
+            j += 1;
+        }
+        write(off, end);
+        calls += 1;
+        i = j;
+    }
+    calls
+}
+
+/// Of putting shader writes back ([`Shadow::copy_back`]), since the last
+/// frame-rate line: pieces looked at, runs of GPU bytes, kernel writes;
+/// microseconds reading title memory and merging, opening guards
+/// (`watch::writing`), writing.
+static BACK_PUT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
@@ -1579,6 +1625,51 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    let b: Vec<f64> = BACK_PUT.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if b[0] > 0.0 {
+        tracing::info!(
+            pieces = b[0],
+            runs = b[1],
+            writes = b[2],
+            read_merge_ms = b[3] / 1000.0,
+            open_ms = b[4] / 1000.0,
+            write_ms = b[5] / 1000.0,
+            join = back_join(),
+            "putting shader writes back, per frame (VICTORY_BACK_JOIN)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::joined_runs;
+
+    fn calls(runs: &[(usize, usize)], join: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let n = joined_runs(runs, join, |off, end| out.push((off, end)));
+        assert_eq!(n, out.len());
+        out
+    }
+
+    #[test]
+    fn without_a_join_each_run_is_its_own_write() {
+        let runs = [(0, 2), (3, 1), (100, 4)];
+        assert_eq!(calls(&runs, 0), [(0, 2), (3, 4), (100, 104)]);
+    }
+
+    #[test]
+    fn runs_within_the_join_become_one_write_and_far_ones_stay_apart() {
+        // Gaps of 1, 96 and 3 bytes.
+        let runs = [(0, 2), (3, 1), (100, 4), (107, 2)];
+        assert_eq!(calls(&runs, 1), [(0, 4), (100, 104), (107, 109)]);
+        assert_eq!(calls(&runs, 3), [(0, 4), (100, 109)]);
+        assert_eq!(calls(&runs, 96), [(0, 109)]);
+    }
+
+    #[test]
+    fn no_runs_no_writes() {
+        assert_eq!(calls(&[], 256), []);
+    }
 }
 
 #[cfg(test)]
@@ -2481,18 +2572,29 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                let timed = std::time::Instant::now();
+                let piece = back_piece(host, old, &mut title, &mut mask, &mut runs, read);
+                BACK_PUT[0].fetch_add(1, Ordering::Relaxed);
+                BACK_PUT[3].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let Some((first, n)) = piece else {
                     continue;
                 };
                 let at = at + first;
+                let timed = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
+                BACK_PUT[4].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let timed = std::time::Instant::now();
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
-                }
+                // there since stays. With [`back_join`], runs closer than
+                // that many bytes are written as one, gaps included.
+                written += runs.iter().map(|&(_, len)| len).sum::<usize>();
+                let calls = joined_runs(&runs, back_join(), |off, end| {
+                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), end - off);
+                });
+                BACK_PUT[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                BACK_PUT[2].fetch_add(calls as u64, Ordering::Relaxed);
+                BACK_PUT[5].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
