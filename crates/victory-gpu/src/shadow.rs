@@ -2185,6 +2185,41 @@ mod stale_tests {
     }
 }
 
+/// Lightweight release-mode breakdown of `Shadow::update_free` per frame:
+/// [0] `watch::writes` microseconds, [1] `copy_stale` microseconds,
+/// [2] `unwatched` whole-copy microseconds, [3] refresh calls.
+static REFRESH_BREAKDOWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn refresh_breakdown_line(frames: f64) {
+    let [watch_us, copy_us, whole_us, calls] = [0, 1, 2, 3].map(|i| REFRESH_BREAKDOWN[i].swap(0, Ordering::Relaxed));
+    let [ph_watch, ph_absent, ph_tex] =
+        [0, 1, 2].map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed));
+    let [gww_us, gww_n, g_scan_us, g_prot_us, vp_n, hot_skips] =
+        [0, 1, 2, 3, 4, 5].map(|i| crate::watch::WATCH_TIMING[i].swap(0, Ordering::Relaxed));
+    if calls == 0 && ph_watch + ph_absent + ph_tex == 0 {
+        return;
+    }
+    tracing::info!(
+        "refresh breakdown per frame: watch {:.1} ms (gww {:.1} ms/{:.0}, guard_scan {:.1} ms, guard_prot {:.1} ms/{:.0} vp, hot_skip {:.0}), \
+         copy_stale {:.1} ms, whole {:.1} ms ({:.0} calls); \
+         placeholder fast-path skips (VICTORY_PLACEHOLDER_FAST={}): watch {:.0}, absent {:.0}, tex_query {:.0}",
+        watch_us as f64 / 1e3 / frames,
+        gww_us as f64 / 1e3 / frames,
+        gww_n as f64 / frames,
+        g_scan_us as f64 / 1e3 / frames,
+        g_prot_us as f64 / 1e3 / frames,
+        vp_n as f64 / frames,
+        hot_skips as f64 / frames,
+        copy_us as f64 / 1e3 / frames,
+        whole_us as f64 / 1e3 / frames,
+        calls as f64 / frames,
+        u8::from(crate::inplace::placeholder_fast()),
+        ph_watch as f64 / frames,
+        ph_absent as f64 / frames,
+        ph_tex as f64 / frames,
+    );
+}
+
 /// Copies of windows outside buffers let go since the start, and their
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -3152,9 +3187,15 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            let t0 = std::time::Instant::now();
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
+                let watch_us = t0.elapsed().as_micros() as u64;
+                REFRESH_BREAKDOWN[0].fetch_add(watch_us, Ordering::Relaxed);
+                REFRESH_BREAKDOWN[3].fetch_add(1, Ordering::Relaxed);
                 self.watched.store(1, Ordering::Relaxed);
+                let t1 = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                REFRESH_BREAKDOWN[1].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3164,15 +3205,18 @@ impl Shadow {
                 }
                 return copied;
             }
+            REFRESH_BREAKDOWN[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        let whole_us = started.elapsed().as_micros() as u64;
+        REFRESH_BREAKDOWN[2].fetch_add(whole_us, Ordering::Relaxed);
+        REFRESH_BREAKDOWN[3].fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        crate::copystat::whole(from, to - from, whole_us);
         to - from
     }
 
