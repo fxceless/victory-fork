@@ -272,6 +272,8 @@ info and above).
 
 ## Debugging
 
+[Per-draw sample counts](docs/draw-samples.md) show which draws pass depth and stencil tests in a captured frame.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell

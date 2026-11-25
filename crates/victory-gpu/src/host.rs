@@ -5,6 +5,10 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(feature = "diagnostics")]
+#[path = "draw_samples.rs"]
+mod coverage;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -766,6 +770,8 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    #[cfg(feature = "diagnostics")]
+    samples: Mutex<coverage::Samples>,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -3219,6 +3225,8 @@ impl Host {
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
+                samples: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
@@ -4306,6 +4314,12 @@ impl Host {
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            #[cfg(feature = "diagnostics")]
+            if coverage::enabled() && runs.iter().any(|list| list.has_draw_samples()) {
+                self.execute(&runs);
+                crate::list::recycle(lists, &order);
+                return;
+            }
             self.submit(&runs, true)
         };
         let Some((mut submitted, sent)) = sent else {
@@ -4729,6 +4743,18 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if coverage::enabled() {
+                // SAFETY: this is the fence signalled for this exact group.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                if completed != u64::MAX && completed >= *submitted {
+                    if timing() {
+                        runs[i].save_draw_samples(this_submission, i);
+                    } else {
+                        coverage::save_group(runs, this_submission);
+                    }
+                }
+            }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -5096,6 +5122,10 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
+        if coverage::enabled() {
+            self.samples.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list);
+        }
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -5124,6 +5154,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if coverage::enabled() {
+            self.samples.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);

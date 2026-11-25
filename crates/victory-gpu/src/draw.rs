@@ -2344,7 +2344,7 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    let _sample = list.sampled_draw(true, || self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
@@ -2742,7 +2742,7 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let _sample = list.sampled_draw(true, || self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2843,7 +2843,7 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            let _sample = list.sampled_draw(true, || self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3044,7 +3044,7 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
+        let sample = list.sampled_draw(kind != DISPATCH, || {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         if kind == MESH {
@@ -3062,6 +3062,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
