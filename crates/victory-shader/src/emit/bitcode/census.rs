@@ -59,8 +59,18 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_CENSUS.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice to count the modules its thread writes ([`enabled`]).
+    pub(crate) static TEST_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The counts of the module whose bitcode the container `dxil` holds, if

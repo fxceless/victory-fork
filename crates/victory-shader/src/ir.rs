@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...) and redundant conditional
+//! branches.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -13,7 +14,10 @@
 //!
 //! M0-relative VGPR access (`v_movrels/d/sd_b32`, `v_swaprel_b32`) names its
 //! operand's whole possible range: from the encoded register up to the
-//! program's VGPR count, all read (and all written, for a destination).
+//! program's VGPR count, or the largest M0 proven there ([`build_bounded`],
+//! `crate::range`), all read (and all written, for a destination).
+
+use std::collections::HashMap;
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
@@ -127,6 +131,17 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    build_bounded(code, wave64, vgprs, &HashMap::new())
+}
+
+/// [`build`], with the largest M0 (at most 255) each relative move can see,
+/// by instruction offset, bounding the registers it names.
+pub fn build_bounded(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -149,7 +164,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
+    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs, m0_max);
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -185,6 +200,15 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             (*to, *from) = (parked[k].1, parked[k].2);
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
+        // A conditional SOPP branch to fallthrough has no register effects
+        // and contributes one edge to the join. Calls also use Flow::Branch
+        // but write a return address.
+        if machine.encoding == gfx10::Encoding::Sopp
+            && matches!(flow, Flow::Branch(target) if Some(target) == next)
+        {
+            blocks[b].exit = Exit::Jump(fallthrough()?);
+            continue;
+        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {
@@ -198,7 +222,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        let m0 = m0_max.get(&machine.offset).copied();
+        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {
@@ -252,6 +277,7 @@ fn unspill(
     wave64: bool,
     lanes: u8,
     vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
     fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
@@ -285,7 +311,8 @@ fn unspill(
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
-        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+        let m0 = m0_max.get(&inst.offset).copied();
+        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs, m0) else {
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -432,12 +459,7 @@ fn unspill(
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
-        list[i] = gfx10::Instruction {
-            offset: list[i].offset,
-            encoding,
-            opcode,
-            words: vec![word],
-        };
+        list[i] = gfx10::Instruction::new(list[i].offset, encoding, opcode, vec![word]);
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
@@ -1094,13 +1116,28 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
 fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
-    let find = |replaced: &[Value], mut v: Value| {
-        while replaced[v.0 as usize] != v {
-            v = replaced[v.0 as usize];
+    remove_trivial_phis_steps(blocks, values);
+}
+
+fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
+    fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
+        let mut root = v;
+        while replaced[root.0 as usize] != root {
+            *steps += 1;
+            root = replaced[root.0 as usize];
         }
-        v
-    };
+        let mut cur = v;
+        while replaced[cur.0 as usize] != root {
+            *steps += 1;
+            let next = replaced[cur.0 as usize];
+            replaced[cur.0 as usize] = root;
+            cur = next;
+        }
+        root
+    }
+
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    let mut steps = 0usize;
     let mut changed = true;
     while changed {
         changed = false;
@@ -1108,7 +1145,7 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
             block.phis.retain(|phi| {
                 let mut only = None;
                 for &a in &phi.args {
-                    let a = find(&replaced, a);
+                    let a = find(&mut replaced, a, &mut steps);
                     if a == phi.value || Some(a) == only {
                         continue;
                     }
@@ -1127,15 +1164,16 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     for block in blocks {
         for phi in &mut block.phis {
             for a in &mut phi.args {
-                *a = find(&replaced, *a);
+                *a = find(&mut replaced, *a, &mut steps);
             }
         }
         for inst in &mut block.insts {
             for (_, v) in &mut inst.reads {
-                *v = find(&replaced, *v);
+                *v = find(&mut replaced, *v, &mut steps);
             }
         }
     }
+    steps
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
@@ -1165,13 +1203,25 @@ const DROPPED: &[&str] = &[
 type Effects = (Vec<Reg>, Vec<Reg>);
 
 /// The registers `inst` of `p` reads as operands: its reads without the old
-/// value of a VGPR it only writes.
+/// value of a VGPR it only writes (and, for a bounded relative move, without
+/// the registers past its bound).
 pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
     let lanes = 1 + u8::from(p.wave64);
-    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
-        .ok()
-        .flatten()
-        .map_or_else(Vec::new, |e| e.0)
+    effects(
+        &inst.machine,
+        &inst.fields,
+        inst.name(),
+        lanes,
+        p.vgprs,
+        None,
+    )
+    .ok()
+    .flatten()
+    .map_or_else(Vec::new, |e| {
+        e.0.into_iter()
+            .filter(|&r| inst.read(r).is_some())
+            .collect()
+    })
 }
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
@@ -1182,6 +1232,7 @@ fn effects(
     name: &'static str,
     lanes: u8,
     vgprs: u16,
+    m0_max: Option<u8>,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -1286,10 +1337,13 @@ fn effects(
                 "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32" => (true, true),
                 _ => (false, false),
             };
-            // v[reg + M0] for any M0 that stays inside the program's VGPRs.
+            // v[reg + M0] for any M0 that stays inside the program's VGPRs
+            // (and below the proven bound).
             let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    out.extend((u16::from(reg)..vgprs).map(|r| Reg::V(r as u8)));
+                    let end =
+                        m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
+                    out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {
@@ -1608,6 +1662,26 @@ mod tests {
     }
 
     #[test]
+    fn parked_scalars_become_moves_with_their_names() {
+        let p = build_words(
+            &[
+                0xBE86_0385, // s_mov_b32 s6, 5
+                0xD761_0005, // v_writelane_b32 v5, s6, 0
+                0x0201_0006,
+                0xBE86_0387, // s_mov_b32 s6, 7
+                0xD760_0006, // v_readlane_b32 s6, v5, 0
+                0x0201_0105,
+                0x7E02_0206, // v_mov_b32 v1, s6
+                S_ENDPGM,
+            ],
+            false,
+        );
+        // The rewritten save and restore must not keep the lane opcodes' names.
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names[..4], ["s_mov_b32"; 4]);
+    }
+
+    #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
             0xBF06_0100, // s_cmp_eq_u32 s0, s1
@@ -1787,5 +1861,205 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    const fn s_branch(simm16: i16) -> u32 {
+        0xBF82_0000 | simm16 as u16 as u32
+    }
+
+    const fn s_cbranch_scc1(simm16: i16) -> u32 {
+        0xBF85_0000 | simm16 as u16 as u32
+    }
+
+    #[test]
+    fn reverse_order_diamond_chain_eliminates_trivial_phis() {
+        const LAYERS: usize = 4096;
+        let mut reverse = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(((LAYERS - 1) * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            reverse.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        reverse.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let mut forward = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(0),
+        ];
+        for _ in 0..LAYERS {
+            forward.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                s_branch(0),
+            ]);
+        }
+        forward.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let rev = build_words(&reverse, false);
+        let fwd = build_words(&forward, false);
+        assert!(rev.inputs.is_empty(), "{:?}", rev.inputs);
+        assert!(fwd.inputs.is_empty(), "{:?}", fwd.inputs);
+        assert!(rev.blocks.iter().all(|b| b.phis.is_empty()));
+        assert!(fwd.blocks.iter().all(|b| b.phis.is_empty()));
+        assert_eq!(rev.blocks.len(), fwd.blocks.len());
+
+        let rev_s1 = rev.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let rev_s2 = rev.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let rev_exit = rev.blocks.last().unwrap();
+        assert_eq!(rev_exit.insts[0].name(), "s_add_u32");
+        assert_eq!(rev_exit.insts[0].read(Reg::S(1)), Some(rev_s1));
+        assert_eq!(rev_exit.insts[0].read(Reg::S(2)), Some(rev_s2));
+
+        let fwd_s1 = fwd.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let fwd_s2 = fwd.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let fwd_exit = fwd.blocks.last().unwrap();
+        assert_eq!(fwd_exit.insts[0].name(), "s_add_u32");
+        assert_eq!(fwd_exit.insts[0].read(Reg::S(1)), Some(fwd_s1));
+        assert_eq!(fwd_exit.insts[0].read(Reg::S(2)), Some(fwd_s2));
+    }
+
+    #[test]
+    fn remove_trivial_phis_compresses_reverse_chain_in_bounded_steps() {
+        const CHAIN: usize = 4096;
+        let mut template = build_words(&[0xBE80_0380, S_ENDPGM], false).blocks[0].insts[0].clone();
+        template.writes.clear();
+        let mut blocks = Vec::with_capacity(CHAIN);
+        for k in 0..CHAIN {
+            let v1 = Value(2 + 2 * k as u32);
+            let v2 = Value(3 + 2 * k as u32);
+            let (n1, n2) = if k + 1 < CHAIN {
+                (Value(2 + 2 * (k + 1) as u32), Value(3 + 2 * (k + 1) as u32))
+            } else {
+                (Value(0), Value(1))
+            };
+            let mut inst = template.clone();
+            inst.reads = vec![(Reg::S(1), v1), (Reg::S(2), v2)];
+            blocks.push(Block {
+                offset: k * 4,
+                preds: vec![],
+                phis: vec![
+                    Phi {
+                        reg: Reg::S(1),
+                        value: v1,
+                        args: vec![n1, n1],
+                    },
+                    Phi {
+                        reg: Reg::S(2),
+                        value: v2,
+                        args: vec![n2, n2],
+                    },
+                ],
+                insts: vec![inst],
+                exit: Exit::End,
+            });
+        }
+        let steps = remove_trivial_phis_steps(&mut blocks, 2 + 2 * CHAIN as u32);
+        assert!(blocks.iter().all(|b| b.phis.is_empty()));
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b.insts[0].reads == [(Reg::S(1), Value(0)), (Reg::S(2), Value(1))])
+        );
+        assert!(steps < 100_000, "steps = {steps}");
+    }
+
+    #[test]
+    fn non_trivial_phis_preserve_compressed_representatives() {
+        const LAYERS: usize = 4;
+        let mut code = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            s_cbranch_scc1((2 + (LAYERS - 1) * 4) as i16),
+            0xBE81_0383, // s_mov_b32 s1, 3
+            s_branch((LAYERS * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            code.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        code.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
+
+        let p = build_words(&code, false);
+        let entry_s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let entry_s2 = p.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let arm_s1 = p.blocks[1].insts[0].write(Reg::S(1)).unwrap();
+        let merge = p.blocks.last().unwrap();
+        for b in &p.blocks[..p.blocks.len() - 1] {
+            assert!(b.phis.is_empty(), "{:?}", b.phis);
+        }
+        let [phi] = &merge.phis[..] else {
+            panic!("{:?}", merge.phis)
+        };
+        assert_eq!(phi.reg, Reg::S(1));
+        assert_eq!(phi.args, [arm_s1, entry_s1]);
+        assert_eq!(merge.insts[0].read(Reg::S(1)), Some(phi.value));
+        assert_eq!(merge.insts[0].read(Reg::S(2)), Some(entry_s2));
+
+        let mut loop_code = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0xBE82_0382, // s_mov_b32 s2, 2
+            s_branch(((LAYERS - 1) * 4) as i16),
+        ];
+        for k in 0..LAYERS {
+            loop_code.extend([
+                0xBF06_0201, // s_cmp_eq_u32 s1, s2
+                s_cbranch_scc1(1),
+                0xBF80_0000, // s_nop 0
+                if k == 0 {
+                    s_branch((LAYERS * 4 - 4) as i16)
+                } else {
+                    s_branch(-8)
+                },
+            ]);
+        }
+        loop_code.extend([
+            0x8001_0201, // s_add_u32 s1, s1, s2
+            0xBF07_8401, // s_cmp_lg_u32 s1, 4
+            s_cbranch_scc1(-3),
+            0x8000_0201, // s_add_u32 s0, s1, s2
+            S_ENDPGM,
+        ]);
+
+        let lp = build_words(&loop_code, false);
+        let lp_s1 = lp.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        let lp_s2 = lp.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let header = &lp.blocks[lp.blocks.len() - 2];
+        let exit = lp.blocks.last().unwrap();
+        for b in &lp.blocks[..lp.blocks.len() - 2] {
+            assert!(b.phis.is_empty(), "{:?}", b.phis);
+        }
+        assert!(exit.phis.is_empty(), "{:?}", exit.phis);
+        let [loop_phi] = &header.phis[..] else {
+            panic!("{:?}", header.phis)
+        };
+        let next_s1 = header.insts[0].write(Reg::S(1)).unwrap();
+        assert_eq!(loop_phi.reg, Reg::S(1));
+        assert_eq!(loop_phi.args, [lp_s1, next_s1]);
+        assert_eq!(header.insts[0].read(Reg::S(1)), Some(loop_phi.value));
+        assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
+        assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
+        assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
     }
 }

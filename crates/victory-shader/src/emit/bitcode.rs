@@ -113,6 +113,9 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // Not emitted (nor TRUE): `fcmp false` removes the WARP device, so
+    // `v_cmp_f` and `v_cmp_tru` lower as constants.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -727,7 +730,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1044,6 +1047,57 @@ impl Writer {
 }
 
 #[cfg(test)]
+impl Module {
+    /// The arguments of each call to `name` in `main`, written out as
+    /// expressions (a test's view of the code).
+    pub(crate) fn call_args(&self, name: &str) -> Vec<Vec<String>> {
+        let Some(&f) = self.func_ids.get(name) else {
+            return vec![];
+        };
+        let body = self.blocks.iter().flat_map(|b| &b.body);
+        body.filter_map(|&i| match &self.insts[i as usize].op {
+            Op::Call(g, args) if *g == f => Some(args.iter().map(|&a| self.expr(a)).collect()),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// `v` as `unary(23, Mul(x, 0.5))` and the like: a call by its name
+    /// without `dx.op.` and the overload, other operations by their kind.
+    fn expr(&self, v: V) -> String {
+        let list = |vs: &[V]| {
+            vs.iter()
+                .map(|&x| self.expr(x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match v {
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Int(x) => x.to_string(),
+                Const::Float(bits) => f32::from_bits(*bits).to_string(),
+                Const::Aggregate(ids) => {
+                    let ids: Vec<V> = ids.iter().map(|&k| V::Const(k)).collect();
+                    format!("[{}]", list(&ids))
+                }
+                Const::Undef => "undef".into(),
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, args) => {
+                    let name = &self.funcs[*f as usize].name;
+                    let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                    format!("{}({})", name.split('.').next().unwrap_or(name), list(args))
+                }
+                Op::Bin(op, a, b) => format!("{op:?}({})", list(&[*a, *b])),
+                Op::Cast(op, a) => format!("{op:?}({})", self.expr(*a)),
+                Op::Extract(a, k) => format!("extract({}, {k})", self.expr(*a)),
+                op => format!("{op:?}"),
+            },
+            v => format!("{v:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1194,6 +1248,45 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

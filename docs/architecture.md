@@ -35,7 +35,7 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
+| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
@@ -87,7 +87,11 @@ does not map title DLLs; `victory run` without `--execute` does).
 instruction per machine instruction. `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::resource`
+a lane can reach them with its EXEC bit clear. `victory_shader::range::build`
+(through `victory_shader::spill::build`) builds the SSA form again where a
+bound on the index of a register-relative move (`v_movrel*`) is proven on
+the per-lane form, so the move names only the registers it can reach.
+`victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced

@@ -125,7 +125,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, mut len)) = decode::decode(code) else { return 0 };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -158,39 +158,61 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             if !writable(line, 64) {
                 return 0; // the real instruction faults there too
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+            if len == 3 {
+                // No prefix: the `mov rax, a; add a, 40h; clzero; cmp a, b; jb` loop around it
+                // is done whole, or the one line (`crash::clzero`), which steps over them itself.
+                // That loop's later lines are not asked about: one not writable faults inside
+                // the handler, as the unchecked emulation behind this one does.
+                // SAFETY: a clzero at `ctx.Rip`; the lines it names are the title's to zero.
+                unsafe { crate::crash::clzero(ctx) };
+                len = 0;
+            } else {
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+            }
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
-            // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
+            // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once, but for the last
+            // pass's add, cmp and jb: the CPU runs those, so rax and the flags end as the real
+            // loop leaves them (and a `cmp` that ends it at once, as `cmp rax, rax` does, after
+            // the one pass)
             let regs: [u64; 16] = [
                 ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
             ];
             let end = regs[end_reg as usize & 15] as usize;
             let start = ctx.Rax as usize;
-            if end > start && end - start < 2 << 30 {
+            let span = end.saturating_sub(start);
+            if span < 2 << 30 {
+                // rax at the last pass, and the lines the passes zero
+                let last = start.wrapping_add(span.div_ceil(64).max(1) * 64 - 64);
+                let (from, to) = (start & !63, (last & !63).wrapping_add(64));
                 // Region by region: a block may lie across several (the title's pages are
                 // mapped one view each), and one answer for all of it was a refusal, after
                 // which every 64-byte line took an exception of its own.
-                let mut at = start;
-                while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
+                let mut at = from;
+                while at < to {
+                    let Some(next) = writable_to(at, to) else {
+                        break;
+                    };
+                    // SAFETY: committed and writable from `at` to `next`.
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, next - at) };
+                    at = next;
                 }
-                if at == start {
+                if at == from {
                     return 0;
                 }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
-                if at < end {
+                ZEROED.fetch_add((at - from) as u64, Relaxed);
+                if at < to {
                     // What follows is not writable: the loop goes on there (the same
                     // instruction again), where the real one faults too.
-                    ctx.Rax = at as u64;
+                    ctx.Rax = (at | (start & 63)) as u64;
                     return CONTINUE_EXECUTION;
                 }
+                ctx.Rax = last as u64;
+                len -= 9; // the clzero alone
+            } else {
+                ctx.Rax = end as u64;
             }
-            ctx.Rax = end as u64;
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
@@ -246,4 +268,76 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(64))]
+    struct Lines([u8; 192]);
+
+    fn zeroed(l: &Lines) -> [bool; 3] {
+        [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0]
+    }
+
+    /// [`emulate`] as if `code[at]` faulted with `ctx` as the saved state, on any CPU; `ctx.Rip`
+    /// is left as an offset into `code`.
+    fn emulate_in(code: &[u8], at: usize, ctx: &mut CONTEXT) -> i32 {
+        #[repr(align(4096))]
+        struct Page([u8; 4096]);
+        let mut page = Box::new(Page([0xcc; 4096]));
+        let bytes = &mut page.0[0x800..];
+        bytes[..code.len()].copy_from_slice(code);
+        let base = bytes.as_ptr() as u64;
+        ctx.Rip = base + at as u64;
+        // SAFETY: the code is readable; the lines it zeroes are the caller's.
+        let r = unsafe { emulate(ctx) };
+        ctx.Rip -= base;
+        r
+    }
+
+    #[test]
+    fn clzero_loops_leave_their_last_pass_like_the_cpu() {
+        // clzero; add rax, 0x40; cmp rax, r10; jb, r10 100 bytes on: two lines, and rax at the
+        // last pass, whose add, cmp and jb the CPU runs.
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = start;
+        ctx.R10 = start + 100;
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        assert_eq!(emulate_in(&code, 0, &mut ctx), CONTINUE_EXECUTION);
+        assert_eq!((ctx.Rip, ctx.Rax), (3, start + 64));
+        assert_eq!(zeroed(&mem), [true, true, false]);
+        // cmp rax, rax ends it after one pass.
+        let mut mem = Lines([0xff; 192]);
+        // SAFETY: an all-zero context is valid.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = mem.0.as_mut_ptr() as u64;
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc0, 0x72, 0xf4,
+        ];
+        assert_eq!(emulate_in(&code, 0, &mut ctx), CONTINUE_EXECUTION);
+        assert_eq!((ctx.Rip, ctx.Rax), (3, mem.0.as_ptr() as u64));
+        assert_eq!(zeroed(&mem), [true, false, false]);
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb: whole, as `crash::clzero` does it.
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = start + 64;
+        ctx.Rdx = start + 128;
+        ctx.R8 = start + 192;
+        let code = [
+            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72,
+            0xf1,
+        ];
+        assert_eq!(emulate_in(&code, 7, &mut ctx), CONTINUE_EXECUTION);
+        assert_eq!((ctx.Rip, ctx.Rax, ctx.Rdx), (15, start + 128, start + 192));
+        assert_eq!(zeroed(&mem), [false, true, true]);
+    }
 }

@@ -650,6 +650,14 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if at + size > desc.size {
+            tracing::warn!(
+                kind,
+                at,
+                "pipeline subobject cut off by the stream's end; ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
@@ -839,5 +847,21 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// A subobject the stream's size cuts off is not read: here a pixel
+    /// shader whose bytecode lies past the stream's 16 bytes.
+    #[test]
+    fn streams_end_at_their_size() {
+        let ps = [4u8; 5];
+        let whole = [2, ps.as_ptr() as u64, ps.len() as u64];
+        let desc = StreamDesc {
+            size: 16,
+            stream: whole.as_ptr().cast(),
+        };
+        let mut p = std::ptr::null();
+        let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, S_OK);
+        assert!(shaders(p).is_empty());
     }
 }

@@ -18,16 +18,17 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{self, Program, Reg, Value};
+use crate::ir::{Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, StageIo};
 
 /// The user-data index of the table's first dword.
 const FIRST: u32 = 16;
 
-/// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
-/// of a spilled user-data table rewritten ([`user_data`]).
+/// [`crate::ir::build`] of `native`'s code as the hardware runs it, with the
+/// relative moves bounded ([`crate::range::build`]) and the loads of a
+/// spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut p = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
 }
@@ -283,6 +284,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir;
     use crate::native::{ComputeIo, RootParam, RootType};
 
     fn param(root: RootType, user_data: u8, sgprs: u32, slot: u8) -> RootParam {
