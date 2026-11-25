@@ -8374,7 +8374,18 @@ impl<'a> Lower<'a> {
             x
         };
         let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+        let x = self.s.m.bin(c, Bin::And, x, m);
+        // The neg modifier of this half's operand: high halves take
+        // neg_hi, low halves neg; the two's complement wraps to 16 bits.
+        let neg = if high { v.neg_hi } else { v.neg };
+        let x = if neg >> k & 1 != 0 {
+            let z = self.s.m.i32(0);
+            let x = self.s.m.bin(c, Bin::Sub, z, x);
+            self.s.m.bin(c, Bin::And, x, m)
+        } else {
+            x
+        };
+        Ok(x)
     }
 
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
@@ -8391,7 +8402,9 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        // The per-operand neg (per half) is applied in `packed_src`; the
+        // clamp and the output modifier are not lowered yet.
+        if v.omod != 0 || !float && v.clamp {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
