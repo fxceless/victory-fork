@@ -2869,6 +2869,85 @@ mod tests {
         visible_nodes: 0,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn volume_alias_refreshes_when_its_writer_changes_on_the_same_list() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
+
+        let Some(host) = crate::host::host() else { return };
+        let volume = |format| {
+            let desc = ResourceDesc {
+                dimension: 4, // 3D texture
+                depth_or_array_size: 4,
+                ..texture(4, 4, format, 1)
+            };
+            let mut out = std::ptr::null();
+            assert_eq!(
+                create_committed(std::ptr::null(), &PROPERTIES, 0, &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            (out, host_resource(out).unwrap())
+        };
+        let (first, first_texture) = volume(42);
+        let (second, second_texture) = volume(42);
+        let (view, view_texture) = volume(67);
+        let (upload, data) = host.upload_buffer(8192).unwrap();
+        let readback = host.read_back_buffer(4096).unwrap();
+        let placed = |buffer: &ID3D12Resource, offset, format| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the copy borrows the resource.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: 4, Height: 4, Depth: 4, RowPitch: 256 },
+                },
+            },
+        };
+        let sub = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the copy borrows the resource.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let list = host.new_list().unwrap();
+        for (index, (writer, tex)) in [(first, first_texture), (second, second_texture)].into_iter().enumerate() {
+            let offset = index * 4096;
+            crate::list::ensure_state(&list, writer, 0x400);
+            // SAFETY: both volumes and their mapped upload ranges are live.
+            unsafe {
+                for z in 0..4 {
+                    data.add(offset + z * 1024).write_bytes((index * 16 + z + 1) as u8, 1024);
+                }
+                list.list.CopyTextureRegion(&sub(tex), 0, 0, 0, &placed(&upload, offset as u64, DXGI_FORMAT_R32_UINT), None);
+            }
+            crate::list::ensure_state(&list, writer, 0x800);
+        }
+        assert!(crate::texture::alias(&list, view, first));
+        assert!(crate::texture::alias(&list, view, second));
+        crate::list::ensure_state(&list, view, 0x800);
+        // SAFETY: an open list and live resources in copy states.
+        unsafe { list.list.CopyTextureRegion(&placed(&readback, 0, DXGI_FORMAT_R9G9B9E5_SHAREDEXP), 0, 0, 0, &sub(view_texture), None) };
+        list.close();
+        host.execute(&[&list]);
+        let mut actual = [0u8; 4];
+        // SAFETY: the GPU finished and the readback has four slices.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            for (z, byte) in actual.iter_mut().enumerate() {
+                *byte = ptr.cast::<u8>().add(z * 1024).read();
+            }
+            readback.Unmap(0, None);
+        }
+        drop(list);
+        for resource in [first, second, view] {
+            resource_release(resource);
+        }
+        assert_eq!(actual, [17, 18, 19, 20], "the view still contains the previous volume");
+    }
+
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
