@@ -733,6 +733,117 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
+    /// adapter, as `Host::card_before` records it behind the compare (tickets,
+    /// a UAV barrier, copies into a staging buffer in the card's memory) and
+    /// as the landing brings the flight's slots down (one copy of the slots
+    /// it used into the PC's memory, in a submission of its own): each
+    /// flagged piece takes a ticket of the flight's counter; those below the
+    /// region's slots come down byte for byte as the copy holds them, cut and
+    /// widened as the compare hashes them; one past the region gets a ticket
+    /// and no slot; an unflagged piece's entry says so.
+    #[test]
+    fn warp_card_fetch_stages_flagged_pieces_and_they_come_down_the_same() {
+        use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT, INFLIGHT_STEPS};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
+        let fetch = compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        // The copy starts 40 bytes into its piece 0: piece 0 is short, the
+        // others straddle title pieces and start off a multiple of 16.
+        const SKEW: u32 = 40;
+        const PIECES: u32 = 4;
+        let size = 3 * PIECE;
+        // Four slots; the flight's region is slots 1 and 2.
+        const SLOTS: u32 = 4;
+        let (base, count) = (1u32, 2u32);
+        let entries = SLOTS * 4;
+        let slot = INFLIGHT_SLOT as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(u64::from(entries) + 64);
+        let staging = warp.default_uav(INFLIGHT_SLOT * u64::from(SLOTS));
+        let (down, down_ptr, _) = warp.shared_buffer(INFLIGHT_SLOT * u64::from(count));
+        let mut content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mappings hold what is written.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+            table_ptr.cast::<u32>().add(base as usize).write_volatile(0);
+        }
+        let compare_pass = |warp: &mut WarpHarness, mode: u32| {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(1, 1, 1);
+            }
+        };
+        compare_pass(&mut warp, 0);
+        warp.submit_and_wait();
+        // Pieces 0, 1 and 2 change; piece 3 does not.
+        for at in [5, PIECE + 7, 2 * PIECE + 100] {
+            content[at] ^= 0x40;
+            // SAFETY: inside the mapping of the copy.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+        }
+        compare_pass(&mut warp, 2);
+        // SAFETY: as above; the fetch's own root signature.
+        unsafe {
+            warp.list.ResourceBarrier(&[uav_barrier()]);
+            warp.list.SetComputeRootSignature(&fetch.root);
+            warp.list.SetPipelineState(&fetch.pso);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, table_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(4, staging.GetGPUVirtualAddress());
+            // Two rows of groups for four pieces: the loop over pieces.
+            let mut constants = [0u32, SKEW, size as u32, PIECES, 0, base, count, 0, entries, 2];
+            warp.list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
+            warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+            warp.list.ResourceBarrier(&[uav_barrier()]);
+            constants[7] = 1;
+            warp.list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
+            warp.list.Dispatch(INFLIGHT_STEPS, constants[9], 1);
+        }
+        warp.submit_and_wait();
+        // SAFETY: inside the mapping of the counters and entries.
+        let read = |i: usize| unsafe { table_ptr.cast::<u32>().add(i).read_volatile() };
+        assert_eq!(read(base as usize), 3, "three pieces flagged");
+        let tickets: Vec<u32> = (0..PIECES as usize).map(|i| read(entries as usize / 4 + i)).collect();
+        assert_eq!(tickets[3], INFLIGHT_NONE);
+        let mut drawn = tickets[..3].to_vec();
+        drawn.sort_unstable();
+        assert_eq!(drawn, [0, 1, 2]);
+        // The landing: the slots used (two of the three tickets) come down
+        // in one copy, in a submission of their own.
+        // SAFETY: our open list; live buffers.
+        unsafe {
+            warp.list.CopyBufferRegion(&down, 0, &staging, u64::from(base) * INFLIGHT_SLOT, u64::from(count) * INFLIGHT_SLOT);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mapping holds `count` slots, and the copy has run.
+        let came = unsafe { std::slice::from_raw_parts(down_ptr, slot * count as usize) };
+        for (i, &k) in tickets[..3].iter().enumerate() {
+            if k >= count {
+                continue;
+            }
+            let lo = (i * PIECE).saturating_sub(SKEW as usize);
+            let hi = ((i + 1) * PIECE - SKEW as usize).min(size);
+            let (lo, hi) = (lo & !15, (hi + 15) & !15);
+            assert!(hi - lo <= slot);
+            assert_eq!(&came[k as usize * slot..k as usize * slot + (hi - lo)], &content[lo..hi], "piece {i} in slot {k}");
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
