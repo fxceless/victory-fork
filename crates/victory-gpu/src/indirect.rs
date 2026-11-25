@@ -36,8 +36,10 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+pub(crate) mod batch;
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -48,6 +50,7 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    uint dst_offset;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -83,7 +86,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = dst_offset + id.x * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -343,7 +346,22 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, 0, budget, src, count, spec, false).then_some(dst)
+}
+
+/// [`bound`] into a non-overlapping slice of the list's scratch buffer
+/// ([`HostList::indirect_alloc`]), returning `(scratch, dst_offset)`.
+pub(crate) fn bound_at(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, (dst, dst_offset)) =
+        (clamp()?, list.budget()?, list.indirect_alloc(bytes)?);
+    clamp_into(list, c, &dst, dst_offset, budget, src, count, spec, false)
+        .then_some((dst, dst_offset))
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -356,6 +374,7 @@ pub(crate) fn bound(
 /// 4294967295", 43 to 153 such records a frame). Here a record that asks
 /// for more than can run is left empty and charges nothing; a record
 /// clamped alone is clamped and charged as before.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -363,17 +382,32 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, 0, budget, src, None, spec, true).then_some(dst)
 }
 
-/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
-/// the list left it in; afterwards the list knows it is readable as
-/// indirect arguments.
+/// [`bound_ahead`] into a non-overlapping slice of the list's scratch buffer
+/// ([`HostList::indirect_alloc`]), returning `(scratch, dst_offset)`.
+pub(crate) fn bound_ahead_at(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, (dst, dst_offset)) =
+        (clamp()?, list.budget()?, list.indirect_alloc(bytes)?);
+    clamp_into(list, c, &dst, dst_offset, budget, src, None, spec, true)
+        .then_some((dst, dst_offset))
+}
+
+/// [`record_clamp_into`] into `list`'s scratch buffer `dst` at `dst_offset`,
+/// from the state the list left it in; afterwards the list knows it is
+/// readable as indirect arguments.
 #[allow(clippy::too_many_arguments)]
 fn clamp_into(
     list: &HostList,
     c: &Clamp,
     dst: &ID3D12Resource,
+    dst_offset: u64,
     budget: u64,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -381,23 +415,48 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_into(
+        c,
+        &list.list,
+        (dst, dst_offset, before),
+        budget,
+        src,
+        count,
+        spec,
+        ahead,
+    );
     if recorded {
         list.indirect_readable(dst);
     }
     recorded
 }
 
-/// Records the clamp into `dst`, which is in state `before` (common, or
-/// indirect arguments after an earlier clamp into it), and leaves `dst` in
-/// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]). False, with nothing recorded, if the
-/// layout or the addresses do not fit the clamp.
+/// Records the clamp into `dst` at offset 0.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_into(c, l, (dst, 0, before), budget, src, count, spec, ahead)
+}
+
+/// Records the clamp into `dst` at `dst_offset`, which is in state `before`
+/// (common, or indirect arguments after an earlier clamp into it), and
+/// leaves `dst` in `INDIRECT_ARGUMENT`. `ahead`: the records are a window
+/// clamped ahead of their draws ([`bound_ahead`]). False, with nothing
+/// recorded, if the layout or the addresses do not fit the clamp.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_into(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, dst_offset, before): (&ID3D12Resource, u64, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -412,10 +471,26 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if !src_base.is_multiple_of(4)
+        || !dst_base.is_multiple_of(4)
+        || !dst_offset.is_multiple_of(4)
+        || !budget.is_multiple_of(4)
+    {
         return false;
     }
+    let (dst_gpu, dst_at) = match dst_offset
+        .checked_add(bytes)
+        .filter(|&end| end <= u64::from(u32::MAX))
+    {
+        Some(_) => (dst_base, dst_offset as u32),
+        None => {
+            let Some(rebased) = dst_base.checked_add(dst_offset) else {
+                return false;
+            };
+            (rebased, 0)
+        }
+    };
     let (src_gpu, args_offset) = match src_offset
         .checked_add(bytes)
         .filter(|&end| end <= u64::from(u32::MAX))
@@ -447,7 +522,15 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1),
+        count_offset,
+        dst_at,
+    ];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -481,7 +564,7 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
@@ -991,7 +1074,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1065,7 +1148,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1531,13 +1614,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1547,7 +1629,10 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Groups charge atomically, in either scheduling order; records
+        // within the winning group are charged in lane order.
+        assert!(kept == [1, 2] || kept == [64, 65], "the winning group's first two real draws fit: {kept:?}");
+        assert_eq!((kept.len(), zeroed), (2, (RECORDS as usize) - 2));
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
@@ -2046,6 +2131,198 @@ void main() {
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
     }
+
+    #[test]
+    fn warp_card_compare_detects_single_byte_flips_across_coalesced_stripes() {
+        use crate::host::CARD_COMPARE;
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const SKEW: u32 = 40;
+        const PIECES: u32 = 2;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 17 + 3) as u8).collect();
+        // SAFETY: mappings cover `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let piece_count = PIECES + 1;
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+            // SAFETY: open list with live buffers matching `CARD_COMPARE`.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, size as u32, piece_count, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(piece_count, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: mapped `differs` buffer holds at least 12 bytes.
+            [0, 1, 2].map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() })
+        };
+        run(&mut warp, 0);
+        // Flip bytes across different coalesced lanes (0, 1023, 1024, last byte).
+        let piece1_start = PIECE - SKEW as usize;
+        for &(offset, expected) in &[
+            (0usize, [1u32, 0, 0]),
+            (1023, [1, 0, 0]),
+            (piece1_start + 1024, [0, 1, 0]),
+            (size - 1, [0, 0, 1]),
+        ] {
+            // SAFETY: `offset < size`.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset] ^ 0x80) };
+            assert_eq!(run(&mut warp, 1), expected, "flip at offset {offset}");
+            // SAFETY: restore original byte.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset]) };
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+    }
+
+    /// Two equal sign-bit changes in the last load of lanes 0 and 32
+    /// used to cancel when those lanes met in the hash reduction. Exercise
+    /// both zero and seeded nonzero pages; single-byte flips miss this bug.
+    #[test]
+    fn warp_card_compare_detects_paired_sign_bit_flips() {
+        let mut warp = WarpHarness::new().expect("WARP is required for the hash regression");
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).unwrap();
+        const PIECE: usize = 64 << 10;
+        const PIECES: usize = 129;
+        let size = PIECE * PIECES;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer((PIECES * 16) as u64);
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer((PIECES * 4) as u64);
+        let mut content = vec![0u8; size];
+        for piece in 1..PIECES {
+            let mut seed = piece as u32;
+            for word in content[piece * PIECE..(piece + 1) * PIECE].chunks_exact_mut(4) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                word.copy_from_slice(&seed.to_le_bytes());
+            }
+        }
+        // SAFETY: the mapping covers the complete allocation.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
+            // SAFETY: an open list with the compare's root signature and
+            // live buffers; the result mapping has one dword per piece.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES as u32, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES as u32, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the GPU finished and the result mapping covers the pieces.
+            (0..PIECES).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+        };
+        run(&mut warp, 0);
+        assert_eq!(run(&mut warp, 1), vec![0; PIECES]);
+        for piece in 0..PIECES {
+            for offset in [64512usize + 3, 65024 + 3] {
+                let at = piece * PIECE + offset;
+                // SAFETY: the offsets are inside each mapped page.
+                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x80) };
+            }
+        }
+        let changed = run(&mut warp, 1);
+        assert_eq!(changed, vec![1; PIECES], "paired writes must flag every changed page");
+        assert_eq!(run(&mut warp, 2), vec![1; PIECES]);
+        assert_eq!(run(&mut warp, 2), vec![0; PIECES]);
+    }
+
+    #[test]
+    fn host_list_bound_ahead_at_keeps_multiple_windows_disjoint() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        const STEP_A: u32 = 16;
+        const STEP_B: u32 = 32;
+        let sig = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: STRIDE,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: valid single-argument command signature description.
+            unsafe {
+                host.device
+                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                    .unwrap();
+            }
+            sig.unwrap()
+        };
+        let groups_a = [2u32, 3, 5];
+        let groups_b = [7u32, 11];
+        let Some((src_a, ptr_a)) = host.shared_buffer((groups_a.len() * STEP_A as usize) as u64) else {
+            return;
+        };
+        let Some((src_b, ptr_b)) = host.shared_buffer((groups_b.len() * STEP_B as usize) as u64) else {
+            return;
+        };
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: mapped host buffers.
+        unsafe {
+            std::ptr::write_bytes(ptr_a, 0, groups_a.len() * STEP_A as usize);
+            std::ptr::write_bytes(ptr_b, 0, groups_b.len() * STEP_B as usize);
+            for (i, &g) in groups_a.iter().enumerate() {
+                std::ptr::copy_nonoverlapping([g, 1, 1].as_ptr().cast::<u8>(), ptr_a.add(i * STEP_A as usize), 12);
+            }
+            for (i, &g) in groups_b.iter().enumerate() {
+                std::ptr::copy_nonoverlapping([g, 1, 1].as_ptr().cast::<u8>(), ptr_b.add(i * STEP_B as usize), 12);
+            }
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        let (buf_a, off_a) = bound_ahead_at(&list, (&src_a, 0), (KIND_DISPATCH, STEP_A, groups_a.len() as u32)).unwrap();
+        let (buf_b, off_b) = bound_ahead_at(&list, (&src_b, 0), (KIND_DISPATCH, STEP_B, groups_b.len() as u32)).unwrap();
+        assert_eq!(buf_a.as_raw(), buf_b.as_raw());
+        assert!(off_b >= off_a + u64::from(STEP_A) * groups_a.len() as u64);
+        // SAFETY: a live buffer and open list.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: open list; worker shader writes `hits_gpu`; execute interleaved windows without re-clamping.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            list.list.ExecuteIndirect(&sig, 1, &buf_a, off_a, None, 0);
+            list.list.ExecuteIndirect(&sig, 1, &buf_b, off_b, None, 0);
+            list.list.ExecuteIndirect(&sig, 1, &buf_a, off_a + u64::from(STEP_A), None, 0);
+            list.list.ExecuteIndirect(&sig, 1, &buf_b, off_b + u64::from(STEP_B), None, 0);
+            list.list.ExecuteIndirect(&sig, 1, &buf_a, off_a + 2 * u64::from(STEP_A), None, 0);
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: list finished running.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 2 + 3 + 5 + 7 + 11);
+    }
 }
 
 /// The benchmark of the clamp and its barriers (ignored by default).
@@ -2156,7 +2433,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2464,7 +2740,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,

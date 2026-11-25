@@ -746,6 +746,9 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -787,6 +790,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
+        list.stop_indirect_batch();
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -853,6 +857,9 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -943,6 +950,9 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1186,6 +1196,9 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1262,6 +1275,9 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1311,6 +1327,9 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1388,7 +1407,13 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "system" fn query_mark(this: This, _heap: This, _kind: u32, _index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1991,6 +2016,9 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) { list.stop_indirect_batch(); }
+
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {

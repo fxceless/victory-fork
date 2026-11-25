@@ -235,6 +235,33 @@ What did it, on top of the list below:
   (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
   for lack of room; 44,613 textures let go and made again in 13 minutes).
   Cause of that removal not known either.
+- Requested-prefix clamping:
+
+  A separate experiment, `VICTORY_INDIRECT_BATCH=1` (off by default),
+  prepares an actual prefix of up to 256 single-record indirect draw calls
+  before their native list. Nonwriting draw/indexed/mesh programs join;
+  a copy, write, barrier, query, count buffer or other execution stops the
+  prefix. It never cuts a list or guesses future records. Independent
+  prepares have no barriers between them; one final group charges the
+  original list budget in call order. A prefix of one uses the ordinary
+  clamp. Scratch stays readable through the consumer list's close, and
+  the prelude runs again on every replay. In-place title arguments fall
+  back inline. Legacy ahead windows are disabled while this experiment
+  is enabled, so its fallback also uses actual records.
+
+  Synthetic WARP timestamp tests verify identical weighted work in both
+  paths; they are not game FPS measurements. To reproduce the measurement:
+
+  ```powershell
+  $env:VICTORY_D3D12_WARP='1'
+  $env:VICTORY_D3D12_DEBUG='0'
+  $env:VICTORY_D3D12_GBV='0'
+  $env:VICTORY_CARD_METER='0'
+  $env:VICTORY_GPU_TIMING='0'
+  $env:VICTORY_INDIRECT_BATCH='1'
+  cargo test -p victory-gpu --features diagnostics measure_indirect_prefix_against_inline_with_equal_work -- --ignored --nocapture --test-threads=1
+  ```
+
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
@@ -305,6 +332,10 @@ Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
+
+`VICTORY_FAST_COPY=1` opts into fault-guarded in-process reads on x64.
+Unreadable memory, guard-page faults and in-page errors return failure;
+forward-overlapping ranges use the kernel copy. It is off by default.
 
 ### Known problems
 
