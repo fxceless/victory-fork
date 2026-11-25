@@ -181,16 +181,80 @@ fn mirror(handle: u64) {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    sync_heaps_avoiding(None, true);
+}
+
+/// [`sync_heaps`] before a title-read wait (`crate::host`'s
+/// `VICTORY_SYNC_IN_WAIT`): pages of the heaps that touch `avoid` (title
+/// memory flights in the air may write, in order, joined) are not looked
+/// at now but kept in [`DEFERRED`] for the next sync (the one after the
+/// wait), which looks at them first. Every other page is synced now.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_early(avoid: &[(usize, usize)]) {
+    sync_heaps_avoiding(Some(avoid), false);
+}
+
+/// [`sync_heaps_early`] for the sync that runs all along beside the
+/// submissions (`crate::host`'s `VICTORY_SYNC_OVERLAP=2`): the pages under
+/// flights' writes are left for the next sync as there; the records left
+/// to tables' draws that are due are mirrored too, in the heaps no flight's
+/// declared writes touch (the sync before a submission mirrors them with
+/// flights in the air as well; those in other heaps wait for it).
+#[cfg(windows)]
+pub(crate) fn sync_heaps_beside(avoid: &[(usize, usize)]) {
+    sync_heaps_avoiding(Some(avoid), true);
+}
+
+/// Pages (heap, from, to) a sync left for the next one ([`sync_heaps_early`]).
+#[cfg(windows)]
+static DEFERRED: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Since the last frame line: pages synced by [`sync_heaps_early`], and
+/// pages it left for the sync after the wait.
+#[cfg(windows)]
+pub(crate) static EARLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+fn sync_heaps_avoiding(avoid: Option<&[(usize, usize)]>, due_left: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    // Whether `from..to` lies under flights' writes (`avoid`).
+    let under = |from: usize, to: usize| {
+        avoid.is_some_and(|ranges| {
+            let i = ranges.partition_point(|r| r.1 <= from);
+            ranges.get(i).is_some_and(|r| r.0 < to)
+        })
+    };
+    let (mut early, mut deferred) = (0u64, 0u64);
     let started = std::time::Instant::now();
+    host::SYNC_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    // With `sync_wide`: the pages read, each looked at by one of several
+    // threads afterwards.
+    let wide = sync_wide() > 1;
+    let mut work: Vec<SyncPage> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // The pages an earlier sync left (those of heaps still registered).
+    let left: Vec<(usize, usize, usize)> = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut keep: Vec<(usize, usize, usize)> = Vec::new();
+    // The pre-read ([`sync_heaps_preread`], `VICTORY_SYNC_OVERLAP=3`): the
+    // bytes and prints of pages it read, by (heap, page). The sync takes
+    // and reads its pages as before; a page whose bytes are the ones the
+    // pre-read read takes its prints from there. Used ones are dropped.
+    let mut pre: std::collections::HashMap<(usize, usize), PreRead> = {
+        let mut stash = PREREAD.lock().unwrap_or_else(|e| e.into_inner());
+        if stash.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            std::mem::take(&mut *stash).into_iter().map(|r| ((r.at, r.from / crate::watch::PAGE), r)).collect()
+        }
+    };
+    let (mut pre_used, mut pre_stale) = (0u64, 0u64);
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -203,55 +267,412 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // Pages left before first (each lies in one page), then the
+        // pages written since.
+        let mut pieces: Vec<(usize, usize)> = left.iter().filter(|l| l.0 == at).map(|l| (l.1, l.2)).collect();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                        0..0
-                    } else {
-                        slots
-                    };
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
-                }
+                pieces.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
                 page += crate::watch::PAGE;
             }
         }
+        for (from, to) in pieces {
+            {
+                if under(from, to) {
+                    keep.push((at, from, to));
+                    deferred += 1;
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, Relaxed) {
+                        tracing::info!(
+                            heap = format_args!("{start:#x}..{end:#x}"),
+                            page = format_args!("{from:#x}..{to:#x}"),
+                            "a page of a shader-visible heap lies under flights' declared shader writes: its sync waits for the \
+                             one after the title-read wait (VICTORY_SYNC_IN_WAIT=1; said once)"
+                        );
+                    }
+                    continue;
+                }
+                if avoid.is_some() {
+                    early += 1;
+                }
+                // The page's records are read through the kernel, into a
+                // copy: a page the title unmaps meanwhile fails the read
+                // where 2,048 reads in place would fault.
+                if wide {
+                    let mut bytes = vec![0u8; to - from];
+                    if crate::host::read_into(from as *const u8, &mut bytes) {
+                        pages += 1;
+                        work.push(SyncPage {
+                            host: std::ptr::from_ref(host) as usize,
+                            start,
+                            step,
+                            mirrored_count,
+                            from,
+                            to,
+                            bytes,
+                        });
+                    }
+                    continue;
+                }
+                page_bytes.resize(to - from, 0);
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                host::SYNC_STATS[host::S_READ_US].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                host::SYNC_STATS[host::S_READ_BYTES].fetch_add((to - from) as u64, Relaxed);
+                if read {
+                    pages += 1;
+                    // The pre-read's prints, if it read these very bytes.
+                    let prints = pre.remove(&(at, from / crate::watch::PAGE)).and_then(|r| {
+                        let same = r.from == from && r.to == to && r.bytes == page_bytes;
+                        if same {
+                            pre_used += 1;
+                        } else {
+                            pre_stale += 1;
+                        }
+                        same.then_some(r.prints)
+                    });
+                    let (l, m) = sync_page(host, start, step, mirrored_count, from, to, &page_bytes, prints.as_deref());
+                    looked += l;
+                    mirrored += m;
+                }
+            }
+        }
+        // Records left to tables' draws that none made (not before a
+        // title-read wait: flights in the air may write the heap).
+        if avoid.is_none() || (due_left && !under(start as usize, end as usize)) {
+            mirror_left(host, start, step);
+        }
+    }
+    // What was left and is still under flights' writes waits for the next
+    // sync; a page of a heap that went is dropped with it.
+    if !keep.is_empty() {
+        DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).extend(keep);
+    }
+    // Pre-read pages this sync did not take: after a sync before a title-
+    // read wait (which leaves pages under flights' writes) they wait for
+    // the next; after the one before a submission they are dropped (a page
+    // still open is read again by the next pass), so none waits for ever.
+    // Those of heaps that went are dropped. A newer read by a pass stands.
+    if avoid.is_some() && !pre.is_empty() {
+        let mut stash = PREREAD.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, read) in pre {
+            if heaps.iter().any(|h| h.2 == read.at) && !stash.iter().any(|r| (r.at, r.from / crate::watch::PAGE) == key) {
+                stash.push(read);
+            }
+        }
+    }
+    let s = &host::SYNC_STATS;
+    s[host::S_PRE_USED].fetch_add(pre_used, Relaxed);
+    s[host::S_PRE_STALE].fetch_add(pre_stale, Relaxed);
+    EARLY[0].fetch_add(early, Relaxed);
+    EARLY[1].fetch_add(deferred, Relaxed);
+    if !work.is_empty() {
+        let (l, m) = mirror_wide(work);
+        looked += l;
+        mirrored += m;
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+/// The records of `host`'s heap (first handle `start`, `step` bytes a
+/// record) that [`sync_heaps`] left to tables' draws and are due, that no
+/// draw made meanwhile (`HostHeap::take_left`): each read again, through
+/// the kernel, and mirrored if its slot still holds that record (one that
+/// changed since is on a written page again, for the next sync).
+#[cfg(windows)]
+fn mirror_left(host: &host::HostHeap, start: u64, step: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let due = host.take_left(crate::frame::current());
+    if due.is_empty() {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let (mut mirrored, mut gone) = (0u64, 0u64);
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut n = 0;
+    while n < due.len() {
+        // A run of records within 4 KiB of the first, read at once.
+        let first = start + u64::from(due[n].0) * step;
+        let mut end = n + 1;
+        while end < due.len() && start + u64::from(due[end].0) * step + step - first <= 4096 {
+            end += 1;
+        }
+        let last = start + u64::from(due[end - 1].0) * step + step;
+        bytes.resize((last - first) as usize, 0);
+        let read = crate::host::read_into(first as *const u8, &mut bytes);
+        for &(index, key) in &due[n..end] {
+            let handle = start + u64::from(index) * step;
+            let at = (handle - first) as usize;
+            if read && host::HostHeap::record_key(&bytes[at..at + step as usize]) == key {
+                host.mirror_left(index, handle);
+                mirrored += 1;
+            } else {
+                gone += 1;
+            }
+        }
+        n = end;
+    }
+    let s = &host::SYNC_STATS;
+    s[host::S_LEFT_MIRRORED].fetch_add(mirrored, Relaxed);
+    s[host::S_LEFT_GONE].fetch_add(gone, Relaxed);
+    s[host::S_LEFT_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// How many jobs [`sync_heaps`] splits the records it looks at into, run on
+/// the host's kept threads (`crate::shadow::wide_run`) and the calling one
+/// (`VICTORY_SYNC_WIDE=N`, N of 2 to 16; `1` is 8; off by default: 0).
+///
+/// The sync runs before every submission on the thread that submits, and
+/// with the title's heaps at 250,000-280,000 records looked at and 37,000-
+/// 42,000 mirrored a frame it was 29 ms a frame there (run n15), with the
+/// card standing idle behind it after a title-read wait. The records are
+/// gathered under the heaps' lock as before; each job mirrors a run of
+/// them (`HostHeap::mirror_copied_many`; its `HostHeap::mirror` title
+/// threads already call beside the sync: host slots are written
+/// free-threaded, each slot by one job here); the lock is held until every job is done, so no heap goes
+/// meanwhile. What a slot ends up with is what the sync gave it before:
+/// each slot is looked at once per sync, in whichever order.
+#[cfg(windows)]
+pub(crate) fn sync_wide() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("VICTORY_SYNC_WIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(1) => 8,
+        Some(n) => n.min(16),
+        None => 0,
+    })
+}
+
+/// A page of a shader-visible heap read for [`sync_heaps`] with
+/// [`sync_wide`]: the host heap (a pointer: the caller holds
+/// [`SHADER_HEAPS`] until the pages are done), the heap's first handle,
+/// its record size and the slots it mirrors, the page's part of a written
+/// range, and its bytes.
+#[cfg(windows)]
+struct SyncPage {
+    host: usize,
+    start: u64,
+    step: u64,
+    mirrored_count: u32,
+    from: usize,
+    to: usize,
+    bytes: Vec<u8>,
+}
+
+/// The records of one page of a shader-visible heap, `bytes` being title
+/// memory `from..to` read: each slot whose record starts there is mirrored
+/// if it is not the one last seen there (`HostHeap::mirror_copied_many`).
+/// Records looked at and mirrored.
+/// `prints`: the records' fingerprints taken by the pre-read from these
+/// same bytes ([`sync_heaps_preread`]), one per record in order.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn sync_page(
+    host: &host::HostHeap,
+    start: u64,
+    step: u64,
+    mirrored_count: u32,
+    from: usize,
+    to: usize,
+    bytes: &[u8],
+    prints: Option<&[u64]>,
+) -> (u64, u64) {
+    let records = page_records(start, step, mirrored_count, from, to, bytes);
+    // Under one take of the heap's lock of last-seen records, not one per
+    // record (with `sync_wide` the jobs met there).
+    // Upstream's `VICTORY_HEAP_SYNC_PAGE=0`: one record at a time.
+    if !page_at_once() {
+        let made = records
+            .iter()
+            .enumerate()
+            .map(|(n, r)| host.mirror_copied_many(std::slice::from_ref(r), prints.and_then(|p| p.get(n..n + 1))))
+            .sum();
+        return (records.len() as u64, made);
+    }
+    (records.len() as u64, host.mirror_copied_many(&records, prints))
+}
+
+/// The records (title slot, handle, bytes) of the slots whose record starts
+/// in `from..to` of a heap (first handle `start`, `step` bytes a record,
+/// `mirrored_count` slots mirrored), `bytes` being that range as read.
+#[cfg(windows)]
+fn page_records(start: u64, step: u64, mirrored_count: u32, from: usize, to: usize, bytes: &[u8]) -> Vec<(u32, u64, &[u8])> {
+    let mut records: Vec<(u32, u64, &[u8])> = Vec::new();
+    for index in changed_slots(from, to, start as usize, step, mirrored_count) {
+        let handle = start + index * step;
+        // A record that straddles the range's ends is left to the range
+        // that holds its first byte.
+        let Some(at) = (handle as usize).checked_sub(from) else {
+            continue;
+        };
+        let Some(record) = bytes.get(at..at + step as usize) else {
+            continue;
+        };
+        records.push((index as u32, handle, record));
+    }
+    records
+}
+
+/// A page of a shader-visible heap read by the pre-read
+/// ([`sync_heaps_preread`]) for the sync that takes it next: the heap (its
+/// [`Heap`]'s address), the page's part of the heap, its bytes, and the
+/// fingerprints of the records starting there, in order ([`page_records`]).
+#[cfg(windows)]
+struct PreRead {
+    at: usize,
+    from: usize,
+    to: usize,
+    bytes: Vec<u8>,
+    prints: Vec<u64>,
+}
+
+/// The pages the pre-read read that no sync took since (one entry per
+/// page).
+#[cfg(windows)]
+static PREREAD: std::sync::Mutex<Vec<PreRead>> = std::sync::Mutex::new(Vec::new());
+
+/// The heap sync's reading on a thread of its own (`crate::host`'s
+/// `VICTORY_SYNC_OVERLAP=3`; [`sync_heaps`] is otherwise unchanged): reads
+/// the heap pages written since they were last taken, as far as that can
+/// be told without taking them (`crate::watch::peek_written`), and
+/// fingerprints their records, once per page until a sync takes it
+/// ([`PREREAD`]). The sync before a submission takes and reads its pages
+/// as ever; where a page's bytes are the ones read here it takes the
+/// prints from here instead of fingerprinting its records again. True if
+/// it read pages.
+///
+/// It takes no page: run n52 took them here every 2 ms, and a take guards
+/// the heap's written blocks again (the title's heap is view memory the
+/// guards hold), so the title's next write to each faulted again, its
+/// handler waiting on the guards' lock the take held: the title's own
+/// time went from 20-24 to 104 ms a frame, and the passes took 246 pages
+/// a frame in 37.6 ms where the sync alone reads 130-160 in about 1.
+/// It makes no host slot either and takes none of the locks title threads
+/// take for views, nor the one-sync lock: what it leaves is checked
+/// byte for byte by the sync.
+///
+/// Why it only reads: `VICTORY_SYNC_OVERLAP=2` mirrored on its own thread
+/// whenever it ran, and the picture garbled (run n45, a band across the
+/// bottom of the picture over two minutes); `=1`, which runs the very
+/// sync of a submission beside its preparing, garbled too (run n42,
+/// blocks at the foot of the window), where the sync before the preparing
+/// never did. Making host slots and the sets beside them (texture queue,
+/// placed spans that cut textures' own bytes, buffer slots, strides,
+/// waiting slots) while a submission's steps run, between one step and the
+/// next, is what both did and the sync before the preparing never does.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_preread() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    // At most this many pages wait for a sync (some 80 KiB each with their
+    // prints; a frame of the world writes 130-280).
+    const MOST: usize = 512;
+    let began = std::time::Instant::now();
+    // The pages read already (each once until a sync takes it).
+    let known: std::collections::HashSet<(usize, usize)> = {
+        let stash = PREREAD.lock().unwrap_or_else(|e| e.into_inner());
+        if stash.len() >= MOST {
+            return false;
+        }
+        stash.iter().map(|r| (r.at, r.from / crate::watch::PAGE)).collect()
+    };
+    let mut found: Vec<PreRead> = Vec::new();
+    let mut n = 0u64;
+    {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        for &(start, end, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(_), Some(step)) = (heap.host.get(), &heap.written, increment(heap.desc.kind))
+            else {
+                continue;
+            };
+            let step = u64::from(step);
+            let mirrored_count = heap.desc.count.min(host.count());
+            for page in crate::watch::peek_written(start as usize, end as usize) {
+                if known.len() + found.len() >= MOST {
+                    break;
+                }
+                if known.contains(&(at, page)) {
+                    continue;
+                }
+                let from = (page * crate::watch::PAGE).max(start as usize);
+                let to = ((page + 1) * crate::watch::PAGE).min(end as usize);
+                if from >= to {
+                    continue;
+                }
+                let mut bytes = vec![0u8; to - from];
+                if !crate::host::read_into(from as *const u8, &mut bytes) {
+                    continue;
+                }
+                let prints = host::record_prints(&page_records(start, step, mirrored_count, from, to, &bytes));
+                found.push(PreRead { at, from, to, bytes, prints });
+            }
+        }
+        // Under the heaps' list still: a heap that goes takes its pages
+        // with it ([`Heap`]'s drop), after these are in.
+        if !found.is_empty() {
+            let mut stash = PREREAD.lock().unwrap_or_else(|e| e.into_inner());
+            for read in found.drain(..) {
+                let key = (read.at, read.from / crate::watch::PAGE);
+                if !stash.iter().any(|r| (r.at, r.from / crate::watch::PAGE) == key) {
+                    stash.push(read);
+                    n += 1;
+                }
+            }
+        }
+    }
+    let s = &host::SYNC_STATS;
+    s[host::S_PRE_PAGES].fetch_add(n, Relaxed);
+    s[host::S_PRE_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    n > 0
+}
+
+/// [`sync_wide`]: the pages read, looked at in [`sync_wide`] jobs (each a
+/// run of pages; a slot lies in one page). Records looked at and
+/// mirrored. The caller holds [`SHADER_HEAPS`] until this returns.
+#[cfg(windows)]
+fn mirror_wide(work: Vec<SyncPage>) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Host heaps are used from several threads at once already (title
+    // threads mirror the views they make, draws the slots they read).
+    fn shared<T: Sync>() {}
+    shared::<host::HostHeap>();
+    let look = |page: &SyncPage| {
+        // SAFETY: a host heap of a registered (live) heap, under the
+        // heaps' lock the caller holds until every job is done.
+        let host = unsafe { &*(page.host as *const host::HostHeap) };
+        sync_page(host, page.start, page.step, page.mirrored_count, page.from, page.to, &page.bytes, None)
+    };
+    let jobs_n = sync_wide().max(1);
+    // A few pages are not worth the threads.
+    if work.len() < 4 || jobs_n < 2 {
+        return work.iter().map(look).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    }
+    let counts = std::sync::Arc::new([std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]);
+    let each = work.len().div_ceil(jobs_n);
+    let mut pages = work.into_iter();
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(jobs_n);
+    loop {
+        let chunk: Vec<SyncPage> = pages.by_ref().take(each).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let counts = counts.clone();
+        jobs.push(Box::new(move || {
+            let (looked, mirrored) = chunk.iter().map(look).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            counts[0].fetch_add(looked, Relaxed);
+            counts[1].fetch_add(mirrored, Relaxed);
+        }));
+    }
+    crate::shadow::wide_run(jobs);
+    (counts[0].load(Relaxed), counts[1].load(Relaxed))
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
@@ -277,10 +698,64 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let s: Vec<f64> = host::SYNC_STATS
+        .iter()
+        .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames)
+        .collect();
+    let ms = |i: usize| s[i] / 1000.0;
+    let (c, o) = (host::S_CLASS_N, host::S_OUTCOME);
+    let u = host::S_CLASS_US;
+    tracing::info!(
+        "the heap sync's parts per frame: reading {:.1} pages' bytes ({:.2} MB) {:.2} ms; fingerprinting and sorting {:.2} ms: {:.0} records unchanged, {:.0} changed but their slot made from them already (passed over: VICTORY_SYNC_MADE_SKIP {}), {:.0} not ours in a slot made from none (passed over: VICTORY_SYNC_NONE_SKIP {}), {:.0} left to tables' draws (VICTORY_HEAP_SYNC_TABLES={}); of the records it would leave, {:.0} a draw read through a fresh table since the sync before (VICTORY_SYNC_DRAWN_BEFORE={}: 0 leaves them, 1 mirrors them now, 2 passes over the constant buffer views of slots made from nothing, 3 placed views too: {:.0} passed over); mirrored: {:.0} table entries {:.2} ms, {:.0} constant buffer views {:.2} ms, {:.0} placed views {:.2} ms, {:.0} not ours {:.2} ms; the mirror found {:.0} the same, made {:.0}, made {:.0} null for a draw or a pass, kept {:.0} older views, {:.0} no view; of those left to draws and due, {:.0} made by a draw, {:.0} mirrored after all, {:.0} changed again, {:.2} ms; root-indexed table entries outside fresh tables {:.0} (VICTORY_TABLE_INDEXED=1 makes them at their draw: {})",
+        s[host::S_READ_BYTES] / crate::watch::PAGE as f64,
+        s[host::S_READ_BYTES] / 1e6,
+        ms(host::S_READ_US),
+        ms(host::S_PRINT_US),
+        s[host::S_UNCHANGED],
+        s[host::S_SAME_MADE],
+        if host::made_skip_on() { "on" } else { "off" },
+        s[host::S_NONE_SKIPPED],
+        if host::none_skip() { "on" } else { "off" },
+        s[host::S_DEFERRED],
+        host::sync_tables(),
+        s[host::S_DRAWN_BEFORE],
+        host::drawn_before(),
+        s[host::S_DRAWN_PASSED],
+        s[c],
+        ms(u),
+        s[c + 1],
+        ms(u + 1),
+        s[c + 2],
+        ms(u + 2),
+        s[c + 3],
+        ms(u + 3),
+        s[o],
+        s[o + 1],
+        s[o + 2],
+        s[o + 3],
+        s[o + 4],
+        s[host::S_LEFT_DRAWN],
+        s[host::S_LEFT_MIRRORED],
+        s[host::S_LEFT_GONE],
+        ms(host::S_LEFT_US),
+        crate::draw::TABLE_INDEXED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+        if crate::draw::table_indexed() { "on" } else { "off" },
+    );
+    tracing::info!(
+        "the heap sync's null and pre-read parts per frame: constant buffer views whose mirror would only write the null their host slot holds, passed over (VICTORY_SYNC_NULL_SKIP {}): {:.0} changed, {:.0} left to draws and due; pre-read (VICTORY_SYNC_OVERLAP=3, takes nothing) {:.1} pages read beside in {:.2} ms; the sync took the prints of {:.1} pages from it (bytes the same), {:.1} pre-read pages had changed",
+        if host::null_skip() { "on" } else { "off" },
+        s[host::S_NULL_SKIPPED],
+        s[host::S_LEFT_NULL_SKIPPED],
+        s[host::S_PRE_PAGES],
+        ms(host::S_PRE_US),
+        s[host::S_PRE_USED],
+        s[host::S_PRE_STALE],
+    );
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
-/// in one go (`host::HostHeap::mirror_copied_page`). On by default: the
+/// in one go (`host::HostHeap::mirror_copied_many`, this fork's form of
+/// upstream's `mirror_copied_page`). On by default: the
 /// same records are mirrored either way. `VICTORY_HEAP_SYNC_PAGE=0`: one
 /// by one, as before.
 #[cfg(windows)]
@@ -325,6 +800,9 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // Its pre-read pages go with it (a heap made later at the same
+        // address must not take them).
+        PREREAD.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.at != at);
     }
 }
 
@@ -907,6 +1385,33 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// The record words (`i`, `generation`) at `handle`, if it holds a record
+/// of ours; whether they still name a view is [`records_live`]'s.
+pub(crate) fn record_words(handle: u64) -> Option<[u32; 2]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (tag == VIEW_TAG).then_some([i, generation])
+}
+
+/// For each of `records` (record words), whether [`view_at`] would find a
+/// view for it, under one lock: records that name a view whole always do,
+/// a table entry's only while it has that generation (its resources were
+/// not released since).
+pub(crate) fn records_live(records: impl Iterator<Item = [u32; 2]>) -> Vec<bool> {
+    let views = views_read();
+    records
+        .map(|[i, generation]| match generation >> KIND_SHIFT {
+            0 => views.list.get(i as usize).is_some_and(|(_, current)| *current == generation),
+            CONSTANT => true,
+            PLACED => views.shapes.get((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize).is_some(),
+            _ => false,
+        })
+        .collect()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
@@ -1282,6 +1787,59 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+            // `VICTORY_SYNC_OVERLAP`: the sync on its own thread makes the
+            // same slots, and they are made once it is joined.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source as *const u8,
+                    memory.cast::<u8>().add(9 * 16),
+                    16,
+                )
+            };
+            assert!(!host.made(9));
+            let mut on = crate::host::sync_beside_start();
+            assert!(on);
+            crate::host::sync_beside_join(&mut on);
+            assert!(!on);
+            assert!(host.made(9));
+            // `VICTORY_SYNC_OVERLAP=2`: a pass leaves a page under flights'
+            // writes to the sync before the submission, and makes the rest.
+            let page = memory as usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(12 * 16), 16);
+            }
+            sync_heaps_beside(&[(page, page + 64 * 16)]);
+            assert!(!host.made(12));
+            sync_heaps();
+            assert!(host.made(12));
+            unsafe {
+                std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(13 * 16), 16);
+            }
+            sync_heaps_beside(&[]);
+            assert!(host.made(13));
+            // `VICTORY_SYNC_OVERLAP=3`: the pre-read makes nothing; the
+            // sync takes the page and makes the record...
+            let write = |slot: usize| unsafe {
+                std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(slot * 16), 16);
+            };
+            write(20);
+            assert!(sync_heaps_preread());
+            assert!(!host.made(20));
+            sync_heaps();
+            assert!(host.made(20));
+            // ...and where the page changed after the pre-read, the record
+            // written since is made too.
+            write(21);
+            assert!(sync_heaps_preread());
+            write(22);
+            sync_heaps();
+            assert!(host.made(21) && host.made(22));
+            // It takes nothing: a sync before a title-read wait takes the
+            // page as ever, and makes the record.
+            write(23);
+            assert!(sync_heaps_preread());
+            sync_heaps_early(&[]);
+            assert!(host.made(23));
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
@@ -1407,8 +1965,12 @@ mod tests {
         let resource = 0x7777_0000usize as This;
         create_srv(null, resource, std::ptr::null(), a);
         assert_eq!(view(a), Some(View::Shader(0x7777_0000, None)));
+        let words = record_words(a).expect("a record of ours");
+        assert_eq!(records_live([words].into_iter()), [true]);
         forget(0x7777_0000);
         assert_eq!(view(a), None, "stale after release");
+        assert_eq!(records_live([words].into_iter()), [false], "no longer live after release");
+        assert_eq!(record_words(0), None);
         create_srv(null, resource, std::ptr::null(), b);
         assert_eq!(view(b), Some(View::Shader(0x7777_0000, None)));
         // SAFETY: both slots are in `slots`.

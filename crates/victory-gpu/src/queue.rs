@@ -49,8 +49,9 @@ enum Held {
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
-    /// (which it may reset meanwhile), and the order they run in.
-    Run(Vec<crate::list::Detached>, Vec<usize>),
+    /// (which it may reset meanwhile), the order they run in, and when it
+    /// was put in the line (for [`async_line`]).
+    Run(Vec<crate::list::Detached>, Vec<usize>, std::time::Instant),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
     /// With [`behind`]: the submission at the head of the line is being
@@ -136,7 +137,10 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes == 0 || (PRESENTS_HELD.load(Ordering::Acquire) != 0 && !present_wait()) {
+        if !this.is_null() && planes != 0 {
+            stat(a::PRESENT_OLD_HELD, 1);
+        }
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -157,6 +161,25 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
+    // The present before is still in a line ([`present_wait`]): until our
+    // thread has shown it.
+    if PRESENTS_HELD.load(Ordering::Acquire) != 0 {
+        let event = thread_event();
+        lock(&PRESENT_WAITERS).push(event);
+        let shown = wait_on_line(a::PRESENT_US, event, &|| PRESENTS_HELD.load(Ordering::Acquire) == 0);
+        lock(&PRESENT_WAITERS).retain(|&e| e != event);
+        if !shown {
+            stat(a::PRESENT_OLD_HELD, 1);
+            return false;
+        }
+        stat(a::PRESENT_WAITED, 1);
+    }
+    // A wait is not kept across frames: the old way forces it.
+    let before = lock(&LAST_PRESENT).replace(std::time::Instant::now());
+    if present_wait() && before.is_some_and(stands_across_frames) {
+        stat(a::PRESENT_OLD_STANDS, 1);
+        return false;
+    }
     // The state the lists recorded so far leave the texture in: what our
     // copy finds it in when it runs behind them (looked at, not changed).
     const COPY_SOURCE: u32 = 0x800;
@@ -170,6 +193,8 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
         wake();
+    } else {
+        stat(a::PRESENT_OLD_EMPTY, 1);
     }
     sent
 }
@@ -313,8 +338,12 @@ fn submit_cut(this: This, lists: &[This]) {
         {
             let mut held = lock(&queue(this).held);
             for (waits, taken, order) in parts {
+                if crate::host::async_race() {
+                    crate::host::race_note(&taken);
+                }
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push(Held::Run(taken, order, std::time::Instant::now()));
+                lined(1);
             }
         }
         let mut waiting = lock(&WAITING);
@@ -395,7 +424,8 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
-            pieces.push(Held::Run(taken, order));
+            pieces.push(Held::Run(taken, order, std::time::Instant::now()));
+            lined(1);
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
@@ -493,13 +523,17 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    WORKER_HERE.set(true);
     loop {
         {
+            let idle = std::time::Instant::now();
             let mut work = lock(&WORK.0);
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
             *work = false;
+            drop(work);
+            stat(a::IDLE_US, idle.elapsed().as_micros() as u64);
         }
         let started = std::time::Instant::now();
         let (user, kernel) = crate::framelog::thread_times();
@@ -510,8 +544,10 @@ fn worker() {
             }
         }
         release_held_now(false);
+        let us = started.elapsed().as_micros() as u64;
+        stat(a::PASS_US, us);
         let (user_now, kernel_now) = crate::framelog::thread_times();
-        crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WorkerUs, us);
         crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
         crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
     }
@@ -521,7 +557,98 @@ fn worker() {
 thread_local! {
     /// This thread is inside [`release_held_now`].
     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread is [`worker`].
+    static WORKER_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// An event of this thread's for [`wait_on_line`] (0: not made yet).
+    static EVENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// With [`behind`], since the last frame-rate line ([`async_line`]):
+/// microseconds or counts, [`a`] names them.
+#[cfg(windows)]
+static ASYNC: [AtomicU64; a::ALL] = [const { AtomicU64::new(0) }; a::ALL];
+
+/// The parts of [`ASYNC`].
+#[cfg(windows)]
+mod a {
+    /// Parts of submissions put in a queue's line, the parts in the lines
+    /// then (summed over the puts, for the mean depth), and the most.
+    pub const LINED: usize = 0;
+    pub const DEPTH_SUM: usize = 1;
+    pub const DEPTH_MOST: usize = 2;
+    /// From a part's put in the line to its preparing (summed; the most).
+    pub const AGE_US: usize = 3;
+    pub const AGE_MOST: usize = 4;
+    /// Our thread: its passes over the lines, its preparing and sending
+    /// in them (how many parts), and of that the time no title thread
+    /// waited on the lines (the preparing done beside the title's own
+    /// work); waiting for work.
+    pub const PASS_US: usize = 5;
+    pub const PREP_US: usize = 6;
+    pub const PREP_N: usize = 7;
+    pub const PREP_ALONE_US: usize = 8;
+    pub const IDLE_US: usize = 9;
+    /// A title thread waiting on the lines, by cause (time, calls): its
+    /// present (the old way, or waiting for the present before,
+    /// [`super::present_wait`]), a fence it blocks on, a waited-for
+    /// submission of ours, a page mapping ([`super::maps_drain`]).
+    pub const PRESENT_US: usize = 10;
+    pub const PRESENT_N: usize = 11;
+    pub const FENCE_US: usize = 12;
+    pub const FENCE_N: usize = 13;
+    pub const OURS_US: usize = 14;
+    pub const OURS_N: usize = 15;
+    pub const MAPS_US: usize = 16;
+    pub const MAPS_N: usize = 17;
+    /// Of those waits: standing for the lines' lock (our thread's pass);
+    /// parts a title thread prepared itself.
+    pub const LOCK_US: usize = 18;
+    pub const RAN_BY_TITLE: usize = 19;
+    /// Presents: put behind the line after waiting for the one before
+    /// ([`super::present_wait`]), the old way with the one before still
+    /// in a line, the old way with the line empty.
+    pub const PRESENT_WAITED: usize = 20;
+    pub const PRESENT_OLD_HELD: usize = 21;
+    pub const PRESENT_OLD_EMPTY: usize = 22;
+    /// Blocking fence waits met by waiting for the fence
+    /// ([`super::fence_wait`]), and those that ran the lines and settled
+    /// as before.
+    pub const FENCE_MET: usize = 23;
+    pub const FENCE_DRAINED: usize = 24;
+    /// The title's submit calls: time.
+    pub const SUBMIT_US: usize = 25;
+    /// Presents the old way (which forces what the lines hold) because a
+    /// line stood at a wait not met with a part put in before the present
+    /// before ([`super::stands_across_frames`]).
+    pub const PRESENT_OLD_STANDS: usize = 26;
+    pub const ALL: usize = 27;
+}
+
+#[cfg(windows)]
+fn stat(i: usize, n: u64) {
+    ASYNC[i].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Parts of submissions in the queues' lines now (put in, not taken yet).
+#[cfg(windows)]
+static LINED_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// `n` parts were put in a line.
+#[cfg(windows)]
+fn lined(n: u64) {
+    let now = LINED_NOW.fetch_add(n, Ordering::Relaxed) + n;
+    stat(a::LINED, n);
+    stat(a::DEPTH_SUM, n * now);
+    ASYNC[a::DEPTH_MOST].fetch_max(now, Ordering::Relaxed);
+}
+
+/// Title threads waiting on the lines now ([`drain`], [`wait_on_line`]).
+#[cfg(windows)]
+static TITLE_WAITING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Threads running the lines now (inside [`release_held_now`]'s lock).
+#[cfg(windows)]
+static RUNNING_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Whether parts that follow one another in the queues' lines go to the
 /// host as one submission (`VICTORY_JOIN_PARTS=1`; `alt`: twenty seconds
@@ -713,8 +840,281 @@ fn send_joined(joined: &mut Joined) {
 #[cfg(windows)]
 pub(crate) fn before_sync() {
     if behind() && !RELEASING_HERE.get() {
-        release_held_now(false);
+        drain(a::OURS_US);
     }
+}
+
+/// When the title put in the part our thread is preparing now, with
+/// [`behind`] (it is out of its line meanwhile; one releaser at a time).
+#[cfg(windows)]
+static PREPARING_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Parts of submissions the title put in the queues' lines before `t` that
+/// have not been sent yet: still in a line, or being prepared
+/// (`crate::results`' flip wait).
+#[cfg(windows)]
+pub(crate) fn parts_put_before(t: std::time::Instant) -> usize {
+    let mut n = usize::from(lock(&PREPARING_AT).is_some_and(|at| at < t));
+    let queues = lock(&WAITING).clone();
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list.
+        let held = lock(unsafe { &(*(q as *const Queue)).held });
+        n += held.iter().filter(|h| matches!(h, Held::Run(_, _, at) if *at < t)).count();
+    }
+    n
+}
+
+/// Whether a thread runs the lines now or our thread has been asked to
+/// look at them (`crate::results`' flip wait: something still moves).
+#[cfg(windows)]
+pub(crate) fn lines_moving() -> bool {
+    RUNNING_LINES.load(Ordering::Acquire) > 0 || (behind() && *lock(&WORK.0))
+}
+
+/// With [`behind`]: our thread looks at the lines.
+#[cfg(windows)]
+pub(crate) fn nudge() {
+    if behind() {
+        wake();
+    }
+}
+
+/// [`release_held_now`] on a thread of the title's, which waits for it
+/// (counted under `cause`, a pair of [`a`]: time, then calls).
+#[cfg(windows)]
+fn drain(cause: usize) {
+    let started = std::time::Instant::now();
+    let here = !WORKER_HERE.get();
+    if here {
+        TITLE_WAITING.fetch_add(1, Ordering::Relaxed);
+    }
+    release_held_now(false);
+    if here {
+        TITLE_WAITING.fetch_sub(1, Ordering::Relaxed);
+        stat(cause, started.elapsed().as_micros() as u64);
+        stat(cause + 1, 1);
+    }
+}
+
+/// This thread's event for [`wait_on_line`] (made on first use; 0 if it
+/// could not be).
+#[cfg(windows)]
+pub(crate) fn thread_event() -> usize {
+    let made = EVENT.get();
+    if made != 0 {
+        return made;
+    }
+    // SAFETY: a plain auto-reset event, kept for the thread's life.
+    let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) } as usize;
+    EVENT.set(event);
+    event
+}
+
+/// Events of title threads waiting for a present of a line to be shown
+/// ([`present_wait`]).
+#[cfg(windows)]
+static PRESENT_WAITERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// With [`behind`], on a title thread: waits until `done` says so, our
+/// thread and the landing thread working meanwhile; `event` is set when
+/// something `done` looks at may have changed (it is also looked at every
+/// few milliseconds). False, with `done` not true, if nothing moves any
+/// more: no thread runs the lines, our thread has nothing to look at, and
+/// nothing is in the air or being landed (a line stands at a wait that
+/// nothing of ours meets); the caller then does what it did before.
+/// Counted under `cause` (a pair of [`a`]).
+#[cfg(windows)]
+fn wait_on_line(cause: usize, event: usize, done: &dyn Fn() -> bool) -> bool {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    if done() {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    TITLE_WAITING.fetch_add(1, Ordering::Relaxed);
+    wake();
+    let mut still = 0;
+    let met = loop {
+        if event != 0 {
+            // SAFETY: an event of this thread's.
+            unsafe { WaitForSingleObject(event as _, 4) };
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if done() {
+            break true;
+        }
+        let idle = RUNNING_LINES.load(Ordering::Acquire) == 0 && !*lock(&WORK.0) && !crate::host::line_moving();
+        still = if idle { still + 1 } else { 0 };
+        // Found so three times, some milliseconds apart.
+        if still >= 3 {
+            break done();
+        }
+    };
+    TITLE_WAITING.fetch_sub(1, Ordering::Relaxed);
+    stat(cause, started.elapsed().as_micros() as u64);
+    stat(cause + 1, 1);
+    met
+}
+
+/// Whether a fence the title blocks on (a wait without an event) is
+/// waited for until it is reached, with [`behind`]: our thread sends what
+/// the lines hold and the landing thread sets the fence behind it, and
+/// the call returns as soon as the fence gets there
+/// (`VICTORY_ASYNC_FENCE_WAIT=0`: the lines are run on the title's thread
+/// and everything in the air is settled, as before).
+///
+/// Why: before, the call ran every line as far as it was free on the
+/// title's thread (also what the title submitted after the signal it
+/// waits for), and then waited for every flight in the air to land
+/// (`crate::host::settle_for_fence`), not only those before the signal.
+/// What the title sees is the same: the fence is set where the flights
+/// before its signal have landed, which is what it waits for.
+#[cfg(windows)]
+pub(crate) fn fence_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    behind() && *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_FENCE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// [`fence_wait`]: waits until `reached` says the fence is there;
+/// `event` is set by the fence when it gets there. False if nothing
+/// moves any more ([`wait_on_line`]).
+#[cfg(windows)]
+pub(crate) fn wait_for_fence(event: usize, reached: &dyn Fn() -> bool) -> bool {
+    let met = wait_on_line(a::FENCE_US, event, reached);
+    stat(if met { a::FENCE_MET } else { a::FENCE_DRAINED }, 1);
+    met
+}
+
+/// A blocking fence wait that runs the lines first, as before
+/// ([`fence_wait`] off, or it found nothing moving).
+#[cfg(windows)]
+pub(crate) fn before_fence() {
+    if behind() && !RELEASING_HERE.get() {
+        drain(a::FENCE_US);
+    }
+}
+
+/// Whether a page mapping (`copy_page_mappings`) first runs what the
+/// lines hold and is free to run, with [`behind`]
+/// (`VICTORY_ASYNC_MAPS=0`: it does not).
+///
+/// Why: the mapping changes at once what title addresses show, and a
+/// submission still in a line reads title memory when our thread
+/// prepares it (a texture in the tiled heap). On the console the mapping
+/// is ordered behind the queue's earlier submissions; without
+/// [`behind`] every submission the title made before it had been
+/// prepared by then, so it read the pages as they were mapped when it
+/// was made. With [`behind`] and without this it could be prepared after
+/// the mapping and read the new pages (or none: zeros where a range was
+/// unmapped).
+#[cfg(windows)]
+fn maps_drain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    behind() && *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_MAPS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a present that finds the present before it still in a line
+/// waits until our thread has shown that one and then goes behind the
+/// line too, with [`present_behind`] (`VICTORY_ASYNC_PRESENT_WAIT=0`: it
+/// runs the old way, as before: the lines first, then itself).
+///
+/// Why: our thread prepares more slowly than the title records, so the
+/// title's present nearly always found the one before still in a line,
+/// and every other present ran the old way: the title's thread stood
+/// until every submission it had made was prepared, its own frame's
+/// last ones too, and our thread then had nothing to prepare until the
+/// title's next submissions came. With the switch it stands only until
+/// the frame before is shown, and its own frame's last submissions are
+/// prepared while it records the next one. The title is one frame ahead
+/// at most, as with every present that goes behind.
+#[cfg(windows)]
+fn present_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_PRESENT_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// When the title's last present that went through [`send_behind`] was
+/// called.
+#[cfg(windows)]
+static LAST_PRESENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// With [`present_wait`]: whether a queue's line stands at a wait that is
+/// not met (a fence, a memory value) and holds a part put in before
+/// `since` (the present before). Every other present ran the old way
+/// before the switch and forced such a wait; with it nearly every present
+/// goes behind the line, and a line that stands for good (a value the
+/// card never writes) would never run again.
+#[cfg(windows)]
+fn stands_across_frames(since: std::time::Instant) -> bool {
+    let queues = lock(&WAITING).clone();
+    queues.into_iter().any(|q| {
+        // SAFETY: a live queue: one released is taken off the list.
+        let held = lock(unsafe { &(*(q as *const Queue)).held });
+        let stands = match held.first() {
+            Some(&Held::Wait(fence, value)) => crate::fence::completed(fence as This) < value,
+            Some(Held::Value(wait)) => !wait.met(),
+            _ => false,
+        };
+        stands && held.iter().any(|h| matches!(h, Held::Run(_, _, at) if *at < since))
+    })
+}
+
+/// A present of a line was shown: title threads waiting for that
+/// ([`present_wait`]) look again.
+#[cfg(windows)]
+fn presents_moved() {
+    for &event in lock(&PRESENT_WAITERS).iter() {
+        // SAFETY: a waiting thread's event (kept for its life).
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+    }
+}
+
+/// With [`behind`], at the frame-rate line: what the queues' lines and
+/// our thread did per frame since the last one ([`ASYNC`]).
+#[cfg(windows)]
+pub(crate) fn async_line(frames: f64) {
+    if !behind() || frames <= 0.0 {
+        return;
+    }
+    let v: Vec<u64> = ASYNC.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+    let ms = |i: usize| v[i] as f64 / 1e3 / frames;
+    let n = |i: usize| v[i] as f64 / frames;
+    let per = |sum: usize, of: usize| if v[of] == 0 { 0.0 } else { v[sum] as f64 / v[of] as f64 };
+    let waited = ms(a::PRESENT_US) + ms(a::FENCE_US) + ms(a::OURS_US) + ms(a::MAPS_US);
+    tracing::info!(
+        "submissions prepared by our thread per frame (VICTORY_ASYNC_SUBMIT=1): {:.1} parts put in the lines, {:.1} in them          then on average (the most {}), taken {:.1} ms after (the most {:.1}); our thread: passes {:.1} ms, preparing and          sending {:.1} ms in {:.1} parts, {:.1} of it beside the title (no title thread waiting on the lines), waiting for          work {:.1}; the title: in its submit calls {:.1} ms, waiting on the lines {:.1} ms: in presents {:.1} in {:.2},          blocking fence waits {:.1} in {:.2} ({:.2} met as the fence got there, {:.2} ran the lines and settled,          VICTORY_ASYNC_FENCE_WAIT={}), our own waited submissions {:.1} in {:.2}, page mappings {:.1} in {:.2}          (VICTORY_ASYNC_MAPS={}); of it standing for our thread's pass {:.1}, {:.2} parts prepared on a title thread;          presents: {:.2} behind the line after the one before was shown (VICTORY_ASYNC_PRESENT_WAIT={}), {:.2} the old way          with the one before still in a line, {:.2} the old way with the line empty, {:.2} the old way to force a line          that stood at a wait since the present before",
+        n(a::LINED),
+        per(a::DEPTH_SUM, a::LINED),
+        v[a::DEPTH_MOST],
+        per(a::AGE_US, a::LINED) / 1e3,
+        v[a::AGE_MOST] as f64 / 1e3,
+        ms(a::PASS_US),
+        ms(a::PREP_US),
+        n(a::PREP_N),
+        ms(a::PREP_ALONE_US),
+        ms(a::IDLE_US),
+        ms(a::SUBMIT_US),
+        waited,
+        ms(a::PRESENT_US),
+        n(a::PRESENT_N),
+        ms(a::FENCE_US),
+        n(a::FENCE_N),
+        n(a::FENCE_MET),
+        n(a::FENCE_DRAINED),
+        u8::from(fence_wait()),
+        ms(a::OURS_US),
+        n(a::OURS_N),
+        ms(a::MAPS_US),
+        n(a::MAPS_N),
+        u8::from(maps_drain()),
+        ms(a::LOCK_US),
+        n(a::RAN_BY_TITLE),
+        n(a::PRESENT_WAITED),
+        u8::from(present_behind() && present_wait()),
+        n(a::PRESENT_OLD_HELD),
+        n(a::PRESENT_OLD_EMPTY),
+        n(a::PRESENT_OLD_STANDS),
+    );
 }
 
 #[cfg(windows)]
@@ -724,12 +1124,18 @@ fn release_held_now(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
+    let locking = std::time::Instant::now();
     let _one = lock(&RELEASING);
+    if behind() && !WORKER_HERE.get() {
+        stat(a::LOCK_US, locking.elapsed().as_micros() as u64);
+    }
+    RUNNING_LINES.fetch_add(1, Ordering::AcqRel);
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {
         fn drop(&mut self) {
             RELEASING_HERE.set(self.0);
+            RUNNING_LINES.fetch_sub(1, Ordering::AcqRel);
         }
     }
     let _leave = Leave(was_here);
@@ -788,7 +1194,14 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(lists, order, at) => {
+                        LINED_NOW.fetch_sub(1, Ordering::Relaxed);
+                        let age = at.elapsed().as_micros() as u64;
+                        stat(a::AGE_US, age);
+                        ASYNC[a::AGE_MOST].fetch_max(age, Ordering::Relaxed);
+                        if !WORKER_HERE.get() {
+                            stat(a::RAN_BY_TITLE, 1);
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -829,6 +1242,21 @@ fn release_held_now(all: bool) {
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
+                            // The parts right behind this one that can go
+                            // with it as one submission (`VICTORY_JOIN_PARTS`),
+                            // taken from the line now, with the signals
+                            // between them, to be set behind the joined flight.
+                            let (joined, signals): (Vec<(Vec<crate::list::Detached>, Vec<usize>)>, Vec<(usize, u64)>) = (Vec::new(), Vec::new());
+                            let send = |lists: Vec<crate::list::Detached>, order: Vec<usize>, joined: Vec<(Vec<crate::list::Detached>, Vec<usize>)>| {
+                                if joined.is_empty() {
+                                    host.execute_late(lists, order);
+                                } else {
+                                    let mut parts = Vec::with_capacity(joined.len() + 1);
+                                    parts.push((lists, order));
+                                    parts.extend(joined);
+                                    host.execute_late_joined(parts);
+                                }
+                            };
                             // Not waited for: the host keeps the lists
                             // until they are settled.
                             if behind() && !all {
@@ -837,13 +1265,49 @@ fn release_held_now(all: bool) {
                                 // from its head (one releaser at a time).
                                 held.insert(0, Held::Running);
                                 drop(held);
-                                host.execute_late(lists, order);
+                                let alone = TITLE_WAITING.load(Ordering::Relaxed) == 0;
+                                let preparing = std::time::Instant::now();
+                                *lock(&PREPARING_AT) = Some(at);
+                                if crate::host::async_race() {
+                                    crate::host::race_check(&lists, at);
+                                    for (part, _) in &joined {
+                                        crate::host::race_check(part, at);
+                                    }
+                                }
+                                send(lists, order, joined);
+                                *lock(&PREPARING_AT) = None;
+                                crate::results::sent(at);
+                                if WORKER_HERE.get() {
+                                    let us = preparing.elapsed().as_micros() as u64;
+                                    stat(a::PREP_US, us);
+                                    stat(a::PREP_N, 1);
+                                    // No title thread waited on the lines when
+                                    // it began or ended: done beside the title.
+                                    if alone && TITLE_WAITING.load(Ordering::Relaxed) == 0 {
+                                        stat(a::PREP_ALONE_US, us);
+                                    }
+                                }
                                 held = lock(line);
                                 if matches!(held.first(), Some(Held::Running)) {
                                     held.remove(0);
                                 }
                             } else {
-                                host.execute_late(lists, order);
+                                *lock(&PREPARING_AT) = Some(at);
+                                if crate::host::async_race() {
+                                    crate::host::race_check(&lists, at);
+                                    for (part, _) in &joined {
+                                        crate::host::race_check(part, at);
+                                    }
+                                }
+                                send(lists, order, joined);
+                                *lock(&PREPARING_AT) = None;
+                                crate::results::sent(at);
+                            }
+                            // Behind the joined flight, in their order.
+                            for (fence, value) in signals {
+                                if !crate::host::late_signal(fence, value) {
+                                    crate::fence::set(fence as This, value);
+                                }
                             }
                         } else {
                             let ran = {
@@ -893,6 +1357,7 @@ fn release_held_now(all: bool) {
                             }
                         }
                         PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
+                        presents_moved();
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -1019,6 +1484,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     #[cfg(windows)]
     {
         let us = started.elapsed().as_micros() as u64;
+        if behind() {
+            stat(a::SUBMIT_US, us);
+        }
         crate::framelog::add(crate::framelog::T::ExecuteUs, us);
         crate::framelog::here(crate::framelog::H::ExecuteUs, us);
     }
@@ -1032,6 +1500,13 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // The walls trace: where the lists' results for the title's
+        // processor go when they land (`crate::results`).
+        if crate::results::trace() {
+            let spans: Vec<(usize, u8)> =
+                lists.iter().filter_map(|&l| crate::list::host_list(l)).flat_map(|h| h.result_spans()).collect();
+            crate::results::submitted(&spans);
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1058,7 +1533,11 @@ fn execute_now(this: This, count: u32, lists: *const This) {
         }
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
+            if crate::host::async_race() {
+                crate::host::race_note(&taken);
+            }
+            lined(1);
+            Held::Run(taken, order, std::time::Instant::now())
         });
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
@@ -1125,6 +1604,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    crate::fence::ask(fence, value);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
@@ -1232,6 +1712,10 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        #[cfg(windows)]
+        if crate::results::trace() {
+            crate::results::landed(at as usize);
+        }
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -1258,6 +1742,66 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Title images drawn into (as render targets) or copied to: `.0` since they
+/// were last presented, `.1` ever. the title's opening video and
+/// title cards present its two images in turn but draw into only every
+/// other one (the frames between show an image it did not touch): shown as
+/// they are, the window flicked between the newest picture and one from
+/// long before. Such an image is now passed over for the one shown last
+/// (`VICTORY_PRESENT_EVERY=1`: every image as the title names it). An image
+/// written only by shaders (an upscaler's output) is never in `.1`, so it is
+/// always shown.
+static WRITTEN: std::sync::Mutex<Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>)>> =
+    std::sync::Mutex::new(None);
+
+/// `resource` was drawn into or copied to (see [`WRITTEN`]).
+pub(crate) fn note_written(resource: This) {
+    if resource.is_null() {
+        return;
+    }
+    let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, ever) = w.get_or_insert_with(Default::default);
+    // (bounded: render targets come and go; a clear only lets one stale
+    // image through)
+    if since.len() > 8192 {
+        since.clear();
+    }
+    if ever.len() > 8192 {
+        ever.clear();
+    }
+    since.insert(resource as usize);
+    ever.insert(resource as usize);
+}
+
+/// The image to show for a present of `resource`: itself, or the one shown
+/// last when `resource` is an image the title draws into and has not since
+/// it was last shown (see [`WRITTEN`]).
+#[cfg(windows)]
+fn fresh_or_last(resource: This) -> This {
+    static EVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if *EVERY.get_or_init(|| std::env::var_os("VICTORY_PRESENT_EVERY").is_some()) {
+        return resource;
+    }
+    let key = resource as usize;
+    let stale = {
+        let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let (since, ever) = w.get_or_insert_with(Default::default);
+        let fresh = since.remove(&key);
+        !fresh && ever.contains(&key)
+    };
+    let last = LAST.load(Ordering::Relaxed);
+    if stale && last != 0 && last != key {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::info!("a present of an image not drawn since it was last shown: the last image is shown again");
+        }
+        return last as This;
+    }
+    LAST.store(key, Ordering::Relaxed);
+    resource
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -1275,7 +1819,11 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
-    let hr = present_now(this, planes, plane_parameters);
+    // What the title submitted before this present is what its flip wait
+    // before the next one waits for (`crate::results`).
+    #[cfg(windows)]
+    crate::results::present_called();
+    let hr = present_now(this, planes, plane_parameters, _parameters);
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
@@ -1286,7 +1834,7 @@ extern "system" fn present(
     hr
 }
 
-fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _parameters: *const u8) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1299,6 +1847,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
     let _ = this;
+    // With `behind`: the title's thread waits on the lines from here
+    // (counted).
+    #[cfg(windows)]
+    let draining = (behind() && !sent_behind).then(|| {
+        TITLE_WAITING.fetch_add(1, Ordering::Relaxed);
+        std::time::Instant::now()
+    });
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -1322,6 +1877,12 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     if !sent_behind {
         release_held(forces());
+    }
+    #[cfg(windows)]
+    if let Some(draining) = draining {
+        TITLE_WAITING.fetch_sub(1, Ordering::Relaxed);
+        stat(a::PRESENT_US, draining.elapsed().as_micros() as u64);
+        stat(a::PRESENT_N, 1);
     }
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
@@ -1369,6 +1930,36 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             crate::capture::dump_targets(frame);
         }
     }
+    // `VICTORY_PRESENT_LOG=1`: what the title passes with its first 600
+    // presents (planes, each plane's token and resources, the first words of
+    // the parameters), to see which image it means to show.
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_PRESENT_LOG").is_some() && frame <= 600 && !plane_parameters.is_null() {
+        let mut text = String::new();
+        for i in 0..planes.min(4) as usize {
+            // SAFETY: the title passes `planes` plane descriptions.
+            let p = unsafe { &*plane_parameters.add(i) };
+            let res: Vec<String> = (0..p.count.min(4) as usize)
+                // SAFETY: the plane lists `count` resources.
+                .map(|r| format!("{:#x}", unsafe { *p.resources.add(r) } as usize))
+                .collect();
+            text.push_str(&format!(" plane{i}: token {:#x} count {} [{}]", p.token, p.count, res.join(" ")));
+        }
+        let params = if _parameters.is_null() {
+            String::from("none")
+        } else {
+            // SAFETY: the title's parameter block is at least 32 bytes.
+            let w = unsafe { std::slice::from_raw_parts(_parameters.cast::<u32>(), 8) };
+            format!("{w:08x?}")
+        };
+        // draws and dispatches run on the host since the last present
+        static LAST: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+        let (drawn, dispatched) = (crate::draw::drawn(), crate::draw::dispatched());
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let (dd, dx) = (drawn - last.0, dispatched - last.1);
+        *last = (drawn, dispatched);
+        tracing::info!(frame, planes, drawn = dd, dispatched = dx, "present:{text}; parameters {params}");
+    }
     #[cfg(windows)]
     if !sent_behind
         && planes > 0
@@ -1377,7 +1968,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && plane.count > 0
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        && let resource = fresh_or_last(unsafe { *plane.resources })
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -1455,7 +2046,8 @@ const PAGE: u64 = 64 << 10;
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// submission has run (with `VICTORY_ASYNC_SUBMIT=1`, has been prepared
+/// once what the lines hold has run: [`maps_drain`]).
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1469,6 +2061,11 @@ extern "system" fn copy_page_mappings(
     };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
+    }
+    // Submissions made before it read the pages as they are mapped now.
+    #[cfg(windows)]
+    if maps_drain() && count > 0 {
+        drain(a::MAPS_US);
     }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.

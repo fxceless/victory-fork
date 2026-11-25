@@ -126,6 +126,16 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    // The flip: on the console the frame presented before has been shown,
+    // so the card has run its work; with `VICTORY_FLIP_LANDED` ours waits
+    // until that work has landed too (`crate::results`), then for the tick.
+    #[cfg(windows)]
+    {
+        crate::results::frame_wait(kind);
+        if kind == crate::results::FLIP {
+            crate::results::flip_wait(timeout_ms);
+        }
+    }
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait

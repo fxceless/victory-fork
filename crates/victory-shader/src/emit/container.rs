@@ -144,7 +144,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh, 14 amplification.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -157,6 +157,8 @@ pub(crate) struct Psv<'a> {
     /// Geometry (triangles in, triangle strips out on stream 0): its
     /// maximum vertex count. `flag`: writes `SV_Position`.
     pub geometry: Option<u32>,
+    /// Amplification: the payload bytes it hands its mesh groups.
+    pub amplify: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -202,8 +204,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[29] = p.outputs.len() as u8;
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
+    if let Some(payload) = p.amplify {
+        // ASInfo.PayloadSizeInBytes
+        info[0..4].copy_from_slice(&payload.to_le_bytes());
+    }
     if let Some((mesh, shared)) = p.mesh {
         info[0..4].copy_from_slice(&shared.to_le_bytes());
+        // MSInfo.PayloadSizeInBytes
+        info[8..12].copy_from_slice(&mesh.payload.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
         info[14..16].copy_from_slice(&(mesh.max_primitives as u16).to_le_bytes());
         info[26] = vectors(p.prims) as u8;

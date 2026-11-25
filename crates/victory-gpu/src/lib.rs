@@ -22,17 +22,30 @@ mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod cpuwait;
+#[cfg(windows)]
+mod airlists;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod barstat;
+#[cfg(windows)]
+mod brighten;
+#[cfg(windows)]
+mod bus;
+#[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
+mod early;
 mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod gpuprof;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
@@ -45,6 +58,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod prepare;
+#[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
@@ -55,15 +70,21 @@ pub mod queue;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
+#[cfg(windows)]
+mod results;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memline;
+#[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod small;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
@@ -73,11 +94,14 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, title_window_made};
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{
+    inplace_level, title_memory_freeing, title_memory_section, title_memory_section_gone,
+    title_memory_view,
+};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
-    writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_reserved,
+    title_memory_written, writing as kernel_will_write,
 };

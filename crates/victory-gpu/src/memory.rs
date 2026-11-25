@@ -83,6 +83,15 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Copies numbered (held for the rest of the run) and their bytes.
+static NUMBERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the memory line: the copies held for shaders that read memory by
+/// address, and their bytes.
+pub(crate) fn numbered() -> [u64; 2] {
+    NUMBERED.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -156,6 +165,8 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                NUMBERED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                NUMBERED[1].fetch_add(shadow.span().1, std::sync::atomic::Ordering::Relaxed);
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.

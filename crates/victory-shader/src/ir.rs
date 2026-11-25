@@ -221,9 +221,142 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             what: "a branch to the program entry",
         });
     }
+    if join_wave_sections(&mut blocks) {
+        link(&mut blocks);
+    }
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
+}
+
+/// Whole-wave sections (`s_or_saveexec -1` ... the restore of the saved EXEC,
+/// `emit::wave`) are found within one block. The compiler may branch (on a
+/// scalar) between two such reductions and restore EXEC once where the arms
+/// meet: each arm starts its own section and jumps to a join whose first
+/// EXEC write is the restore (a `v_readlane` of the result before it). Here
+/// the join's instructions up to and including that restore are copied onto
+/// the end of each such arm, which then jumps to the rest of the join, so each
+/// section ends in its own block. The same instructions run on every path, in
+/// the same order. The join's head stays for any other way in, and goes
+/// when none is left. Returns whether anything changed (`blocks` then needs
+/// `link`).
+fn join_wave_sections(blocks: &mut Vec<Block>) -> bool {
+    let writes = |i: &Inst, r: Reg| i.writes.iter().any(|w| w.0 == r);
+    let reads = |i: &Inst, r: Reg| i.reads.iter().any(|w| w.0 == r);
+    // The saved register of a section that starts in `block` and has no restore there.
+    let open = |block: &Block| -> Option<u8> {
+        let start = block.insts.iter().rposition(|i| {
+            let k = match i.name() {
+                "s_or_saveexec_b64" | "s_or_saveexec_b32" => 193,
+                "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => 128,
+                _ => return false,
+            };
+            matches!(&i.fields, Fields::Sop { src, .. } if src.first() == Some(&Operand::Const(k)))
+        })?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        } = block.insts[start].fields
+        else {
+            return None;
+        };
+        let wide = block.insts[start].name().ends_with("_b64");
+        let after = &block.insts[start + 1..];
+        let touched = after.iter().any(|i| {
+            writes(i, Reg::S(EXEC)) || writes(i, Reg::S(EXEC + 1)) || writes(i, Reg::S(code)) || wide && writes(i, Reg::S(code + 1))
+        });
+        (!touched).then_some(code)
+    };
+    // Where in `join` the section saved in `code` (`wide`: and `code + 1`) ends: its first
+    // EXEC write, if that reads the saved register and nothing before it writes that.
+    let restore = |join: &Block, code: u8, wide: bool| -> Option<usize> {
+        let r = join.insts.iter().position(|i| writes(i, Reg::S(EXEC)) || writes(i, Reg::S(EXEC + 1)))?;
+        let saved = |i: &Inst| writes(i, Reg::S(code)) || wide && writes(i, Reg::S(code + 1));
+        (reads(&join.insts[r], Reg::S(code)) && !join.insts[..r].iter().any(saved)).then_some(r)
+    };
+    let mut changed = false;
+    // The join's head and rest, for joins already split.
+    let mut split: std::collections::HashMap<usize, (usize, usize)> = Default::default();
+    for a in 0..blocks.len() {
+        let Exit::Jump(join) = blocks[a].exit else { continue };
+        if join == a || join == 0 {
+            continue;
+        }
+        let Some(code) = open(&blocks[a]) else { continue };
+        let wide = blocks[a].insts.iter().rev().find(|i| i.name().contains("saveexec")).is_some_and(|i| i.name().ends_with("_b64"));
+        let head = match split.get(&join) {
+            Some(&(head, _)) => head,
+            None => join,
+        };
+        let Some(r) = restore(&blocks[head], code, wide) else { continue };
+        let rest = match split.get(&join) {
+            Some(&(_, rest)) => rest,
+            None => {
+                let tail: Vec<Inst> = blocks[join].insts.drain(r + 1..).collect();
+                let rest = Block {
+                    offset: tail.first().map_or(blocks[join].offset, |i| i.machine.offset),
+                    preds: Vec::new(),
+                    phis: Vec::new(),
+                    insts: tail,
+                    exit: blocks[join].exit,
+                };
+                blocks.push(rest);
+                let rest = blocks.len() - 1;
+                blocks[join].exit = Exit::Jump(rest);
+                split.insert(join, (join, rest));
+                rest
+            }
+        };
+        let copy = blocks[join].insts.clone();
+        if blocks[a].insts.last().is_some_and(|i| i.name() == "s_branch") {
+            blocks[a].insts.pop();
+        }
+        blocks[a].insts.extend(copy);
+        blocks[a].exit = Exit::Jump(rest);
+        changed = true;
+    }
+    if changed {
+        drop_unreachable(blocks);
+    }
+    changed
+}
+
+/// Drops the blocks no path from the entry reaches, renumbering the others' exits.
+fn drop_unreachable(blocks: &mut Vec<Block>) {
+    let mut seen = vec![false; blocks.len()];
+    let mut stack = vec![0];
+    while let Some(b) = stack.pop() {
+        if std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        stack.extend(blocks[b].exit.successors());
+    }
+    if seen.iter().all(|&s| s) {
+        return;
+    }
+    let mut number = vec![usize::MAX; blocks.len()];
+    let mut n = 0;
+    for (b, &s) in seen.iter().enumerate() {
+        if s {
+            number[b] = n;
+            n += 1;
+        }
+    }
+    let old = std::mem::take(blocks);
+    for (b, mut block) in old.into_iter().enumerate() {
+        if !seen[b] {
+            continue;
+        }
+        block.exit = match block.exit {
+            Exit::Jump(t) => Exit::Jump(number[t]),
+            Exit::Branch { taken, not_taken } => Exit::Branch {
+                taken: number[taken],
+                not_taken: number[not_taken],
+            },
+            e => e,
+        };
+        blocks.push(block);
+    }
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
@@ -336,11 +469,12 @@ fn unspill(
     // Lane pairs (register, lower lane) that always move together: each
     // save of the lower lane is followed, in the same block and before its
     // register changes, by the save of the next register into the next
-    // lane; each restore of the lower lane is followed at once by the
-    // restore of the next lane into the next register.
+    // lane; each restore of the lower lane is followed, in the same block
+    // and before the next register is read or written, by the restore of
+    // the next lane into the next register.
     // The second save may come any number of instructions after the first (the
     // compiler puts loads and constants between the two: five instructions later
-    // in the ped mesh programs). Only wave64 programs have pairs: a wave32 mask
+    // in the ped mesh programs), and so may the second restore. Only wave64 programs have pairs: a wave32 mask
     // is one dword, and a pair move of it with its neighbour would hide it.
     let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
     slots.sort_unstable();
@@ -1555,6 +1689,57 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    /// A lane mask parked in lanes 6 and 7 of a VGPR comes back as the pair
+    /// it is also when the compiler puts other work between the two
+    /// restores (the irradiance cache's shading programs: one vector
+    /// instruction), and as two scalars when that work reads the second
+    /// register.
+    #[test]
+    fn a_parked_pair_restored_with_work_between_moves_as_a_pair() {
+        let program = |between: u32| {
+            [
+                0xD761_0000,
+                0x0001_0C04, // v_writelane_b32 v0, s4, 6
+                0xD761_0000,
+                0x0001_0E05, // v_writelane_b32 v0, s5, 7
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xD760_000A,
+                0x0001_0D00, // v_readlane_b32 s10, v0, 6
+                between,
+                0xD760_000B,
+                0x0001_0F00, // v_readlane_b32 s11, v0, 7
+                0xBE8C_040A, // s_mov_b64 s[12:13], s[10:11]
+                S_ENDPGM,
+            ]
+        };
+        // v_mov_b32 v1, v2 between the restores: one pair move.
+        let p = build_words(&program(0x7E02_0302), true);
+        let insts = &p.blocks[0].insts;
+        let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+        assert_eq!(
+            names,
+            ["s_mov_b64", "s_mov_b32", "s_mov_b32", "s_mov_b64", "v_mov_b32", "s_mov_b64", "s_endpgm"],
+            "{insts:?}"
+        );
+        // The pair saved is the input pair, and the pair restored is that.
+        let (save, restore, last) = (&insts[0], &insts[3], &insts[5]);
+        let parked = |reg| save.write(Reg::S(reg));
+        let slot = (0..=255u8).find(|&c| parked(c).is_some()).expect("a slot");
+        assert_eq!(save.read(Reg::S(4)), Some(input(&p, Reg::S(4))));
+        assert_eq!(save.read(Reg::S(5)), Some(input(&p, Reg::S(5))));
+        assert_eq!(restore.read(Reg::S(slot)), save.write(Reg::S(slot)));
+        assert_eq!(restore.read(Reg::S(slot + 1)), save.write(Reg::S(slot + 1)));
+        assert_eq!(last.read(Reg::S(10)), restore.write(Reg::S(10)));
+        assert_eq!(last.read(Reg::S(11)), restore.write(Reg::S(11)));
+        // v_mov_b32 v1, s11 between reads the second register before its
+        // restore: the two lanes move as scalars, saves and restores.
+        let p = build_words(&program(0x7E02_020B), true);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "s_mov_b64").count(), 1, "{names:?}");
+        assert_eq!(names[4..7], ["s_mov_b32", "v_mov_b32", "s_mov_b32"], "{names:?}");
     }
 
     /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what

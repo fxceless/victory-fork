@@ -30,9 +30,12 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// The highest value a queue was told to signal (with the polls'
+    /// count, [`take_polls`]).
+    asked: AtomicU64,
     /// For [`pace`]: when each wait above was asked for.
     #[cfg(all(windows, feature = "diagnostics"))]
-    asked: Mutex<Vec<pace::Asked>>,
+    pace_asked: Mutex<Vec<pace::Asked>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -53,8 +56,9 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        asked: AtomicU64::new(initial),
         #[cfg(all(windows, feature = "diagnostics"))]
-        asked: Mutex::new(Vec::new()),
+        pace_asked: Mutex::new(Vec::new()),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -83,6 +87,45 @@ extern "system" fn release(this: This) -> u32 {
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
+
+/// [`completed`] as the title calls it (counted, [`take_polls`]).
+extern "system" fn title_completed(this: This) -> u64 {
+    let fence = fence(this);
+    let value = fence.value.load(Ordering::Acquire);
+    if polls_counted() {
+        POLLS[0].fetch_add(1, Ordering::Relaxed);
+        if value < fence.asked.load(Ordering::Relaxed) {
+            POLLS[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    value
+}
+
+/// Whether the title's reads of fence values are counted ([`take_polls`];
+/// with `VICTORY_WALLS_TRACE=1|2` or `VICTORY_RESULTS_TRACE=1`).
+fn polls_counted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2")
+            || std::env::var_os("VICTORY_RESULTS_TRACE").is_some_and(|v| v == "1")
+    })
+}
+
+/// The title's reads of fence values through the method, and of them those
+/// below a value a queue was told to signal (the work before that signal
+/// not landed yet).
+static POLLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`POLLS`] since the last call. The title may also read a value at the
+/// fence's address, which is not counted.
+pub(crate) fn take_polls() -> (u64, u64) {
+    (POLLS[0].swap(0, Ordering::Relaxed), POLLS[1].swap(0, Ordering::Relaxed))
+}
+
+/// A queue was told to signal `this` to `value` (for [`take_polls`]).
+pub(crate) fn ask(this: This, value: u64) {
+    fence(this).asked.fetch_max(value, Ordering::Relaxed);
+}
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -95,14 +138,36 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
+    pace::waits(this, &fence.pace_asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
         #[cfg(windows)]
         if crate::host::late() {
-            drop(waiters);
+            // With submissions prepared by a thread of ours
+            // (`VICTORY_ASYNC_SUBMIT=1`, `crate::queue::fence_wait`): until
+            // the fence gets there, the event of this thread's set by it.
+            let event = if crate::queue::fence_wait() { crate::queue::thread_event() } else { 0 };
+            if event != 0 {
+                waiters.push((value, event));
+                drop(waiters);
+                let met = crate::queue::wait_for_fence(event, &|| fence.value.load(Ordering::Acquire) >= value);
+                fence
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|&(wanted, e)| !(e == event && wanted == value));
+                if met {
+                    return S_OK;
+                }
+            } else {
+                drop(waiters);
+            }
+            // With submissions prepared by a thread of ours
+            // (`VICTORY_ASYNC_SUBMIT=1`) the signal may still be in a
+            // queue's line, not sent yet: what is free to run runs first.
+            crate::queue::before_fence();
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
@@ -124,7 +189,7 @@ pub(crate) fn set(this: This, value: u64) {
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     #[cfg(all(windows, feature = "diagnostics"))]
-    pace::reached(this, &fence.asked, value);
+    pace::reached(this, &fence.pace_asked, value);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -310,7 +375,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
-    f[8] = completed as *const (); // 0x40
+    f[8] = title_completed as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
     f[10] = signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58

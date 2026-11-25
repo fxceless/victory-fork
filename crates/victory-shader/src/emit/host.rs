@@ -143,6 +143,15 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_with(stages, &[])
+    }
+
+    /// [`Host::root_signature_for`] with `extra` parameters after the root views.
+    pub fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        extra: &[D3D12_ROOT_PARAMETER1],
+    ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -185,6 +194,7 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        params.extend_from_slice(extra);
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {

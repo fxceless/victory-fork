@@ -94,6 +94,9 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg: dst, .. } = *data else {
             return Err("a ray-tracing node test's result");
         };
+        if super::super::rt_miss() {
+            return self.bvh_nothing(inst, b, i, regs[0], dst);
+        }
         let site = (b, i);
         let nodes = self
             .x
@@ -216,6 +219,30 @@ impl<'a> Lower<'a> {
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
+            self.write(inst, Reg::V(dst + k as u8), r, guard);
+        }
+        Ok(())
+    }
+
+    /// `VICTORY_RT_MISS` ([`super::super::rt_miss`]): the instruction's
+    /// result for a ray with nothing in its way
+    /// ([`bvh::nothing_in_the_way`]), chosen by the kind in the node
+    /// pointer's low bits (VGPR `pointer`), without reading the node or
+    /// its structure's descriptor. Four "no child" dwords for a box node:
+    /// a traversal pushes nothing and its stack runs empty.
+    fn bvh_nothing(&mut self, inst: &Inst, b: usize, i: usize, pointer: u8, dst: u8) -> Result<(), Why> {
+        let guard = self.guard(b, i)?;
+        let v = inst.read(Reg::V(pointer)).ok_or("an unread operand")?;
+        let pointer = self.i32_of(v)?;
+        let c = self.cur;
+        let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+        let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+        let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+        let boxes = bvh::nothing_in_the_way(4);
+        let others = bvh::nothing_in_the_way(0);
+        for k in 0..4 {
+            let (on_box, other) = (self.s.m.i32(boxes[k]), self.s.m.i32(others[k]));
+            let r = self.s.m.select(c, is_box, on_box, other);
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())

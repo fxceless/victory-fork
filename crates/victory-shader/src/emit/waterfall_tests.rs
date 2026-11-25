@@ -55,12 +55,22 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    let (shader, nonuniform_handles, wave_ops) = lowered(&native);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(nonuniform_handles, 1);
+    assert!(!wave_ops);
+    shader
+}
+
+/// `native` lowered and validated by `dxil.dll` when present; with the count of its
+/// non-uniform handles and whether it has wave operations.
+fn lowered(native: &NativeProgram) -> (HostShader, u32, bool) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -71,9 +81,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    let (nonuniform, wave_ops) = (lowered.nonuniform_handles, lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -91,7 +99,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, nonuniform, wave_ops)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
@@ -247,5 +255,75 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+/// A texture's size read from its descriptor that nothing uses as one (the puddle detection
+/// programs take sizes from the heap by index and sample other textures): entry 1 of the
+/// table of views at s0 is loaded for its width (dword 1 bits 30-31, dword 2 bits 0-11) and
+/// height (dword 2 bits 14-27) alone, and both are stored to the raw UAV at dword 16.
+#[test]
+fn a_size_read_from_a_descriptor_used_for_nothing_else_is_the_views() {
+    let words: [u32; 23] = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF40C_0201,
+        0xFA00_0020, // s_load_dwordx8 s[8:15], s[2:3], 0x20 (entry 1)
+        0xF408_0501,
+        0xFA00_0040, // s_load_dwordx4 s[20:23], s[2:3], 0x40 (the UAV)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9010_9E09, // s_lshr_b32 s16, s9, 30
+        0x8F11_820A, // s_lshl_b32 s17, s10, 2
+        0x8810_1110, // s_or_b32 s16, s16, s17
+        0x8710_FF10,
+        0x0000_3FFF, // s_and_b32 s16, s16, 0x3fff
+        0x8110_8110, // s_add_i32 s16, s16, 1
+        0x9391_FF0A,
+        0x000E_000E, // s_bfe_u32 s17, s10, 14 bits at 14
+        0x8111_8111, // s_add_i32 s17, s17, 1
+        0x7E02_0210, // v_mov_b32 v1, s16
+        0x7E04_0211, // v_mov_b32 v2, s17
+        0xE070_0000,
+        0x8005_0100, // buffer_store_dword v1, off, s[20:23], 0
+        0xE070_0004,
+        0x8005_0200, // buffer_store_dword v2, off, s[20:23], 0 offset:4
+        0xBF81_0000, // s_endpgm
+    ];
+    let table = |user_data: u8| RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: user_data,
+    };
+    let range = |kind, table_offset_dwords, dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![table(0)],
+        used: vec![range(ResourceType::Srv, 0, 8), range(ResourceType::Uav, 16, 4)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let (shader, _, _) = lowered(&native);
+    let texels = [[0.0f32; 4]; 15];
+    let views = [View::Texture(1, 1, &texels[..1]), View::Texture(5, 3, &texels), View::RawUav(32)];
+    let results = run(&shader, &views);
+    for (label, got) in &results {
+        assert_eq!(got[..2], [5, 3], "{label}");
     }
 }

@@ -115,6 +115,18 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// `VICTORY_ARROWS_LOOK` (on unless `0`): the arrow keys are the right stick
+/// too (look and turn, as I/J/K/L), and the D-pad moves to the numpad's
+/// 8/2/4/6.
+fn arrows_look() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ARROWS_LOOK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The D-pad on the numpad (8 up, 2 down, 4 left, 6 right), for
+/// [`arrows_look`].
+const NUMPAD_DPAD: [(u8, u32); 4] = [(0x68, UP), (0x62, DOWN), (0x64, LEFT), (0x66, RIGHT)];
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -123,17 +135,23 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let look = arrows_look();
+    let buttons = FALLBACK_BUTTONS
+        .iter()
+        // (the arrows' D-pad entries give way to the numpad's)
+        .filter(|(vk, _)| !(look && matches!(*vk, 0x25..=0x28)))
+        .chain(NUMPAD_DPAD.iter().filter(|_| look))
+        .filter(|(vk, _)| on(*vk) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
+    let (ax, ay) = if look { (on(0x27) - on(0x25), on(0x26) - on(0x28)) } else { (0.0, 0.0) };
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
+        buttons,
         left_trigger: on(b'Z'),
         right_trigger: on(b'C'),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: (on(b'L') - on(b'J') + ax).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + ay).clamp(-1.0, 1.0),
     }
 }
 
@@ -1150,7 +1168,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,10 +1179,8 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
+            // (in every build: runs need input whatever window has focus)
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1202,7 +1217,7 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// Unset (the default), nothing is pressed.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();

@@ -105,6 +105,39 @@ pub(crate) fn wanted() -> bool {
     })
 }
 
+/// Low levels under pressure: while the card has no room for more host
+/// copies (`resource.rs` `room`: the commit floor, or the card's budget),
+/// a texture of this kind is still made, without memory, and its held
+/// levels get tiles only up to this many bytes a level
+/// (`VICTORY_PRESSED_LEVELS_KB`; unset or 0: off, as before). Its views
+/// show from the first such level: the texture reads as a smaller copy of
+/// itself, where a texture held back reads as a null view (zeros: alpha 0,
+/// black albedo, an alpha-tested mesh drawn as nothing). The levels left
+/// without tiles get them by the waiting uploads once there is room again
+/// (`HostHeap::texture_slots_waiting`). Only with [`wanted`].
+pub(crate) fn pressed_cap() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let kb = parse_pressed(std::env::var("VICTORY_PRESSED_LEVELS_KB").ok().as_deref())?;
+        let on = wanted();
+        tracing::info!(
+            kb,
+            on,
+            "textures picked by index while the card has no room: made with their levels of at most this many KiB              (VICTORY_PRESSED_LEVELS_KB; needs VICTORY_LEVELS_ON_DEMAND=1 and tiled resources tier 2)"
+        );
+        on.then_some(kb << 10)
+    })
+}
+
+/// [`pressed_cap`]'s KiB for the switch's value; at least one tile.
+fn parse_pressed(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&kb| kb > 0).map(|kb| kb.max(TILE >> 10))
+}
+
+/// Since the start: uploads under pressure that gave small levels tiles
+/// ([`pressed_cap`]), and those tiles' bytes.
+pub(crate) static PRESSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn parse_floor(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -378,7 +411,16 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // Without room only the card's own levels, and under
+        // [`pressed_cap`] the held levels of at most its bytes.
+        let may = if room { named } else { card | self.small_levels(pressed_cap().unwrap_or(0)) };
+        let before = if room { 0 } else { given.runs.len() };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
+        if !room && given.runs.len() > before {
+            let bytes: u64 = given.runs[before..].iter().map(|run| u64::from(run.2) * TILE).sum();
+            PRESSED[0].fetch_add(1, Ordering::Relaxed);
+            PRESSED[1].fetch_add(bytes, Ordering::Relaxed);
+        }
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -428,6 +470,26 @@ impl Tiled {
             self.unclaim(without);
         }
         changed
+    }
+
+    /// The bits of the levels whose tiles take at most `cap` bytes: the
+    /// levels the card packs together if their tiles do, and each level
+    /// of its own that does (none for 0).
+    pub(crate) fn small_levels(&self, cap: u64) -> u32 {
+        if cap == 0 {
+            return 0;
+        }
+        let mut bits = 0;
+        for (level, &tiles) in self.standard.iter().enumerate() {
+            if level < 32 && u64::from(tiles) * TILE <= cap {
+                bits |= 1 << level;
+            }
+        }
+        let first_packed = self.standard.len() as u32;
+        if first_packed < self.levels && u64::from(self.packed) * TILE <= cap {
+            bits |= self.every_level() & !((1u32 << first_packed.min(31)) - 1);
+        }
+        bits & self.every_level()
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -1478,6 +1540,35 @@ void look() {
         assert_eq!(parse_floor(Some("2048")), 2048 << 10);
         assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
         assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn pressed_levels_switch_and_small_levels() {
+        assert_eq!(parse_pressed(None), None);
+        assert_eq!(parse_pressed(Some("0")), None);
+        assert_eq!(parse_pressed(Some("x")), None);
+        assert_eq!(parse_pressed(Some("16")), Some(64), "at least one tile");
+        assert_eq!(parse_pressed(Some(" 256 ")), Some(256));
+        // A 2048x2048 one-byte-a-texel chain: 64, 16, 4, 1 tiles, then
+        // seven levels packed into one tile.
+        let tiled = Tiled {
+            standard: vec![64, 16, 4, 1],
+            packed: 1,
+            levels: 11,
+            full: 86 * TILE,
+            given: Mutex::new(Given { levels: vec![false; 4], packed: false, runs: Vec::new() }),
+            shown: AtomicU32::new(u32::MAX),
+            held: AtomicU32::new(0),
+            card: AtomicU32::new(0),
+            claimed: AtomicU32::new(0),
+        };
+        let packed = 0b111_1111_0000;
+        assert_eq!(tiled.small_levels(0), 0, "off: none");
+        assert_eq!(tiled.small_levels(TILE), packed | 0b1000);
+        assert_eq!(tiled.small_levels(256 << 10), packed | 0b1100);
+        assert_eq!(tiled.small_levels(u64::MAX), tiled.every_level());
+        // Not dropped: its drop would take its bytes off the module's counts.
+        std::mem::forget(tiled);
     }
 
     #[test]

@@ -132,6 +132,69 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader can write through unordered access at all:
+    /// [`stores`], or image stores and atomics ([`image_stores`]). A draw
+    /// or dispatch of a pipeline none of whose shaders can leaves nothing
+    /// for a wait for shader writes to wait for (`crate::barstat`).
+    pub(crate) writes: bool,
+    /// Whether the shader can store through a buffer view it picks from the
+    /// view heap by an index it computes (a `ResourceHeap` root parameter):
+    /// writes no table or root view of the draw names ([`picked_stores`]).
+    /// True when that cannot be told (the analysis failed).
+    pub(crate) picked_stores: bool,
+    /// With [`Translated::picked_stores`]: how the program finds the heap
+    /// slots it stores through, root parameters by slot
+    /// (`victory_shader::picked`, `crate::draw`'s `picked_exact`); `None`
+    /// when the analysis could not follow every such store.
+    pub(crate) picks: Option<Vec<Pick>>,
+}
+
+/// [`victory_shader::picked::HeapPick`] with root parameters by root
+/// signature slot (and dword), as the bound arguments hold them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pick {
+    pub(crate) offset: u32,
+    pub(crate) shift: u32,
+    pub(crate) mask: u32,
+    pub(crate) source: PickFrom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PickFrom {
+    Fixed,
+    /// Root constants at (slot, dword).
+    Constant(u8, u32),
+    /// Dword `field` of records of the buffer view at byte `entry` of the
+    /// table at root slot `table`: records `[first, first + count)` (root
+    /// constants), all of them where not given.
+    Records { table: u8, entry: u32, field: u32, first: Option<(u8, u32)>, count: Option<(u8, u32)> },
+}
+
+#[cfg(windows)]
+fn pick_of(layout: &[victory_shader::RootParam], h: &victory_shader::picked::HeapPick) -> Option<Pick> {
+    use victory_shader::picked::PickSource;
+    let at = |(param, dword): (usize, u32)| layout.get(param).map(|p| (p.slot, dword));
+    let source = match &h.source {
+        PickSource::Fixed => PickFrom::Fixed,
+        PickSource::Constant(c) => {
+            let (slot, dword) = at(*c)?;
+            PickFrom::Constant(slot, dword)
+        }
+        PickSource::Records { table, entry, field, first, count } => PickFrom::Records {
+            table: layout.get(*table)?.slot,
+            entry: *entry,
+            field: *field,
+            first: match first {
+                Some(c) => Some(at(*c)?),
+                None => None,
+            },
+            count: match count {
+                Some(c) => Some(at(*c)?),
+                None => None,
+            },
+        },
+    };
+    Some(Pick { offset: h.offset, shift: h.shift, mask: h.mask, source })
 }
 
 #[cfg(windows)]
@@ -190,6 +253,15 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let writes = stores || programs.iter().any(image_stores);
+    let (picked_stores, picks) = if stores {
+        programs
+            .iter()
+            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs))
+            .map_or((false, None), picked_stores)
+    } else {
+        (false, None)
+    };
     let used = programs
         .into_iter()
         .find(|p| {
@@ -200,7 +272,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, writes, picked_stores, picks })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -428,6 +500,132 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to or do atomics on an image
+/// (texture) through unordered access, use the global data share, or has
+/// code that does not decode.
+#[cfg(windows)]
+fn image_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        match i.encoding {
+            Encoding::Mimg => i.name().is_none_or(|n| n.contains("store") || n.contains("atomic")),
+            // The global data share and its counters outlive a draw.
+            Encoding::Ds => {
+                i.words.first().is_some_and(|w| w & (1 << 17) != 0)
+                    || i.name().is_none_or(|n| ["gws", "append", "consume", "ordered"].iter().any(|k| n.contains(k)))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Of [`picked_stores`], since the start: programs with a `ResourceHeap`
+/// root parameter that can store analysed, of them ones that store through
+/// a picked buffer view, ones the analysis failed for (counted as
+/// storing), the microseconds the analyses took, and of the storing ones
+/// those whose slots `victory_shader::picked` could not follow.
+pub(crate) static PICKED_ANALYSIS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Whether a console program can store through a buffer view it picks
+/// from the view heap by an index it computes: a buffer store or atomic
+/// (`buffer_*`, `tbuffer_*`) whose descriptor the resource analysis traces
+/// (through any choice by control flow or lane) to a load from the heap
+/// a `ResourceHeap` root parameter gives. Such writes are declared by no
+/// table or root view (`crate::draw`'s heap pass, `VICTORY_PICKED_UAV_WRITES`).
+/// Only programs with such a parameter are analysed (the analysis is the
+/// translator's first stages again); true when it fails.
+/// shortcut: image stores (textures) are left out, as in [`stores`]: they
+/// reach no buffer's host copy.
+#[cfg(windows)]
+fn picked_stores(program: &victory_shader::NativeProgram) -> (bool, Option<Vec<Pick>>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use victory_shader::RootType;
+    use victory_shader::gfx10::Encoding;
+    use victory_shader::resource::{Role, Source};
+    let buffer_store = |encoding, name: Option<&str>| {
+        matches!(encoding, Encoding::Mubuf | Encoding::Mtbuf)
+            && name.is_none_or(|n| n.contains("store") || n.contains("atomic"))
+    };
+    if !program.layout.iter().any(|p| p.root == RootType::ResourceHeap)
+        || victory_shader::gfx10::decode(&program.code)
+            .is_ok_and(|code| !code.iter().any(|i| buffer_store(i.encoding, i.name())))
+    {
+        return (false, None);
+    }
+    let started = std::time::Instant::now();
+    // First without the structure the tracing of per-lane descriptors
+    // needs, again with it where that fails. The title's shaders.rpf
+    // (2026-11-25): 2,846 programs with a heap parameter and a buffer
+    // store, 21 s for all of them so (some 7 ms each; with the structure
+    // some 40 ms), 4 that needed it (none then storing through picked
+    // views), 37 compute programs that store through picked views, all
+    // of `bvh_skinning` (CSComputeSkinning*, CSComputeCable/Rope*,
+    // CSComputeTreeAnimVelocity, CSUnpackIB*: skinned vertex streams). A
+    // panic in the analysis (code the translator would refuse) is a failure.
+    let analyse = |lanes: bool| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = victory_shader::spill::build(program).ok()?;
+            let st = if lanes { Some(victory_shader::structure::structure(&p).ok()?) } else { None };
+            let res = victory_shader::resource::track(&p, &program.layout, program.stage, st.as_ref()).ok()?;
+            let scalar: HashMap<_, _> = res.scalar.iter().map(|(site, a)| (*site, a.param)).collect();
+            let from_heap = |load| {
+                scalar
+                    .get(load)
+                    .and_then(|&param| program.layout.get(param))
+                    .is_some_and(|rp| rp.root == RootType::ResourceHeap)
+            };
+            let any = res.descriptors.iter().any(|d| {
+                if d.role != Role::Resource {
+                    return false;
+                }
+                let Some(inst) = p.blocks.get(d.site.0).and_then(|b| b.insts.get(d.site.1)) else {
+                    return false;
+                };
+                buffer_store(inst.machine.encoding, inst.machine.name())
+                    && d.source.leaves().iter().any(|s| match s {
+                        Source::Loaded { load, .. } | Source::Fetched { load, .. } => from_heap(load),
+                        _ => false,
+                    })
+            });
+            // Which slots: the recipe of each such store's heap index
+            // (`victory_shader::picked`; all 37 of the title's programs
+            // follow, offline 2026-11-25).
+            let picks = any
+                .then(|| {
+                    victory_shader::picked::heap_picks(&p, &program.layout, &res, |i| {
+                        buffer_store(i.machine.encoding, i.machine.name())
+                    })
+                })
+                .flatten()
+                .and_then(|picks| picks.iter().map(|h| pick_of(&program.layout, h)).collect::<Option<Vec<Pick>>>());
+            Some((any, picks))
+        }))
+        .ok()
+        .flatten()
+    };
+    let found = analyse(false).or_else(|| analyse(true));
+    PICKED_ANALYSIS[0].fetch_add(1, Relaxed);
+    PICKED_ANALYSIS[3].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    match found {
+        Some((true, picks)) => {
+            PICKED_ANALYSIS[1].fetch_add(1, Relaxed);
+            if picks.is_none() {
+                PICKED_ANALYSIS[4].fetch_add(1, Relaxed);
+            }
+            (true, picks)
+        }
+        Some((false, _)) => (false, None),
+        None => {
+            PICKED_ANALYSIS[2].fetch_add(1, Relaxed);
+            (true, None)
+        }
+    }
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -468,6 +666,16 @@ pub(crate) fn bound(this: This) {
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
+}
+
+/// The hashes of a pipeline's shaders, as the "first bind" lines print
+/// them, comma-separated (for logs).
+pub(crate) fn hashes(this: This) -> String {
+    if this.is_null() {
+        return String::new();
+    }
+    let p = pipeline(this);
+    p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>().join(",")
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does

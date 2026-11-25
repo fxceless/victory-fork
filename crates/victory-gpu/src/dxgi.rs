@@ -221,7 +221,8 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// Series X on a 1080p set lists a 1080p mode), else 1920x1080 for a Series S
+/// (`--console series-s`) and 3840x2160 for a Series X.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
@@ -233,6 +234,9 @@ fn display_size() -> (u32, u32) {
         });
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            // A Series S on a 1080p set (its common case) lists 1080p; the
+            // title sizes its targets from the mode and the device type.
+            _ if crate::console::current() == crate::console::Console::SeriesS => (1920, 1080),
             _ => (3840, 2160),
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");

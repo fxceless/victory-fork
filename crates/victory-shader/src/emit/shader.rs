@@ -73,6 +73,8 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// UAVs in a stage before the pixel stage (the amplification shader's budget).
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -104,6 +106,18 @@ pub(crate) struct Mesh {
     pub max_primitives: u32,
     /// 1 lines, 2 triangles.
     pub topology: u8,
+    /// Bytes of the payload an amplification shader hands it (0: none; see
+    /// [`mesh_payload`]).
+    pub payload: u32,
+}
+
+/// `VICTORY_MESH_AMPLIFY=1` (default off): mesh shaders declare a payload of 4 bytes, so that
+/// the host can put its amplification shader in front of them (`victory-gpu`: an indirect
+/// mesh dispatch's record read and clamped there, in the graphics pipe, instead of by a
+/// compute pass between two waits). The payload is never read.
+pub(crate) fn mesh_payload() -> u32 {
+    // Read at each translation (once a program), so tests can make both forms.
+    if std::env::var("VICTORY_MESH_AMPLIFY").is_ok_and(|v| v == "1") { super::amplify::MESH_PAYLOAD } else { 0 }
 }
 
 /// What a geometry shader declares: triangles in, triangle strips out on
@@ -142,6 +156,9 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
+    /// An amplification shader (`amplify.rs`) handing this many bytes of payload to its
+    /// mesh groups; `threads` is its thread-group size.
+    pub amplify: Option<u32>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -205,6 +222,7 @@ impl Shader {
             prims: Vec::new(),
             mesh: None,
             geometry: None,
+            amplify: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -719,12 +737,19 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh.payload,
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
                     node.extend(state);
                     props.push(self.m.md_node(node));
+                }
+                // Amplification state (tag 10): threads, payload bytes.
+                None if self.amplify.is_some() => {
+                    props.push(i32c(&mut self, 10));
+                    let payload = self.amplify.unwrap_or(0);
+                    let payload = Some(i32c(&mut self, payload));
+                    props.push(self.m.md_node(vec![Some(t), payload]));
                 }
                 None => {
                     props.push(i32c(&mut self, 4));
@@ -753,9 +778,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh, 14 amplification.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.amplify.is_some() => ("as", 14u32),
             _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
@@ -783,6 +809,9 @@ impl Shader {
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
@@ -824,6 +853,7 @@ impl Shader {
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
             geometry: self.geometry.map(|g| g.max_vertices),
+            amplify: self.amplify,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

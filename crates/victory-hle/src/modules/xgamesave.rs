@@ -177,6 +177,57 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Removes a folder and all it holds; a missing one is no error.
+///
+/// Run from a packaged app (the Claude desktop app, say), the host merges
+/// the real `AppData\Local` with the package's private copy of it, and a
+/// folder can exist in both. `remove_dir_all` opens what is inside without
+/// following reparse points, which such a merged folder needs, and fails
+/// with ERROR_REPARSE_POINT_ENCOUNTERED (4395). Removing entry by entry,
+/// by path, works: each pass removes the upper copy, the lower one shows
+/// through, and the next pass removes that.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut last = None;
+    for _ in 0..4 {
+        match std::fs::remove_dir_all(dir).or_else(|_| remove_entries(dir)) {
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => last = Some(e),
+            Ok(()) => {}
+        }
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if gone(&e) => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("the folder is still there after removal")))
+}
+
+/// [`remove_tree`] by path, entry by entry; links are removed, never followed.
+fn remove_entries(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            remove_entries(&path)?;
+        } else if kind.is_symlink() {
+            std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_dir(dir)
+}
+
+/// Removes a leftover (an unfinished or superseded version) if it can: one
+/// that stays is garbage, never read, and must not stop the container.
+fn discard(path: &Path) {
+    if let Err(e) = remove_tree(path) {
+        tracing::warn!(path = %path.display(), %e, "game save leftover not removed");
+    }
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -185,7 +236,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            discard(&entry.path());
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -195,7 +246,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         return Ok(None);
     };
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        discard(&dir.join(format!("v{old}")));
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
@@ -243,7 +294,7 @@ fn commit(
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
     if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+        remove_tree(&staged)?;
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -280,7 +331,7 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         if file.ends_with(".gone") {
-            let _ = std::fs::remove_dir_all(&path);
+            discard(&path);
         } else if file.contains('~') {
             if let Ok(Some(v)) = current(&path) {
                 out.push((v.name, path));
@@ -317,7 +368,7 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
             .collect();
         commit(&dir, 1, name, &display, &sources).ok()?;
     }
-    std::fs::remove_dir_all(old).ok()?;
+    remove_tree(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
 }
@@ -476,7 +527,7 @@ impl Update {
         }
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
-            let _ = std::fs::remove_dir_all(&old.dir);
+            discard(&old.dir);
             step();
         }
         S_OK
@@ -493,13 +544,25 @@ fn delete(root: &Path, name: &str) -> HRESULT {
         Err(e) => return io_error(&dir, &e),
     }
     let gone = dir.with_extension("gone");
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
     step();
     if let Err(e) = std::fs::rename(&dir, &gone) {
         return io_error(&dir, &e);
     }
     step();
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
+    // A folder the host merges from two copies (see `remove_tree`) moves
+    // one copy at a time: the lower one shows now and goes the same way.
+    for _ in 0..3 {
+        if !matches!(current_named(&dir, name), Ok(Some(_))) {
+            break;
+        }
+        let _ = remove_tree(&gone);
+        if std::fs::rename(&dir, &gone).is_err() {
+            break;
+        }
+        let _ = remove_tree(&gone);
+    }
     S_OK
 }
 
@@ -1067,6 +1130,71 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    /// A version that cannot be removed (here a file in it held open with
+    /// no sharing; on the user's machine a folder the host merged from two
+    /// copies, which `remove_dir_all` refuses with error 4395) is garbage:
+    /// the container still opens, reads, saves and lists, and the version
+    /// goes once it can.
+    #[cfg(windows)]
+    #[test]
+    fn an_old_version_that_stays_never_blocks_the_container() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let saves = tempfile::tempdir().unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&p.root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        // A crash after committing v2, before removing v1.
+        let c = p.container("Slot");
+        let v1 = c.dir.join("v1");
+        let v2 = c.dir.join("v2");
+        copy_tree(&v1, &v2);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(v1.join(MANIFEST))
+            .unwrap();
+        assert!(std::fs::remove_dir_all(&v1).is_err());
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(v1.exists());
+        assert_eq!(current_named(&c.dir, "Slot").unwrap().unwrap().number, 2);
+        assert_eq!(state(&p.root), old_state());
+        let _saves = saves_lock();
+        assert_eq!(containers(&p.root).len(), 1);
+        drop(_saves);
+        assert_eq!(update(&p.root, "two", &[("a", Some("new a"))]), S_OK);
+        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
+        assert_eq!(state(&p.root), new);
+        assert!(v1.exists() && !v2.exists());
+
+        drop(held);
+        assert_eq!(state(&p.root), new);
+        assert!(!v1.exists());
+        assert_eq!(current_named(&c.dir, "Slot").unwrap().unwrap().number, 3);
+    }
+
+    #[cfg(windows)]
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    #[test]
+    fn remove_tree_removes_everything_or_nothing_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("v1");
+        std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        std::fs::write(tree.join("0"), b"x").unwrap();
+        std::fs::write(tree.join("a").join("b").join("1"), b"y").unwrap();
+        remove_entries(&tree.join("a")).unwrap();
+        assert!(!tree.join("a").exists() && tree.join("0").exists());
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        remove_tree(&tree).unwrap();
     }
 
     #[test]

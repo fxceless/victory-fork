@@ -131,6 +131,18 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
     }
 }
 
+/// What the instruction returns for a node of this `kind` when nothing
+/// the node holds is in the ray's way: no child for a box node (kinds 4
+/// and 5), [`MISS`] for the others. What [`intersect`] returns for a ray
+/// that misses every box or the triangle, without the node's words; the
+/// translation's `VICTORY_RT_MISS` returns it for every node.
+pub fn nothing_in_the_way(kind: u32) -> [u32; 4] {
+    match kind & 7 {
+        4 | 5 => [NONE; 4],
+        _ => MISS.map(f32::to_bits),
+    }
+}
+
 /// A box node's four child pointers.
 pub fn children(words: &[u32; 28]) -> [u32; 4] {
     [words[0], words[1], words[2], words[3]]
@@ -647,6 +659,39 @@ pub(crate) mod tests {
         // Triangle 1 = node vertices (1, 3, 2) = (b, d, c) as vertices 0, 1, 2.
         let got = triangle_vertices(&node, 1);
         assert_eq!(got, [b, d, c]);
+    }
+
+    #[test]
+    fn nothing_in_the_way_is_what_a_ray_that_misses_the_node_gets() {
+        // Boxes along +x, a ray along +y: it misses all four, in both
+        // widths, sorted or not.
+        let children = [0x105, 0x20c, 0x304, 0x400];
+        let boxes = [
+            moved(UNIT, [30.0, 0.0, 0.0]),
+            moved(UNIT, [10.0, 0.0, 0.0]),
+            moved(UNIT, [10.0, 5.0, 0.0]),
+            moved(UNIT, [20.0, 0.0, 0.0]),
+        ];
+        let ray = Ray::new([0.0, 20.0, 0.0], [0.0, 1.0, 0.0], 1000.0);
+        for (node, kind) in [(box32(children, boxes), 5), (box16(children, boxes), 4)] {
+            for sort in [true, false] {
+                assert_eq!(intersect(&node, kind, &ray, sort), nothing_in_the_way(kind));
+            }
+        }
+        // A triangle behind the ray, every triangle slot, and the kinds
+        // the instruction does not read.
+        let node = triangles(&TRIANGLE, 9);
+        let away = Ray::new([0.0; 3], [0.0, 0.0, -1.0], 100.0);
+        for k in 0..8 {
+            if k == 4 || k == 5 {
+                continue;
+            }
+            assert_eq!(intersect(&node, k, &away, true), nothing_in_the_way(k), "kind {k}");
+        }
+        // A box result holds no child, so a traversal pushes nothing; a
+        // triangle result's distance is never below any extent.
+        assert!(nothing_in_the_way(4).iter().all(|&c| c == NONE));
+        assert_eq!(f32::from_bits(nothing_in_the_way(0)[0]), f32::INFINITY);
     }
 
     #[test]

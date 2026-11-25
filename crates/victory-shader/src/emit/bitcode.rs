@@ -326,6 +326,63 @@ impl Module {
         }
     }
 
+    /// The bits of an f32 known when the module is built: a float constant,
+    /// an i32 constant read as a float, or the negation (`-0 - x`) or
+    /// absolute value (FAbs) of one; `None` for anything else.
+    pub fn float_bits(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize] {
+                (_, Const::Float(b)) => Some(b),
+                (t, Const::Int(x)) if self.types[t.0 as usize] == TypeDef::Int(32) => {
+                    Some(x as u32)
+                }
+                _ => None,
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => self.float_bits(*x),
+                Op::Bin(Bin::Sub, z, x)
+                    if self.is_float_inst(i) && self.float_bits(*z) == Some(0x8000_0000) =>
+                {
+                    self.float_bits(*x).map(|b| b ^ 0x8000_0000)
+                }
+                _ => self.fabs_of(v).and_then(|x| self.float_bits(x)).map(|b| b & 0x7FFF_FFFF),
+            },
+            _ => None,
+        }
+    }
+
+    fn is_float_inst(&self, i: u32) -> bool {
+        self.types[self.insts[i as usize].ty.0 as usize] == TypeDef::Float
+    }
+
+    /// `x` where `v` is `|x|` (DXIL FAbs).
+    fn fabs_of(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let Op::Call(f, args) = &self.insts[i as usize].op else {
+            return None;
+        };
+        (self.funcs[*f as usize].name == "dx.op.unary.f32"
+            && args.len() == 2
+            && self.int_value(args[0]) == Some(6))
+        .then_some(args[1])
+    }
+
+    /// The value `v` is zero exactly when: `v` without negations (`-0 - x`)
+    /// and absolute values (FAbs) around it.
+    pub fn zero_root(&self, v: V) -> V {
+        if let V::Inst(i) = v
+            && let Op::Bin(Bin::Sub, z, x) = &self.insts[i as usize].op
+            && self.is_float_inst(i)
+            && self.float_bits(*z) == Some(0x8000_0000)
+        {
+            return self.zero_root(*x);
+        }
+        match self.fabs_of(v) {
+            Some(x) => self.zero_root(x),
+            None => v,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

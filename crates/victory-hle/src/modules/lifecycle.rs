@@ -73,6 +73,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    no_ghosting();
+    let asked = (width, height);
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -81,6 +83,12 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if parent.is_null() && style & wm::WS_CHILD == 0 {
+        // Frames go to the title's biggest top-level window, made or not
+        // yet shown when the first frame comes.
+        #[cfg(windows)]
+        victory_gpu::title_window_made(hwnd as usize, asked.0, asked.1);
+    }
     hwnd
 }
 
@@ -99,6 +107,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    no_ghosting();
+    let asked = (width, height);
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -107,11 +117,38 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if parent.is_null() && style & wm::WS_CHILD == 0 {
+        // Frames go to the title's biggest top-level window, made or not
+        // yet shown when the first frame comes.
+        #[cfg(windows)]
+        victory_gpu::title_window_made(hwnd as usize, asked.0, asked.1);
+    }
     hwnd
 }
 
-/// A console title sizes its window to its render target (
-/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
+/// Turns off window ghosting for the process, once, before the title's
+/// first window: a window whose thread has not taken a message for five
+/// seconds is otherwise covered by a "not responding" ghost the system
+/// paints from what the window last showed through it, which for a window
+/// the swap chain shows and nothing ever painted is white. The title's
+/// window thread stops taking messages while the title loads and while a
+/// frame takes seconds (world loads, a cold shader cache), and the ghost
+/// then stays over every frame presented behind it until the thread takes
+/// messages again. `VICTORY_GHOSTING=1` leaves ghosting on, as before.
+fn no_ghosting() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("VICTORY_GHOSTING").is_some_and(|v| v == "1") {
+            return;
+        }
+        // SAFETY: a plain call with no arguments.
+        unsafe { wm::DisableProcessWindowsGhosting() };
+        tracing::info!("window ghosting off: a title window that stops taking messages keeps showing its frames");
+    });
+}
+
+/// A console title sizes its window to its render target (the title:
+/// 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).

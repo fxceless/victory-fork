@@ -53,6 +53,16 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
+    // VICTORY_RT_MISS (and every other switch the translator reads) is in
+    // `translation_fingerprint`; only the warning is said here.
+    static WARNED_RT: std::sync::Once = std::sync::Once::new();
+    if victory_shader::emit::rt_miss() {
+        WARNED_RT.call_once(|| {
+            tracing::warn!(
+                "VICTORY_RT_MISS: every ray-tracing node test reports a miss (rays find nothing in the way)"
+            )
+        });
+    }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {

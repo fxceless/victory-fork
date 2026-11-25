@@ -153,7 +153,18 @@ What did it, on top of the list below:
   - On by default: fills of upload memory and read-only buffer copies no
     longer wait for flights and are checked against what the flights then
     wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
-    so far); up to 512 idle host lists and texture staging buffers are
+    so far, but the check never saw reads made after a relay wait). In
+    this fork buffer copies wait again (`VICTORY_COPY_AHEAD=1` lets them
+    go ahead): their destination stays in title memory, where the title
+    reads it back. `VICTORY_EARLY_READS` (on; `=0` off) logs a title copy
+    that read bytes shaders then changed, ahead of a flight or before its
+    own submission's lists ran; `VICTORY_COPY_REPAIR=1` puts such a
+    destination right when the flight lands. Run n49 (copies waiting)
+    lost the character's ponytail, n50 (copies ahead) had it, with no
+    early read found. `VICTORY_COPY_ON_CARD=1` (off) records title buffer
+    copies on the card in the list's order, as the console runs them (`=2`
+    only those under writes when recorded): no wait, no read ahead; the
+    frame line counts them and the ones left on the CPU, by reason. Up to 512 idle host lists and texture staging buffers are
     reused instead of made and freed every frame.
   - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
     the layer; it is how the above was found.
@@ -218,6 +229,17 @@ What did it, on top of the list below:
     `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
     `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
     no gain while the card is the limit).
+  - With `VICTORY_ASYNC_SUBMIT=1`, on by default with it (`=0` each
+    reverts; built and unit-tested, not run yet):
+    `VICTORY_ASYNC_PRESENT_WAIT` (a present that finds the one before in
+    the line waits for it to be shown and goes behind too, instead of
+    running every line itself), `VICTORY_ASYNC_FENCE_WAIT` (a blocking
+    fence wait returns when the fence is set, without running the lines
+    on the title's thread and settling everything), `VICTORY_ASYNC_MAPS`
+    (a page mapping first runs the lines, so earlier submissions read the
+    pages as they were). The frame-rate line "submissions prepared by our
+    thread per frame" gives the lines' depth, our thread's preparing
+    beside the title, and where the title waited on the lines.
   - Tried and refused: `VICTORY_BVH_HOLD=1` holds back the 64 programs
     that walk ray-tracing structures nothing has built; the picture loses
     its indirect light with it, so it stays off.
@@ -252,8 +274,10 @@ Memory sync between the title's memory and the copies on the card:
   guarded again in between no longer fails the read.
 - Writes of the storage layer into physical pages are counted where the title
   has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
-  them in every run) and can open the guards there:
-  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
+  them in every run); the guards there are opened and the textures picked by
+  index that were uploaded before such a write are uploaded again (a worker's
+  read from before it is let go). `VICTORY_PAGE_WRITES=guards` opens the
+  guards alone (the default before), `0` counts only, `all` does more.
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
 
 Card memory (the test card is full from the first frame of the world: 85 to
@@ -294,12 +318,15 @@ Rendering:
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
+- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame. Without the relay, `VICTORY_SETTLE_LISTS=1` (off by default) no longer settles everything once a frame at 128 lists in the air: only the flights the card has already run give back their descriptor slots, and the rest keep running while the next submissions are prepared; `=2` also spares the settle for reads of title memory that the flights' compares on the card found unwritten. Since the merge of upstream 9376fd6 the relay is on unless `VICTORY_RELAY=0`, so `VICTORY_SETTLE_LISTS` is not used (a warning says so), and `VICTORY_CARD_NO_PC_COPY=1` is refused under the relay (`=2` forces the mirror).
+- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE=1` windows, `2` also title buffers, `3` also page-pool runs; off by default; a probe confirmed the approach on the test GPU; an `in place per frame` line follows the frame line).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
+
+- `VICTORY_GPU_PROFILE=1` (release builds too) logs every 10 s the 25 pipelines with the most GPU time per frame, by their shaders' hashes, with calls per frame and time per call (`GPU profile #n` lines). Timestamps around the draws and dispatches, read a few frames later: lists are not serialised. Off, it costs nothing.
+- `VICTORY_QUAD_OPS=1` and `VICTORY_CLASS_RANGES=1` (off by default, exact): DPP quad permutations in pixel programs as host quad operations; `v_cmp_class` with a constant mask as range tests (`±inf` in two instructions instead of about twenty).
 
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,

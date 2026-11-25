@@ -688,3 +688,132 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// Sets the tests' `VICTORY_RT_MISS` ([`super::rt_miss`]) for this thread
+/// until dropped.
+struct Miss;
+
+impl Miss {
+    fn on(on: bool) -> Self {
+        super::TEST_RT_MISS.set(Some(on));
+        Self
+    }
+}
+
+impl Drop for Miss {
+    fn drop(&mut self) {
+        super::TEST_RT_MISS.set(None);
+    }
+}
+
+#[test]
+fn with_every_ray_missing_no_node_is_read() {
+    // GPU-free: the program lowers (and validates where the validator is)
+    // without the host's directory of title memory, and without asking
+    // for the structure's descriptor; the same program without the switch
+    // reads its nodes through the directory.
+    for wide in [true, false] {
+        for descriptor in [WHOLE, Descriptor::Table] {
+            let (shader, _) = {
+                let _miss = Miss::on(true);
+                build(wide, descriptor).expect("lowers with every ray missing")
+            };
+            assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+            assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
+            assert!(
+                !shader
+                    .user_data
+                    .iter()
+                    .any(|u| u.root == crate::native::RootType::Other(super::USER_MEMORY_BASE)),
+                "no directory base"
+            );
+        }
+        let _miss = Miss::on(false);
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    }
+}
+
+#[test]
+fn with_every_ray_missing_a_structure_that_returns_triangle_ids_lowers() {
+    // The switch reads nothing of the node, so the refusals about how the
+    // structure is described do not apply.
+    let _miss = Miss::on(true);
+    let mut words = program(true, WHOLE);
+    let flags = words.iter().position(|&w| w == 0x8900_03FF).unwrap();
+    words[flags] = 0x8800_03FF;
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .map(|_| ())
+    .expect("lowers");
+}
+
+#[test]
+fn with_every_ray_missing_the_node_test_returns_nothing_in_the_way_on_the_card() {
+    // Every case of the reference scene, whatever the node holds: no child
+    // for a box node, a triangle miss for the others, and the registers
+    // untouched in threads that do not run the instruction.
+    let _miss = Miss::on(true);
+    let (scene, batches) = scene();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (wide, descriptor) in [(true, WHOLE), (false, Descriptor::Table)] {
+        let (shader, _) = build(wide, descriptor).expect("the program lowers");
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            for (b, batch) in batches.iter().enumerate() {
+                let data = buffer(&scene, batch, u64::from(NODES));
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![0; 5]))],
+                            views: &[
+                                View::Buffer {
+                                    data: &data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4 * THREADS),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                for t in 0..THREADS as usize {
+                    let want = match batch.get(t).copied().flatten() {
+                        Some((_, kind, _)) => bvh::nothing_in_the_way(kind),
+                        None => BEFORE,
+                    };
+                    let got = &out[0][4 * t..4 * t + 4];
+                    assert_eq!(got, want, "{label}, wide {wide}, batch {b} thread {t}");
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device available");
+    }
+}
