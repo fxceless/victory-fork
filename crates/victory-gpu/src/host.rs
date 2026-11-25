@@ -824,6 +824,11 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Alias copies left to the prelude (`crate::texture::alias_once`).
+    aliases: Mutex<Vec<crate::texture::AliasCopy>>,
+    /// The host copies the list puts in a state that writes them (keys of
+    /// `states`), for [`ALIAS_WRITES`].
+    written: Mutex<std::collections::HashSet<usize>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -890,6 +895,33 @@ const GATHER_SETS: usize = 8;
 /// made with one all the same: twice the host objects per list, for the
 /// title's 630 lists and for every list made anew.
 /// `VICTORY_LAZY_PRELUDE=0`: made with the list, as before.
+/// The write marks of [`crate::texture::alias_once`], kept at submission:
+/// the submissions' numbers, the last one that wrote each host copy (by
+/// the copy's address), and the last one that made each alias copy (by
+/// source copy and placed copy).
+///
+/// The marks are keyed by the host copies' addresses, and each holds a weak
+/// reference to its copies: while a mark lives, the allocation behind its
+/// address cannot be freed and handed to another copy, so a new pair can
+/// never inherit an old pair's mark. Marks of copies that are gone are swept
+/// once there are many.
+#[derive(Default)]
+struct AliasWrites {
+    seq: u64,
+    written: std::collections::HashMap<usize, (u64, AliasWeak)>,
+    copied: std::collections::HashMap<(usize, usize), (u64, AliasWeak, AliasWeak)>,
+}
+
+type AliasWeak = std::sync::Weak<crate::resource::HostTexture>;
+
+/// Marks past which [`AliasWrites`] sweeps the ones whose copies are gone.
+const ALIAS_MARKS_SWEEP: usize = 4096;
+
+static ALIAS_WRITES: Mutex<Option<AliasWrites>> = Mutex::new(None);
+
+/// Alias copies left to preludes: made, and left out (source unwritten).
+pub(crate) static ALIAS_COUNTS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
@@ -3838,6 +3870,8 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                aliases: Mutex::default(),
+                written: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -6017,6 +6051,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.written.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
@@ -6054,6 +6090,32 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
+    /// With [`crate::texture::alias_once`]: notes that the list writes host
+    /// copy `key` if `state` is one that writes.
+    fn note_write(&self, key: usize, state: u32) {
+        // Render target, unordered access, depth write, stream out, copy
+        // destination, resolve destination.
+        const WRITES: u32 = 0x4 | 0x8 | 0x10 | 0x100 | 0x400 | 0x1000;
+        if crate::texture::alias_once() && state & WRITES != 0 {
+            self.written.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+        }
+    }
+
+    /// Whether the list has used title texture `resource`'s host copy yet.
+    pub(crate) fn touches(&self, resource: crate::object::This) -> bool {
+        crate::resource::host_copy(resource).is_some_and(|copy| {
+            self.states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(std::sync::Arc::as_ptr(&copy) as usize))
+        })
+    }
+
+    /// Leaves an alias copy to the list's prelude.
+    pub(crate) fn alias_at_submission(&self, copy: crate::texture::AliasCopy) {
+        self.aliases.lock().unwrap_or_else(|e| e.into_inner()).push(copy);
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -6066,6 +6128,7 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        self.note_write(std::sync::Arc::as_ptr(&copy) as usize, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -6085,6 +6148,7 @@ impl HostList {
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
+        self.note_write(std::sync::Arc::as_ptr(copy) as usize, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -6341,7 +6405,44 @@ impl HostList {
         // The records the list's draws read from slots (`crate::indirect::gather`).
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if barriers.is_empty() && syncs.is_empty() && !gathered {
+        // Alias copies (`crate::texture::alias_once`): this submission gets
+        // a number; a copy runs unless it ran in a submission after the
+        // source's last write; then this list's writes are marked.
+        type Run = (ID3D12Resource, ID3D12Resource, std::sync::Arc<crate::texture::Through>);
+        let aliases: Vec<Run> = {
+            let wanted = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            let written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+            let mut marks = ALIAS_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+            let marks = marks.get_or_insert_with(Default::default);
+            let mut run = Vec::new();
+            if !wanted.is_empty() || !written.is_empty() {
+                marks.seq += 1;
+                let seq = marks.seq;
+                for a in wanted.iter() {
+                    let source = std::sync::Arc::as_ptr(&a.source) as usize;
+                    let key = (source, std::sync::Arc::as_ptr(&a.placed) as usize);
+                    let last_write = marks.written.get(&source).map_or(0, |w| w.0);
+                    let fresh = marks.copied.get(&key).is_some_and(|c| last_write < c.0);
+                    ALIAS_COUNTS[usize::from(fresh)].fetch_add(1, Ordering::Relaxed);
+                    if !fresh {
+                        let weak = (std::sync::Arc::downgrade(&a.source), std::sync::Arc::downgrade(&a.placed));
+                        marks.copied.insert(key, (seq, weak.0, weak.1));
+                        run.push((a.source.texture.clone(), a.to.clone(), a.through.clone()));
+                    }
+                }
+                for &key in written.iter() {
+                    if let Some((_, _, copy)) = states.get(&key) {
+                        marks.written.insert(key, (seq, std::sync::Arc::downgrade(copy)));
+                    }
+                }
+                if marks.copied.len() + marks.written.len() > ALIAS_MARKS_SWEEP {
+                    marks.copied.retain(|_, c| c.1.strong_count() > 0 && c.2.strong_count() > 0);
+                    marks.written.retain(|_, w| w.1.strong_count() > 0);
+                }
+            }
+            run
+        };
+        if barriers.is_empty() && syncs.is_empty() && !gathered && aliases.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6364,6 +6465,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for (from, to, through) in &aliases {
+                    crate::texture::record_alias(list, from, to, through);
                 }
                 if gathered {
                     // The slots must hold clamped records before a draw
@@ -7696,6 +7800,10 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
+        }
+        if crate::texture::alias_once() {
+            let [made, left] = [0, 1].map(|i| ALIAS_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!("alias copies in preludes per frame (VICTORY_ALIAS_ONCE=1): {made:.1} made, {left:.1} left out (source not written since)");
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
