@@ -575,6 +575,71 @@ fn reupload_when_full() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
 }
 
+/// Every how many passes the pass over the heap's buffer views
+/// (`State::heap_buffers`) looks at every buffer slot, and not only the ones
+/// written since (`VICTORY_HEAP_RESCAN_FRAMES`, 16 by default; VItoriaBr
+/// 5a84eb4 (uiliannn) takes 64). That pass took 96.7 ms of one recording
+/// thread every 16th frame on an RTX 5080. Longer, a view whose
+/// resource the title released without writing the slot, or a slot written
+/// before its memory had a host copy, waits that much longer: stale buffer
+/// data for shaders that pick buffers by index.
+pub(crate) fn heap_rescan_frames() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RESCAN_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(16)
+    })
+}
+
+/// Whether the pass over the heap's buffer views looks at every buffer slot
+/// once in [`heap_rescan_frames`] passes a share at a time, a slot in the
+/// pass `slot % N` (with the slots written since, as every pass), rather
+/// than all of them in one pass every N (`VICTORY_HEAP_RESCAN_SPREAD=1`, off
+/// by default). Each slot is looked at again as often as before, and no
+/// frame takes the whole: that one pass was 96.7 ms of a recording thread
+/// every 16th frame (RTX 5080, Ryzen 7 9800X3D).
+pub(crate) fn heap_rescan_spread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RESCAN_SPREAD").is_some_and(|v| v == "1"))
+}
+
+/// The slots pass number `passes` over the heap's buffer views looks at,
+/// and what it forgets of `ranges` (by slot, what the last look found):
+/// with `(every, spread)` as [`heap_rescan_frames`] and
+/// [`heap_rescan_spread`] say, `changed` the slots written since the last
+/// pass and `all` the buffer slots (`Some((k, n))`: those `slot % n == k`).
+/// - Not spread: every buffer slot, all of `ranges` forgotten, once in
+///   `every` passes; otherwise the slots written since.
+/// - Spread: the buffer slots of this pass's share (`slot % every ==
+///   passes % every`) and the slots written since, sorted, and what
+///   `ranges` held of that share forgotten.
+fn pass_slots<V>(
+    passes: u64,
+    (every, spread): (u64, bool),
+    changed: Vec<u32>,
+    all: impl FnOnce(Option<(u64, u64)>) -> Vec<u32>,
+    ranges: &mut std::collections::HashMap<u32, V>,
+) -> Vec<u32> {
+    let every = every.max(1);
+    if !spread {
+        if passes.is_multiple_of(every) {
+            ranges.clear();
+            return all(None);
+        }
+        return changed;
+    }
+    let share = passes % every;
+    ranges.retain(|&slot, _| u64::from(slot) % every != share);
+    let mut slots = all(Some((share, every)));
+    slots.extend(changed);
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -1560,9 +1625,10 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // at best); all of them every 16 passes (`heap_rescan_frames`),
+        // because a view of a released resource goes stale without a write,
+        // and a slot written before its memory had a host copy is only made
+        // then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
@@ -1572,12 +1638,13 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let slots = pass_slots(
+            *passes,
+            (heap_rescan_frames(), heap_rescan_spread()),
+            changed,
+            |stripe| host.buffer_slots_striped(stripe),
+            ranges,
+        );
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -3737,6 +3804,72 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::pass_slots;
+
+    /// The pass over buffer views: not spread, every buffer slot once in N
+    /// passes with all that was found forgotten, the slots written since in
+    /// the others (as before the switch). Spread, every buffer slot is
+    /// looked at exactly once in any N passes in a row, with the slots
+    /// written since in each; after N passes nothing found before is left
+    /// (not of slots that left the set either), and what was found of the
+    /// slots looked at stays.
+    #[test]
+    fn every_buffer_slot_is_looked_at_once_in_n_passes() {
+        let set: Vec<u32> = (0..5000u32).filter(|i| i % 7 != 3).collect();
+        let all = |stripe: Option<(u64, u64)>| -> Vec<u32> {
+            set.iter().copied().filter(|&i| stripe.is_none_or(|(k, n)| u64::from(i) % n == k)).collect()
+        };
+        for every in [1u64, 16, 64] {
+            // Not spread.
+            let mut ranges: std::collections::HashMap<u32, u64> = (0..6000).map(|i| (i, 0)).collect();
+            for passes in 0..3 * every {
+                let changed = vec![3, 10, 17];
+                let slots = pass_slots(passes, (every, false), changed.clone(), all, &mut ranges);
+                if passes % every == 0 {
+                    assert_eq!(slots, set);
+                    assert!(ranges.is_empty());
+                } else {
+                    assert_eq!(slots, changed);
+                }
+                ranges.extend(slots.iter().map(|&i| (i, passes)));
+            }
+            // Spread: entries of slots no longer in the set (written before,
+            // say) go within N passes too.
+            let mut ranges: std::collections::HashMap<u32, u64> = (0..6000).map(|i| (i, u64::MAX)).collect();
+            let mut looked: Vec<u64> = vec![0; 6000];
+            for passes in 0..2 * every {
+                let changed = vec![(passes * 37 % 5000) as u32];
+                let slots = pass_slots(passes, (every, true), changed.clone(), all, &mut ranges);
+                assert!(slots.windows(2).all(|w| w[0] < w[1]), "sorted, each once");
+                assert!(slots.contains(&changed[0]));
+                for &i in &slots {
+                    looked[i as usize] += 1;
+                }
+                ranges.extend(slots.iter().map(|&i| (i, passes)));
+                if passes + 1 == every {
+                    for &i in &set {
+                        assert!(looked[i as usize] >= 1, "every {every}: slot {i} not looked at in {every} passes");
+                    }
+                    assert!(
+                        ranges.values().all(|&found| found != u64::MAX),
+                        "every {every}: something found before the first {every} passes is left"
+                    );
+                }
+            }
+            // Over 2N passes each buffer slot twice (once in each N), the
+            // slots written since apart.
+            let written: std::collections::HashSet<u32> = (0..2 * every).map(|p| (p * 37 % 5000) as u32).collect();
+            for &i in &set {
+                if !written.contains(&i) {
+                    assert_eq!(looked[i as usize], 2, "every {every}: slot {i}");
+                }
+            }
+        }
     }
 }
 

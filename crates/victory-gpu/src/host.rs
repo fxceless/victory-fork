@@ -7854,9 +7854,15 @@ impl Meter {
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views                  (every buffer slot every {} passes, VICTORY_HEAP_RESCAN_FRAMES, {})",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                crate::draw::heap_rescan_frames(),
+                if crate::draw::heap_rescan_spread() {
+                    "a share in each pass (VICTORY_HEAP_RESCAN_SPREAD=1)"
+                } else {
+                    "all in one pass (VICTORY_HEAP_RESCAN_SPREAD=1: a share in each)"
+                },
             );
         }
         crate::shadow::exact_line(frames);

@@ -1517,6 +1517,16 @@ impl HostHeap {
         buffers.iter().copied().collect()
     }
 
+    /// [`HostHeap::buffer_slots`]; with `Some((k, n))` only the slots
+    /// `slot % n == k` (a share of them, `VICTORY_HEAP_RESCAN_SPREAD`).
+    pub(crate) fn buffer_slots_striped(&self, stripe: Option<(u64, u64)>) -> Vec<u32> {
+        let Some((k, n)) = stripe else {
+            return self.buffer_slots();
+        };
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.iter().copied().filter(|&slot| u64::from(slot) % n == k).collect()
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
