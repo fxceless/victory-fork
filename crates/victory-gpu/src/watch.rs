@@ -81,6 +81,17 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// Drops what the journal holds of `[start, end)` (tests: memory that is
+/// let go, whose address another test may get).
+#[cfg(test)]
+fn forget(start: usize, end: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let pages: Vec<usize> = j.written.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    for page in pages {
+        j.written.remove(&page);
+    }
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -1571,12 +1582,16 @@ mod tests {
     }
 
     /// The section of [`two_views`] is closed and its views unmapped; the
-    /// guard is told they are gone first.
+    /// guard is told they are gone first, and the journal forgets their
+    /// pages (a test that gets the addresses next, write-watched memory
+    /// say, would find them written: `written_pages_are_reported_to_every_asker`
+    /// failed so once).
     fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
             title_memory_remapped(view, bytes);
+            forget(view, view + bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
