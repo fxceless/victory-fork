@@ -817,23 +817,28 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
-        };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: a fixed-size feature query for this device and the matching structure.
+        let reported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                std::ptr::from_mut(&mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }.is_ok() && options.MaxViewDescriptorHeapSize != 0;
+        let views = if reported {
+            options.MaxViewDescriptorHeapSize.min(UNCAPPED_VIEWS)
         } else {
-            PORTABLE_VIEWS
+            // Older runtimes do not expose the optional larger heap size.
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: UNCAPPED_VIEWS,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            };
+            // SAFETY: plain heap creation; the heap is released at once.
+            let probe: windows::core::Result<ID3D12DescriptorHeap> = unsafe { host.device.CreateDescriptorHeap(&desc) };
+            if probe.is_ok() { UNCAPPED_VIEWS } else { PORTABLE_VIEWS }
         };
         tracing::info!(
             views,
@@ -3111,6 +3116,29 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shader_view_limit_fits_the_reported_heap() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: output storage matches the device feature query.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                std::ptr::from_mut(&mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.MaxViewDescriptorHeapSize != 0
+        {
+            super::probe_view_limit();
+            let limit = victory_shader::emit::view_heap_limit();
+            assert!(limit < options.MaxViewDescriptorHeapSize);
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
