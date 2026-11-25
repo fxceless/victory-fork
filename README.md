@@ -80,7 +80,7 @@ numbers are estimates until a run carries them.**
 - **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
   the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
   with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
-- `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
+- [timing-run-295s-2026-11-25.txt](https://github.com/fxceless/victory-fork/blob/dc4c0fcd71bdb1233cca5b55befb77e4f8c2a344/diagnostics/timing-run-295s-2026-11-25.txt): a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
 
