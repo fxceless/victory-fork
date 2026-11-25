@@ -135,6 +135,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Until this frame a texture the guard did not see change is hashed at
+    /// every check ([`Staging::unseen_write`]).
+    unguarded: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1017,16 +1020,28 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // A texture the guard did not see change, hashed, and found changed
+        // all the same: it is hashed at every check for a while. The intro's
+        // movie is three pictures in turn that changed only every eighth
+        // frame, one old picture after another on the screen, which is one
+        // of the abrupt image changes at launch. (From DexNom's fork.)
+        let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            // A linear picture of one level is what the processor draws (the
+            // planes of a movie), through a view of its own: always hashed.
+            let desc = &self.layout.desc;
+            let film = desc.swizzle == victory_formats::texture::Swizzle::LINEAR && desc.mips == 1;
+            if unwritten && !turn && !film && frame >= last.unguarded {
                 return 0;
             }
+            unseen = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1088,6 +1103,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                if unseen && last.hash.is_some() {
+                    self.unseen_write(last);
+                }
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1109,6 +1127,15 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// The guard did not see a write to this texture, and the hash found it
+    /// changed anyway: hash it at every check for a while, so that a picture
+    /// that changes unseen is not shown up to eight frames late.
+    fn unseen_write(&self, last: &mut Last) {
+        let frame = crate::frame::current();
+        let more = if frame < last.unguarded { 120 } else { 16 };
+        last.unguarded = frame + more;
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):

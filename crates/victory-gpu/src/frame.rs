@@ -25,6 +25,30 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// The shortest interval this layer will keep, whatever the title asks:
+/// 120 frames a second, as if the display reported 120 Hz. The title sets
+/// its interval from the modes we report (`crate::dxgi`), and on the
+/// console it takes the lowest one that is a whole number of ticks at 60
+/// Hz, which is 30 frames a second; this makes the shortest it can take
+/// 8.33 ms, so its own frame limit no longer holds it at 30. `VICTORY_MIN_INTERVAL_US`
+/// sets another (0: keep whatever the title asks, as before this).
+fn least_interval() -> Duration {
+    static LEAST: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| {
+        let us = std::env::var("VICTORY_MIN_INTERVAL_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(8_333);
+        Duration::from_micros(us)
+    })
+}
+
+/// `asked` microseconds as the interval to keep: never shorter than
+/// [`least_interval`].
+fn kept_interval(asked: Duration) -> Duration {
+    asked.max(least_interval())
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
@@ -51,7 +75,7 @@ pub(crate) extern "system" fn set_interval(
 ) -> HRESULT {
     let interval = match length {
         0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
+        us => kept_interval(Duration::from_micros(u64::from(us))),
     };
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
@@ -207,7 +231,9 @@ mod tests {
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
-        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        // Under the shortest interval this layer keeps (120 frames a
+        // second, [`least_interval`]), so the test paces at what it asks.
+        assert_eq!(set_interval(null, null, 5_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
         let before = Instant::now();
@@ -228,11 +254,20 @@ mod tests {
         assert!(early == second + 1 && next == early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
+        // What the title asks is kept from [`least_interval`] up: 120
+        // frames a second, and nothing faster, whatever it says.
+        assert_eq!(set_interval(null, null, 33_333, 1, 0), S_OK);
+        let asked = clock().as_ref().map(|c| c.interval);
+        assert_eq!(asked, Some(Duration::from_micros(33_333)));
+        assert_eq!(set_interval(null, null, 4_000, 1, 0), S_OK);
+        let fast = clock().as_ref().map(|c| c.interval);
+        assert_eq!(fast, Some(least_interval()), "a title asking for 250 frames a second keeps 120");
+
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        assert_eq!(set_interval(null, null, 9_000, 3, 0), S_OK);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {

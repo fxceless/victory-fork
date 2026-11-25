@@ -359,12 +359,37 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    // Slot 0x218 is `CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC*,
+    // ...)`: the description it gets is a size and a stream of subobjects,
+    // the same the method at 0x1a8 takes, so it is made the same way.
+    // `VICTORY_PIPELINE_STREAM=0` refuses it again, as it always did.
+    //
+    // What the title asks for there: its state objects. Every description
+    // seen in a run (13 calls) begins with a subobject of type 0x1c, a
+    // console type (a pipeline library or a state object's own state),
+    // whose stream the reader does not know: the shaders a state object
+    // needs (ray tracing) are not among the standard types, so what is
+    // handed back here is a pipeline of no stages. It answers `S_OK` and the
+    // title goes on; it is not a ray-tracing pipeline.
+    static STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if SLOT == 0x218 && *STREAM.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_STREAM").is_none_or(|v| v != "0")) {
+        // SAFETY: the title passes a description of its own; the reader
+        // checks its size against the stream it is given.
+        let made = crate::pipeline::create_stream(std::ptr::null_mut(), desc.cast(), iid, out);
+        if made >= 0 {
+            if calls <= 4 || calls.is_power_of_two() {
+                tracing::info!(calls, "a pipeline made from a stream the title passed at slot 0x218");
+            }
+            return made;
+        }
+        tracing::warn!(calls, ?made, "a stream pipeline at slot 0x218 could not be made");
+    }
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };

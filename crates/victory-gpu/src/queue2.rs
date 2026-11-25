@@ -60,8 +60,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-/// `VICTORY_QUEUE2`, a sum of bits; unset or 0: off, everything goes
-/// through the one direct queue as before.
+/// `VICTORY_QUEUE2`, a sum of bits; unset: 1 in this branch (fetches of what
+/// shaders wrote to copies in the card's memory go to a copy queue, beside
+/// the relay); `VICTORY_QUEUE2=0` puts everything through the one direct
+/// queue as before.
 ///
 /// - 1: fetches of what shaders wrote to copies in the card's memory go to
 ///   a copy queue (the gain is with `VICTORY_RELAY=1`/`2`; without the
@@ -75,7 +77,7 @@ use windows::core::Interface;
 /// Read once, when the first submission asks.
 pub(crate) fn bits() -> u32 {
     static BITS: OnceLock<u32> = OnceLock::new();
-    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3)
+    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1) & 3)
 }
 
 /// The most bytes of landing buffers in the card's memory, for title

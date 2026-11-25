@@ -581,7 +581,8 @@ struct Guards {
 }
 
 /// Whether a block once guarded stays known as view memory while its
-/// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
+/// guard is open (`VICTORY_VIEW_KNOWN=0` turns it off; **on by default in
+/// this branch**).
 ///
 /// A range whose first block the title wrote since the last check has
 /// that block neither read-only nor noted absent, so nothing says it is a
@@ -600,9 +601,9 @@ fn view_known() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_VIEW_KNOWN").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,

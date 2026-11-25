@@ -1127,21 +1127,381 @@ mod host {
         }
     }
 
+    /// The HID gamepad's side of [`Host`]: a pad Windows offers over HID
+    /// (a DualSense, a DualShock 4, a Switch Pro pad) read as the XInput
+    /// pad the title asks for. Such a pad is not an XInput device, so
+    /// before this it was not there at all; the title reads XInput only.
+    ///
+    /// The pad's first report is read whole and every usage of the
+    /// gamepad page taken from it by its usage number, so the report's
+    /// layout (which differs between a DualSense, a DualShock 4 and a
+    /// Switch Pro pad) is the one Windows reports, not a table of ours.
+    /// The next reports are read when the pad has one waiting; a pad
+    /// whose reports do not come is opened again every two seconds.
+    #[cfg(windows)]
+    mod hid {
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+            SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+            SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+        };
+        use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+            HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes,
+            HidD_GetPreparsedData, HidD_GetHidGuid, HidP_GetCaps, HidP_GetUsageValue, HidP_GetUsages,
+            PHIDP_PREPARSED_DATA,
+        };
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+            INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        use windows_sys::Win32::UI::Input::XboxController::{
+            XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
+            XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
+            XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
+            XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START,
+            XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        };
+
+        /// The generic desktop page, the gamepad usage, and the usages of
+        /// the gamepad page XInput's own buttons are.
+        const DESKTOP: u16 = 0x01;
+        const GAMEPAD: u16 = 0x05;
+        const PAGE: u16 = 0x05;
+        /// Usages of the button page that are a gamepad's buttons.
+        const BUTTONS: [(u32, u16); 14] = [
+            (1, XINPUT_GAMEPAD_X),
+            (2, XINPUT_GAMEPAD_A),
+            (3, XINPUT_GAMEPAD_B),
+            (4, XINPUT_GAMEPAD_Y),
+            (5, XINPUT_GAMEPAD_LEFT_SHOULDER),
+            (7, XINPUT_GAMEPAD_RIGHT_SHOULDER),
+            (8, XINPUT_GAMEPAD_BACK),
+            (9, XINPUT_GAMEPAD_START),
+            (10, XINPUT_GAMEPAD_LEFT_THUMB),
+            (11, XINPUT_GAMEPAD_RIGHT_THUMB),
+            (12, XINPUT_GAMEPAD_DPAD_UP),
+            (13, XINPUT_GAMEPAD_DPAD_DOWN),
+            (14, XINPUT_GAMEPAD_DPAD_LEFT),
+            (15, XINPUT_GAMEPAD_DPAD_RIGHT),
+        ];
+        /// The usages of the gamepad page a stick or a trigger is, and how
+        /// a title's XInput value comes from them.
+        const LEFT_X: u32 = 0x30;
+        const LEFT_Y: u32 = 0x31;
+        const RIGHT_X: u32 = 0x32;
+        const RIGHT_Y: u32 = 0x33;
+        const LEFT_TRIGGER: u32 = 0x32 + 0x00;
+        /// Reports read before the pad is opened again: a pad whose reports
+        /// stop (it was unplugged) is looked for again after this long.
+        pub(super) const REOPEN: std::time::Duration = std::time::Duration::from_secs(2);
+        /// The biggest report Windows offers for a HID device.
+        const REPORT: usize = 512;
+
+        /// An opened pad: its file, its preparations, and the size of the
+        /// reports it sends.
+        pub(super) struct Pad {
+            handle: HANDLE,
+            preparsed: PHIDP_PREPARSED_DATA,
+            input: usize,
+            /// The report read when the pad was opened: its first state.
+            first: Vec<u8>,
+            /// What the pad last sent, if it sent anything since.
+            latest: Vec<u8>,
+            read: bool,
+        }
+
+        // SAFETY: the handle is used by the hub's poll thread only (the hub
+        // holds its source under a lock), and Windows allows one reader at
+        // a time.
+        unsafe impl Send for Pad {}
+
+        impl Drop for Pad {
+            fn drop(&mut self) {
+                // SAFETY: both were given to us by Windows, above.
+                unsafe {
+                    HidD_FreePreparsedData(self.preparsed);
+                    CloseHandle(self.handle);
+                }
+            }
+        }
+
+        impl Pad {
+            /// The first HID device Windows presents that says it is a
+            /// gamepad, opened for reading and writing (the light and the
+            /// motors of a DualSense are written to it, if the title asks
+            /// for rumble).
+            pub(super) fn open() -> Option<Pad> {
+                let mut guid: windows_sys::core::GUID = unsafe { std::mem::zeroed() };
+                // SAFETY: room for the GUID it writes.
+                unsafe { HidD_GetHidGuid(&mut guid) };
+                // SAFETY: a plain enumeration, freed below.
+                let set: HDEVINFO = unsafe {
+                    SetupDiGetClassDevsW(&guid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+                };
+                if set == INVALID_HANDLE_VALUE as HDEVINFO {
+                    return None;
+                }
+                let mut found = None;
+                for index in 0..16u32 {
+                    let mut interface = SP_DEVICE_INTERFACE_DATA {
+                        cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                        ..Default::default()
+                    };
+                    // SAFETY: the struct says its size, as the call asks.
+                    if unsafe { SetupDiEnumDeviceInterfaces(set, std::ptr::null_mut(), &guid, index, &mut interface) } == 0 {
+                        break;
+                    }
+                    let mut needed = 0u32;
+                    // SAFETY: asking for the size only (no buffer).
+                    let _ = unsafe {
+                        SetupDiGetDeviceInterfaceDetailW(set, &interface, std::ptr::null_mut(), 0, &mut needed, std::ptr::null_mut())
+                    };
+                    if needed == 0 {
+                        continue;
+                    }
+                    let mut buffer = vec![0u8; needed as usize];
+                    let detail = buffer.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+                    // SAFETY: the buffer holds what the call asked for.
+                    unsafe { (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 };
+                    let mut info = SP_DEVINFO_DATA {
+                        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                        ..Default::default()
+                    };
+                    // SAFETY: the same, with room for the path.
+                    let asked = unsafe {
+                        SetupDiGetDeviceInterfaceDetailW(set, &interface, detail, needed, std::ptr::null_mut(), &mut info)
+                    };
+                    if asked == 0 {
+                        continue;
+                    }
+                    let path = unsafe { (*detail).DevicePath.as_ptr() };
+                    if let Some(pad) = Self::open_path(path) {
+                        found = Some(pad);
+                        break;
+                    }
+                }
+                // SAFETY: the set was given to us above.
+                unsafe { SetupDiDestroyDeviceInfoList(set) };
+                found
+            }
+
+            fn open_path(path: *const u16) -> Option<Pad> {
+                // SAFETY: a device path from Windows, opened read-write and
+                // shared as the pads are.
+                let handle = unsafe {
+                    CreateFileW(
+                        path,
+                        (GENERIC_READ | GENERIC_WRITE) as u32,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if handle == INVALID_HANDLE_VALUE {
+                    return None;
+                }
+                let mut preparsed: PHIDP_PREPARSED_DATA = 0;
+                // SAFETY: a handle we opened, and room for the pointer.
+                if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {
+                    // SAFETY: ours, and nothing was given.
+                    unsafe { CloseHandle(handle) };
+                    return None;
+                }
+                let mut caps = HIDP_CAPS::default();
+                // SAFETY: preparations Windows gave us, and room for the caps.
+                let got = unsafe {
+                    HidP_GetCaps(preparsed, &mut caps)
+                };
+                let gamepad = got == HIDP_STATUS_SUCCESS && caps.UsagePage == DESKTOP && caps.Usage == GAMEPAD;
+                if !gamepad {
+                    // SAFETY: both ours.
+                    unsafe {
+                        HidD_FreePreparsedData(preparsed);
+                        CloseHandle(handle);
+                    }
+                    return None;
+                }
+                let mut attributes = HIDD_ATTRIBUTES {
+                    Size: size_of::<HIDD_ATTRIBUTES>() as u32,
+                    ..Default::default()
+                };
+                // SAFETY: room for the attributes.
+                let _ = unsafe { HidD_GetAttributes(handle, &mut attributes) };
+                let mut pad = Pad {
+                    handle,
+                    preparsed,
+                    input: (caps.InputReportByteLength as usize).clamp(1, REPORT),
+                    first: Vec::new(),
+                    latest: Vec::new(),
+                    read: false,
+                };
+                pad.first = pad.read_report()?;
+                tracing::info!(
+                    vendor = format!("{:04x}", attributes.VendorID),
+                    product = format!("{:04x}", attributes.ProductID),
+                    report = pad.input,
+                    "a HID pad is read as an XInput pad (a DualSense, a DualShock 4, a Switch Pro pad)"
+                );
+                Some(pad)
+            }
+
+            /// The next report the pad sent, if one is waiting.
+            fn read_report(&mut self) -> Option<Vec<u8>> {
+                use windows_sys::Win32::Storage::FileSystem::ReadFile;
+                use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+                let mut report = vec![0u8; self.input];
+                let mut read = 0u32;
+                // SAFETY: an overlapped read on our handle, waited for with
+                // its own event; the buffer outlives the wait.
+                unsafe {
+                    let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+                    if event.is_null() {
+                        return None;
+                    }
+                    let mut overlapped: OVERLAPPED = std::mem::zeroed();
+                    overlapped.hEvent = event;
+                    let ok = ReadFile(
+                        self.handle,
+                        report.as_mut_ptr(),
+                        report.len() as u32,
+                        &mut read,
+                        &mut overlapped,
+                    );
+                    let waited = if ok == 0 && GetLastError() == ERROR_IO_PENDING {
+                        WaitForSingleObject(event, 0) == WAIT_OBJECT_0
+                            && GetOverlappedResult(
+                                self.handle,
+                                &overlapped,
+                                &mut read,
+                                0,
+                            ) != 0
+                    } else {
+                        ok != 0
+                    };
+                    CloseHandle(event);
+                    if !waited || read == 0 {
+                        return None;
+                    }
+                }
+                report.truncate(read as usize);
+                Some(report)
+            }
+
+            /// The pad's state as XInput's own struct, from the report.
+            pub(super) fn state(&self) -> XINPUT_GAMEPAD {
+                let report = if self.latest.is_empty() { &self.first } else { &self.latest };
+                let mut pad = XINPUT_GAMEPAD::default();
+                let mut usages = [0u16; 32];
+                let mut count = usages.len() as u32;
+                // SAFETY: preparations and a report Windows gave us, and a
+                // list of usages with its room.
+                let asked = unsafe {
+                    HidP_GetUsages(
+                        0, // HidP_Input
+                        PAGE,
+                        0,
+                        usages.as_mut_ptr(),
+                        &mut count,
+                        self.preparsed,
+                        report.as_ptr().cast_mut(),
+                        report.len() as u32,
+                    )
+                };
+                if asked == HIDP_STATUS_SUCCESS as i32 {
+                    for &usage in &usages[..count as usize] {
+                        if let Some(&(_, button)) = BUTTONS.iter().find(|(u, _)| *u == u32::from(usage)) {
+                            pad.wButtons |= button;
+                        }
+                    }
+                }
+                let value = |usage: u32| {
+                    let mut out = 0u32;
+                    // SAFETY: as above, one usage's value.
+                    let got = unsafe {
+                        HidP_GetUsageValue(
+                            0,
+                            PAGE,
+                            0,
+                            usage as u16,
+                            &mut out,
+                            self.preparsed,
+                            report.as_ptr(),
+                            report.len() as u32,
+                        )
+                    };
+                    if got == HIDP_STATUS_SUCCESS { Some(out) } else { None }
+                };
+                // A stick reports 0 to 255 (some pads to 4095): 128 is the
+                // middle, and XInput's range is -32768 to 32767.
+                let stick = |raw: u32, top: u32| -> i16 {
+                    let mid = top / 2;
+                    let v = i32::try_from(raw.min(top)).unwrap_or(0) - mid as i32;
+                    (v * 32767 / mid as i32).clamp(-32768, 32767) as i16
+                };
+                let top = |usage: u32, fallback: u32| value(usage).map_or(fallback, |v| if v <= 255 { 255 } else { 4095 });
+                if let Some(raw) = value(LEFT_X) {
+                    pad.sThumbLX = stick(raw, top(LEFT_X, 255));
+                }
+                if let Some(raw) = value(LEFT_Y) {
+                    // HID counts a stick up as the value growing, XInput as
+                    // it falling.
+                    pad.sThumbLY = stick(raw, top(LEFT_Y, 255)).saturating_neg();
+                }
+                if let Some(raw) = value(RIGHT_X) {
+                    pad.sThumbRX = stick(raw, top(RIGHT_X, 255));
+                }
+                if let Some(raw) = value(RIGHT_Y) {
+                    pad.sThumbRY = stick(raw, top(RIGHT_Y, 255)).saturating_neg();
+                }
+                if let Some(raw) = value(LEFT_TRIGGER) {
+                    pad.bLeftTrigger = raw.min(255) as u8;
+                }
+                pad
+            }
+
+            /// Reads what the pad sent since the last call; false once the
+            /// pad stopped answering (it was unplugged).
+            pub(super) fn poll(&mut self) -> bool {
+                while let Some(report) = self.read_report() {
+                    self.latest = report;
+                    self.read = true;
+                }
+                // A pad that sends nothing for a while is not gone (a pad at
+                // rest sends nothing): the hub opens it again only when a
+                // read fails, which is when it was unplugged.
+                true
+            }
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// A HID pad, when no XInput one is there (`hid`): looked for at the
+        /// first empty read, then again every [`hid::REOPEN`].
+        #[cfg(windows)]
+        hid: Option<hid::Pad>,
+        #[cfg(windows)]
+        hid_looked: Option<Instant>,
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                // Still the HID pad's turn, if there is one (`hid`).
+                return self.hid_pad(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return self.hid_pad(slot);
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
@@ -1195,6 +1555,40 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    impl Host {
+        /// The HID pad as XInput slot 0 (`hid`): the first XInput slot is
+        /// the one a title reads for its main player, and a HID pad is not
+        /// an XInput device at all. Looked for when no XInput pad is there,
+        /// and again every two seconds while none is.
+        fn hid_pad(&mut self, slot: usize) -> Option<PadState> {
+            #[cfg(not(windows))]
+            {
+                let _ = slot;
+                None
+            }
+            #[cfg(windows)]
+            {
+                if slot != 0 {
+                    return None;
+                }
+                if std::env::var_os("VICTORY_HID_PAD").is_some_and(|v| v == "0") {
+                    return None;
+                }
+                let now = Instant::now();
+                if self.hid.is_none() && self.hid_looked.is_none_or(|at| now >= at) {
+                    self.hid_looked = Some(now + hid::REOPEN);
+                    self.hid = hid::Pad::open();
+                }
+                let pad = self.hid.as_mut()?;
+                if !pad.poll() {
+                    self.hid = None;
+                    return None;
+                }
+                Some(convert(&pad.state()))
+            }
         }
     }
 

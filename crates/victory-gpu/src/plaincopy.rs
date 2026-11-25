@@ -55,16 +55,20 @@ unsafe extern "C" {
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (`VICTORY_COPY_PLAIN=0` turns it off; **on by default** in this branch
+/// on x86-64, where the submit thread's kernel time fell from 44 to 20 ms
+/// a frame with it). See [`on`]'s description in the README for what it
+/// assumes.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let on = cfg!(target_arch = "x86_64")
+            && std::env::var("VICTORY_COPY_PLAIN").map_or(true, |v| v != "0");
         if on {
             install();
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there (VICTORY_COPY_PLAIN=0 turns this off)"
             );
         }
         on

@@ -59,6 +59,12 @@ pub(crate) enum C {
     BackCompared,
     /// Reading around unmapped pages after a failed bulk read.
     SparseUs,
+    /// Pieces of a copy in the card's memory that a fetch brought down
+    /// whole instead of asking the compare which of them changed.
+    FetchWholePieces,
+    /// Pieces a fetch left out of its copy list, joined with the piece
+    /// before them (a piece by page the title's frame reads).
+    FetchJoined,
     /// Guarding view memory (part of the write-watch askings' time).
     GuardUs,
     /// Bytes copied whole because their memory is neither write-watched
@@ -1099,7 +1105,7 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks; fetches {:.0} pieces whole, {:.0} joined; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1120,6 +1126,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        c[C::FetchWholePieces as usize],
+        c[C::FetchJoined as usize],
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),

@@ -2019,7 +2019,19 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]) or 3
+/// ([`late_free_present`]).
+///
+/// **3 by default in this branch**: the card and the submitting thread no
+/// longer take turns (run 86: 134 ms preparing, then 194 ms waiting for
+/// the card, then 78 ms copying back, one after the other). What it costs
+/// is described where each stage is used: the title is told a frame's
+/// fences and bottom-of-pipe values when the card has run it, and a
+/// submission reads title memory as the card found it, not as the title
+/// left it afterwards - which is what the console does. `VICTORY_LATE_WAIT=0`
+/// restores the one-submission-at-a-time behaviour of earlier runs, for
+/// telling a picture problem caused by this from one that was there
+/// before.
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -2027,12 +2039,13 @@ fn late_stage() -> u8 {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+            Ok("0") => 0,
             Ok("1") => 1,
             Ok("2") => 2,
             Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
+            Ok(_) => 3,
+            // Nothing said: this branch's default.
+            _ => 3,
         }
     })
 }
@@ -2060,8 +2073,8 @@ fn late_exact() -> bool {
     late_stage() > 1
 }
 
-/// Stage 3 of [`late`] (`VICTORY_LATE_WAIT=3`: stage 2, and the present is
-/// no longer a point where flights are settled). The copy to the back
+/// Stage 3 of [`late`] (`VICTORY_LATE_WAIT=3`, this branch's default: stage
+/// 2, and the present is no longer a point where flights are settled). The copy to the back
 /// buffer is sent as a flight of its own (`Host::execute_own`, a list of
 /// its own for each present in the air) and the swap chain is told to
 /// present behind it; the queue's call returns, and the card finishes the
@@ -2078,9 +2091,10 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
-/// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
-/// and is off with it, in the timing run and with kept snapshots).
+/// The relay's first stage (`VICTORY_RELAY=1` or `2`, **on by default in
+/// this branch**: [`relay`] reads it unless `VICTORY_RELAY=0` says
+/// otherwise; it needs [`late`] at stage 3, and is off with it, in the
+/// timing run and with kept snapshots).
 ///
 /// With [`late`] alone every settle does three things on the thread that
 /// holds the submission lock: it waits for everything in the air, copies
@@ -4556,6 +4570,32 @@ impl Host {
         }
         if inflight_fetch() {
             INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        // One copy a piece becomes fewer copies. A piece of 64 KiB asked
+        // for as several (the title's frame reads the middle of a page, a
+        // few bytes at a time) is copied with the piece before it: the
+        // extra bytes cost a copy far less than the copy does (from
+        // DexNom's fork, "GPU readback combines adjacent copy ranges").
+        // `VICTORY_FETCH_JOIN=0` copies each piece on its own.
+        static JOIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let join = *JOIN.get_or_init(|| std::env::var_os("VICTORY_FETCH_JOIN").is_none_or(|v| v != "0"));
+        if join && pieces.len() > 1 {
+            // The pieces come in the copy lists' order (by copy, then by
+            // offset), so a run is a contiguous stretch of one copy. Each
+            // run is copied once, into the slot its first piece was given.
+            let mut joined: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
+                Vec::with_capacity(pieces.len());
+            for (shadow, lo, hi, at) in pieces.drain(..) {
+                match joined.last_mut() {
+                    Some(last) if std::sync::Arc::ptr_eq(&last.0, &shadow) && last.2 == lo => {
+                        last.2 = hi;
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::FetchJoined, 1);
+                    }
+                    _ => joined.push((shadow, lo, hi, at)),
+                }
+            }
+            pieces = joined;
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();

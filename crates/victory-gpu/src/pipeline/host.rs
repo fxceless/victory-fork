@@ -169,6 +169,43 @@ impl GraphicsState {
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
+                // The rasterizer's forced sample count, as this branch's
+                // debug message printed it (the last 8 bytes of the type
+                // 10 subobject); the stream the title sends leaves it out.
+                0x1000_000a => {
+                    self.rasterizer.ForcedSampleCount = data
+                        .add(size_of::<D3D12_RASTERIZER_DESC>())
+                        .cast::<u32>()
+                        .read_unaligned()
+                }
+                // Render target formats the stream names one at a time
+                // (D3D12's own types 1 and 2 of the console's numbering).
+                // Only those a pipeline of this one did not already name
+                // are read: the last subobject of a kind wins.
+                0x1000_0015 => {
+                    let n = (self.targets.NumRenderTargets as usize).min(8);
+                    let format = crate::resource::target_format(crate::resource::pc_format(
+                        data.cast::<u32>().read_unaligned(),
+                    )) as i32;
+                    if n < 8 {
+                        self.targets.RTFormats[n] = DXGI_FORMAT(format);
+                        self.targets.NumRenderTargets = n as u32 + 1;
+                    }
+                }
+                0x1000_0016 => {
+                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
+                    self.depth = D3D12_DEPTH_STENCIL_DESC {
+                        DepthEnable: d.DepthEnable,
+                        DepthWriteMask: d.DepthWriteMask,
+                        DepthFunc: d.DepthFunc,
+                        StencilEnable: d.StencilEnable,
+                        StencilReadMask: d.StencilReadMask,
+                        StencilWriteMask: d.StencilWriteMask,
+                        FrontFace: d.FrontFace,
+                        BackFace: d.BackFace,
+                    };
+                }
                 _ => {}
             }
         }

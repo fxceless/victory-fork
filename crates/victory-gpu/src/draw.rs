@@ -136,12 +136,24 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// The most records clamped in one pass ([`windows`]). A pass costs the
+/// card a switch from drawing to compute and back, whatever the number of
+/// records in it: 64 records a pass against 3,460 records a frame was 54
+/// passes a frame, and the draw budget of a frame is often shorter than
+/// that. `VICTORY_INDIRECT_WINDOW_MOST` sets it (4 to 4096).
+fn window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_WINDOW_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |n| n.clamp(4, 4096))
+    })
+}
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=0` turns
+/// them off; **on by default** in this branch, see [`windows`]).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -152,7 +164,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// With the switch, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
-/// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
+/// apart after it (16, then twice as many each time, [`window_most`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours and no barrier (the scratch
@@ -185,9 +197,21 @@ const WINDOW_MOST: u64 = 64;
 /// Off for the rest of the run from the first error the card's driver
 /// reports to the system (`crate::drvwatch`): every loss of the card in a
 /// run with windows was announced that way seconds ahead.
+///
+/// On by default in this branch (`VICTORY_INDIRECT_WINDOW=0` restores the
+/// per-record clamp). What changed since the switch was off by default:
+/// the record a window would draw is checked against a fresh clamp of
+/// itself before every windowed draw unless `VICTORY_INDIRECT_WINDOW_CHECK=0`
+/// says otherwise ([`crate::indirect::window_check`]; the check was off by
+/// default too), and the recording of a window's records stopped building
+/// the list of every draw's pipeline name (`shortcut:` [`State::note_op`]
+/// formats its text only when device-removed data is on), which the
+/// measured frame paid for on every one of its 3,400 to 6,700 records.
+/// The clamp itself is unchanged; run 201 and 204's losses were records of
+/// 2^24 vertices an instance, which the clamp now leaves empty.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
 /// Whether a record that is not on the window's walk opens a window of its
@@ -1728,6 +1752,17 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
+        // A full card makes no texture (`crate::resource::room`), and the
+        // pass then walks its queue to say so: the question is asked once
+        // here, and the pass is left out while the answer is no (unless
+        // `VICTORY_FULL_CARD_PASS=0` asks for the old walk, which brings
+        // slots up to date and lets go of what nothing names even when the
+        // card is full). In the test machine's world the card is full from
+        // the first frame, so that was a walk of 18,000 slots a frame that
+        // could not make one.
+        if !crate::resource::room_lately() && full_card_pass() {
+            return;
+        }
         let bake = bake && left > 0;
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
@@ -3268,7 +3303,7 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / step).min(window_most()) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                         } else {
                             (stride, max)

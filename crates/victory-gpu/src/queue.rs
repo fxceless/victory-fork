@@ -441,8 +441,9 @@ pub(crate) fn release_held(all: bool) {
 
 /// Whether a submission is only put in its queue's line by the thread
 /// that submits it, and prepared and sent by a thread of ours
-/// (`VICTORY_ASYNC_SUBMIT=1`; needs flights and lists cut at their waits,
-/// both defaults).
+/// (`VICTORY_ASYNC_SUBMIT=0` turns it off; **on by default in this branch**,
+/// where the flights are late and the lists cut at their waits are both
+/// defaults too).
 ///
 /// Why: the profile of run 213 (292 ms a frame) has the title's render
 /// thread inside `queue::execute` for 202 ms of every frame: 155 ms in
@@ -469,9 +470,9 @@ pub(crate) fn release_held(all: bool) {
 pub(crate) fn behind() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
+        let on = std::env::var("VICTORY_ASYNC_SUBMIT").map_or(true, |v| v != "0") && crate::host::late() && cuts();
         if on {
-            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
+            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=0: not)");
             let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
         }
         on

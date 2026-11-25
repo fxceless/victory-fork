@@ -46,8 +46,11 @@
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
-//! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! every other texture is made as before. **On by default in this branch**
+//! (`VICTORY_LEVELS_ON_DEMAND=0` turns it off): it was measured here as
+//! 3.1 GB of the card not allocated for levels the title does not hold, and
+//! no device loss. Its own hazards are listed above; the first thing to try
+//! if a texture shows the wrong bytes is to turn it off.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -72,13 +75,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
-/// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// (`VICTORY_LEVELS_ON_DEMAND=0` turns it off; **on by default in this
+/// branch**), and a card that reads zeros from, and drops writes to, levels
+/// without memory (tiled resources tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var("VICTORY_LEVELS_ON_DEMAND").is_ok_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +102,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=0 turns this off)"
         );
         on
     })

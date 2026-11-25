@@ -632,9 +632,9 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (`VICTORY_RELAY=1` or `2`, **on by default in this branch**; not with
+/// kept snapshots, [`keeps`]). `crate::host::relay` says what it does; here
+/// it changes what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -653,7 +653,9 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v != "0") && !keeps()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1327,7 +1329,26 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // A quarter of the logical processors, kept between 2 and 6 in the
+        // first form of this. The work these threads take (a submission's
+        // refreshes, the snapshots and compares of declared ranges, the
+        // merge of what shaders wrote to card copies) is the largest part of
+        // the frame that is not the card, and the title's own recording
+        // threads stand idle most of the time it runs; on a 28-thread
+        // processor 6 of them were the ceiling of a frame of 136 ms whose
+        // "copies" and "copy-back" were 81 ms. Eight now, and
+        // `VICTORY_WIDE_THREADS` sets the number (0: the submitting thread
+        // alone, as before this).
+        static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let n = *THREADS.get_or_init(|| {
+            std::env::var("VICTORY_WIDE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 8)
+                })
+                .min(32)
+        });
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
