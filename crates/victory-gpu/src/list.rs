@@ -1542,6 +1542,41 @@ mod state {
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
+    /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
+    /// values, rectangle count, rectangles)`. (After upstream
+    /// Marvisak/VIctory 0b35b7f: the AMD upscaler DLL calls it.)
+    pub(super) extern "system" fn clear_unordered_uint(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, false, items(rects, count));
+    }
+    /// `ClearUnorderedAccessViewFloat`, the same with four floats.
+    pub(super) extern "system" fn clear_unordered_float(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, true, items(rects, count));
+    }
+    fn clear_unordered(this: This, cpu: u64, values: *const [u32; 4], float: bool, rects: &[RECT]) {
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        with_state(this, |list, s| {
+            s.clear_unordered(list, cpu, values, float, rects);
+        });
+    }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
@@ -1694,6 +1729,8 @@ mod state {
     pub(super) use super::draw as dispatch_mesh;
     pub(super) use super::draw as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
+    pub(super) use super::ignored_state as clear_unordered_float;
+    pub(super) use super::ignored_state as clear_unordered_uint;
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
@@ -2163,7 +2200,10 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 12] = [
+    (53, state::clear_unordered_uint as *const ()), // 0x1a8
+    (54, state::clear_unordered_float as *const ()), // 0x1b0
+    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0

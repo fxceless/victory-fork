@@ -5879,6 +5879,30 @@ impl Host {
         }
     }
 
+    /// CPU-only UAV descriptor for this recording thread. It can be reused
+    /// once the clear has been recorded. Other threads may still be preparing
+    /// older lists when this thread records its next clear.
+    pub(crate) fn clear_view(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        thread_local! {
+            static HEAP: std::cell::OnceCell<Option<ID3D12DescriptorHeap>> =
+                const { std::cell::OnceCell::new() };
+        }
+        HEAP.with(|slot| {
+            let heap = slot.get_or_init(|| {
+                // SAFETY: the device is live and the description is initialized.
+                unsafe {
+                    self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                }.ok()
+            }).as_ref()?;
+            // SAFETY: the thread owns the heap throughout recording.
+            Some(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
+        })
+    }
+
     /// A host depth view of `resource`, valid until it is recorded.
     pub(crate) fn dsv(
         &self,

@@ -1647,6 +1647,29 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// The two identical descriptors an unordered access clear needs. Resolve
+    /// the view once so a change to the resource behind it cannot split them.
+    pub(crate) fn make_clear_view(
+        &self,
+        index: u32,
+        view: &View,
+        cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<ID3D12Resource> {
+        let device = &host()?.device;
+        let resource = make(view, cpu).flatten()?;
+        // SAFETY: cpu is a CPU-only view, index a reserved shader-visible slot.
+        unsafe {
+            device.CopyDescriptorsSimple(
+                1,
+                self.cpu(index),
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        self.keep(index, Some(resource.clone()));
+        Some(resource)
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {

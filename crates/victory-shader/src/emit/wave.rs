@@ -143,6 +143,12 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// `v_readlane_b32` results after the restore, in the same block, that read one
+    /// constant lane of a value the section wrote: what that lane holds. (The AMD
+    /// upscaler's compiler ends a wave reduction this way: the halves' results are
+    /// combined into the upper half's lanes and the last lane is read once EXEC is back,
+    /// so the value itself has no one shape.)
+    pub late: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -180,8 +186,25 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lanes) = simulate(&insts[i + 1..end], wave, saved);
+        let all = if wave == 64 { u64::MAX } else { u64::from(u32::MAX) };
+        let mut late = HashMap::new();
+        for after in &insts[end + 1..] {
+            if let Fields::Valu(v) = &after.fields
+                && after.name() == "v_readlane_b32"
+                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let Some(lane) = crate::resource::lane_of(lane)
+                && let Some(sym) = after
+                    .read(Reg::V(reg))
+                    .and_then(|x| lanes.get(&x))
+                    .and_then(|l| l.get(lane as usize))
+                && let Some(shape) = single(*sym, all)
+                && let Some(&(_, w)) = after.writes.first()
+            {
+                late.insert(w, shape);
+            }
+        }
+        out.insert(i, Section { end, shapes, late });
         i = end + 1;
     }
     out
@@ -268,7 +291,12 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// The shapes of the values `insts` (a section's) write, and each VGPR value's lanes.
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+) -> (HashMap<Value, Shape>, HashMap<Value, Vec<Sym>>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -289,7 +317,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (shapes(&vec, uni, wave), vec);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -304,7 +332,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (shapes(&vec, uni, wave), vec);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -664,7 +692,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (shapes(&vec, uni, wave), vec)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -690,7 +718,7 @@ fn constant(inst: &Inst) -> Option<u64> {
 
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
+    vec: &HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
 ) -> HashMap<Value, Shape> {
@@ -700,7 +728,22 @@ fn shapes(
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+    for (v, s) in uni {
+        if let Some(sh) = single(s, all) {
+            out.insert(v, sh);
+        }
+    }
+    for (&v, lanes) in vec {
+        if let Some(sh) = per_lane(lanes, all) {
+            out.insert(v, sh);
+        }
+    }
+    out
+}
+
+/// The shape of a value that is `s` in every lane, or of one lane read as a scalar.
+fn single(s: Sym, all: u64) -> Option<Shape> {
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -718,18 +761,7 @@ fn shapes(
             high,
         } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
-    };
-    for (v, s) in uni {
-        if let Some(sh) = single(s) {
-            out.insert(v, sh);
-        }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
-        }
-    }
-    out
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {

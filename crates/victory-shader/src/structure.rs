@@ -22,6 +22,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::resource::lane_of;
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -431,6 +432,10 @@ pub struct Structured {
     /// ballot there gives the mask as data. No split low dword, as in
     /// `masks`.
     pub active: HashSet<Value>,
+    /// `v_readlane_b32` results of a constant lane: the SGPR value that
+    /// `v_writelane_b32` spilled to that lane, the same along every path.
+    /// (After upstream Marvisak/VIctory 0b35b7f.)
+    pub restored: HashMap<Value, Value>,
     /// Incoming lane boolean per predecessor edge (in block predecessor order)
     /// for each [`Atom::Phi`] id.
     pub phi_masks: HashMap<Value, Vec<Bool>>,
@@ -530,6 +535,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::restored`].
+    restored: Map<Value, Value>,
     /// See [`Structured::wide`].
     wide: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
@@ -594,7 +601,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        Ok(Lanes {
+        let mut l = Lanes {
             p,
             order,
             index,
@@ -614,11 +621,67 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            restored: Map::default(),
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
-        })
+        };
+        for inst in blocks.iter().flat_map(|b| &b.insts) {
+            if let Fields::Valu(v) = &inst.fields
+                && inst.name() == "v_readlane_b32"
+                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let Some(lane) = lane_of(lane)
+                && let Some(spill) = inst.read(Reg::V(reg))
+                && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
+                && let Some(&(_, r)) = inst.writes.first()
+            {
+                l.restored.insert(r, s);
+            }
+        }
+        Ok(l)
     }
+
+    /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
+    /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.spilled(a, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+
 
     fn reset(&mut self) {
         self.b = Bools::new();
@@ -848,6 +911,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            restored: self.restored.into_iter().collect(),
             wide: self.wide,
             wave_any: self.wave_any,
             scc_some: self
@@ -1096,6 +1160,9 @@ impl<'a> Lanes<'a> {
                 let scc = inst.read(Reg::Scc)?;
                 if self.clear_after_loop(scc) {
                     (c, None)
+                } else if let Some(own) = self.own_select(inst) {
+                    derived = true;
+                    (self.b.ite(own, a, c), None)
                 } else {
                     let born = self.born(scc);
                     let u = self.b.atom(Atom::Uniform(scc), born);
@@ -1114,6 +1181,80 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// For a lane-width `s_cselect -1, 0` on the SCC of a mask operation ("some lane's bit
+    /// is set", [`Self::scc_lane`]) whose result only reaches the test that closes its
+    /// block: the lane's own bit of that operation. The AMD upscaler's passes begin with
+    /// loops that wait for other thread groups this way: `s_and m, m, exec`,
+    /// `s_cselect a, -1, 0`, a count's `s_cmp` and `s_cselect b, -1, 0`, `s_orn2 a, b, a`,
+    /// `s_cbranch_scc0` - "some lane still waits and the count is not up", kept as two
+    /// all-or-nothing masks. As with a branch on such an SCC itself, each lane then goes by
+    /// its own bit; the count's mask is the SCC it was selected by ([`Atom::Uniform`]).
+    /// Anything else that reads the selection would see the lane's bit where the console
+    /// has the wave's, so it is not taken this way.
+    fn own_select(&self, inst: &Inst) -> Option<Bool> {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let (name, suffix) = if self.p.wave64 {
+            ("s_cselect_b64", "_b64")
+        } else {
+            ("s_cselect_b32", "_b32")
+        };
+        // (inline -1 and 0)
+        if inst.name() != name || !matches!(src[..], [Operand::Const(193), Operand::Const(128)]) {
+            return None;
+        }
+        let scc = inst.read(Reg::Scc)?;
+        let own = *self.scc_lane.get(&scc)?;
+        if self.scc_every.contains(&scc) {
+            return None;
+        }
+        let &(b, i) = self.defs.get(&inst.writes.first()?.1)?;
+        let block = &self.p.blocks[b];
+        // The selection and what is combined from it, the instructions that may read
+        // those, and the SCCs they set.
+        let mut held: Vec<Value> = inst.writes.iter().map(|w| w.1).collect();
+        let (mut readers, mut tests) = (Vec::new(), Vec::new());
+        for (j, next) in block.insts.iter().enumerate().skip(i + 1) {
+            if !next.reads.iter().any(|r| held.contains(&r.1)) {
+                continue;
+            }
+            let op = next.name().strip_prefix("s_").and_then(|n| n.strip_suffix(suffix));
+            if !op.is_some_and(|o| {
+                matches!(o, "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor")
+            }) {
+                return None;
+            }
+            for &(reg, v) in &next.writes {
+                match reg {
+                    Reg::Scc => tests.push(v),
+                    Reg::S(code) if code != EXEC && code != EXEC + 1 => held.push(v),
+                    _ => return None,
+                }
+            }
+            readers.push(j);
+        }
+        let closes = |bb: usize, j: usize, x: &Inst| {
+            bb == b && j + 1 == block.insts.len() && x.name().starts_with("s_cbranch_scc")
+        };
+        for (bb, other) in self.p.blocks.iter().enumerate() {
+            let joined = |v: &Value| held.contains(v) || tests.contains(v);
+            if other.phis.iter().any(|phi| phi.args.iter().any(joined)) {
+                return None;
+            }
+            for (j, x) in other.insts.iter().enumerate() {
+                for (_, v) in &x.reads {
+                    if held.contains(v) && !(bb == b && readers.contains(&j))
+                        || tests.contains(v) && !closes(bb, j, x)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        (!tests.is_empty()).then_some(own)
     }
 
     /// Whether SCC value `scc` is clear wherever it is read: the instruction before an
@@ -1196,7 +1337,7 @@ impl<'a> Lanes<'a> {
                 }
                 let touches_exec =
                     inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
-                if (takes_mask || touches_exec)
+                if (takes_mask || touches_exec || self.own_select(inst).is_some())
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
                     for (k, m) in r.dst.into_iter().chain(r.exec) {

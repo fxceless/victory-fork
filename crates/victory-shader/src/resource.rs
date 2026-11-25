@@ -1118,10 +1118,18 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view.
+        // (after upstream Marvisak/VIctory 0b35b7f, for the AMD upscaler's programs)
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
@@ -1460,6 +1468,45 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The words of a buffer descriptor that `words` makes raw, as the
+    /// FidelityFX upscaler's compiler does before byte accesses: the stride
+    /// (dword 1 bits 16-29) cleared, the record count times max(stride, 1),
+    /// out-of-bounds checking by bytes (dword 3 bits 28-29 set). The bounds
+    /// are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -2315,7 +2362,7 @@ impl Tracer<'_> {
 }
 
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -2331,6 +2378,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
+    // immediate sampler's word.
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2343,6 +2396,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // shortcut: a literal below 2^31, whose high dword is 0 whether the
+        // hardware extends it with zeros or with its sign.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;

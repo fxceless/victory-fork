@@ -1096,6 +1096,23 @@ impl State {
         true
     }
 
+    fn bind_heaps(&mut self, list: &HostList) {
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -1112,20 +1129,7 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2199,6 +2203,65 @@ impl State {
     /// a window ([`windows`]).
     fn may_store(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
+    /// `ClearUnorderedAccessViewUint` or `...Float` (`float`): the view the
+    /// title made at `cpu` (its CPU handle; the GPU one names the same view
+    /// in the bound heap) cleared to `values` on the host, through a
+    /// dynamic slot of the bound view heap that the list holds until reset.
+    /// The AMD upscaler DLL clears its buffers and textures this way.
+    /// (After upstream Marvisak/VIctory 0b35b7f.)
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        cpu: u64,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
+        let Some(view @ View::Unordered(..)) = crate::descriptor::view(cpu) else {
+            once!("an unordered access clear of a slot without a view");
+            return;
+        };
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+            once!("an unordered access clear without a bound view heap");
+            return;
+        };
+        let Some(visible) = heap.host() else { return };
+        let Some(slot) = visible.dynamic(1) else {
+            return;
+        };
+        let Some((at, resource)) = host.clear_view().and_then(|at| {
+            visible.make_clear_view(slot, &view, at).map(|resource| (at, resource))
+        }) else {
+            visible.release(slot, 1);
+            once!("an unordered access clear of a view the host cannot make");
+            return;
+        };
+        self.dynamic
+            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        // What the clear writes to a buffer's host copy goes back to title
+        // memory, as a shader's stores do.
+        self.window = None;
+        list.gather_close();
+        let stores = STORES.replace(true);
+        readable(list, ResourceType::Uav, &view);
+        STORES.set(stores);
+        self.bind_heaps(list);
+        list.keep(&resource);
+        let gpu = visible.gpu_handle(slot);
+        // SAFETY: an open list; both slots view the live resource.
+        unsafe {
+            if float {
+                let values = values.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
+        }
     }
 
     /// Runs a dispatch on the host.
