@@ -596,6 +596,8 @@ mod host {
 mod tests {
     use super::*;
 
+    // (Windows paths: off Windows a backslash does not separate folders)
+    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -654,6 +656,8 @@ mod tests {
         );
     }
 
+    // (Windows paths: off Windows a backslash does not separate folders)
+    #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

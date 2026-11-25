@@ -177,6 +177,8 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    // (title file calls reach the drive through the Windows file layer)
+    #[cfg(windows)]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;

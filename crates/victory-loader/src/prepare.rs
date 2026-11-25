@@ -173,7 +173,8 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
     Ok(())
 }
 
-#[cfg(test)]
+// (they prepare their own test binary, a Windows executable only on Windows)
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

@@ -7,8 +7,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
+use victory_shader::emit;
+#[cfg(not(windows))]
+use offline::{Host, Validator, host};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -863,4 +868,56 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Off Windows the batch translates and reports as on Windows, but there is
+/// no DXIL validator (`--validate`) and no D3D12 (`--pipelines`, pairs):
+/// these stand-ins refuse, so asking for either fails at the start.
+#[cfg(not(windows))]
+mod offline {
+    use victory_shader::emit::HostShader;
+
+    const NOT_HERE: &str = "needs Windows (dxil.dll, D3D12)";
+
+    pub struct Validator;
+
+    impl Validator {
+        pub fn default_path() -> Option<std::path::PathBuf> {
+            None
+        }
+        pub fn load(_: Option<&std::path::Path>) -> Result<Self, String> {
+            Err(NOT_HERE.into())
+        }
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            Err(NOT_HERE.into())
+        }
+    }
+
+    pub struct Host;
+
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, String> {
+            Err(NOT_HERE.into())
+        }
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NOT_HERE.into())
+        }
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NOT_HERE.into())
+        }
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            Err(NOT_HERE.into())
+        }
+    }
+
+    pub mod host {
+        use super::{HostShader, NOT_HERE};
+
+        pub fn stub_ps() -> HostShader {
+            unreachable!("{NOT_HERE}: no host to make a pipeline on")
+        }
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err(NOT_HERE.into())
+        }
+    }
 }
