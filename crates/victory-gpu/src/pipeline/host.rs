@@ -91,6 +91,49 @@ impl Default for GraphicsState {
     }
 }
 
+/// Whether `format` is an integer (UINT/SINT) render target format, which
+/// the host cannot blend.
+fn integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format.0,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+    )
+}
+
+impl GraphicsState {
+    /// The blend description for the host: blending off for integer render
+    /// targets. The console's blender passes integer targets through; D3D12
+    /// calls blending one an error (debug layer message 676, "The render
+    /// target format at slot 2 is format (R8_UINT). This format does not
+    /// support blending": a G-buffer pass of Grand Theft Auto VI), and what
+    /// NVIDIA's driver writes there is undefined. Without independent blend
+    /// the first slot's description holds for all, so it is spread to every
+    /// slot first. `VICTORY_FIX_INTBLEND=0`: the title's description as is.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        if std::env::var_os("VICTORY_FIX_INTBLEND").is_some_and(|v| v == "0") {
+            return blend;
+        }
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        let blends = |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        if !(0..n).any(|i| integer_format(self.targets.RTFormats[i]) && blends(i)) {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in 0..n {
+            if integer_format(self.targets.RTFormats[i]) {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                blend.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+        blend
+    }
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -176,6 +219,11 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// The blend as the host pipeline is made with it ([`Self::host_blend`]):
+    /// named by the title's, a pipeline stored before the integer slots
+    /// lost their blend (or with `VICTORY_FIX_INTBLEND` the other way) kept
+    /// its name, and the library would refuse it at every run (its
+    /// description no longer matches) without storing the new one.
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -195,7 +243,7 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -575,7 +623,19 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            // A mesh program whose outputs pass D3D12's 32 KiB is linked with this pixel
+            // program ([`linked`]): the pipeline gets the two made for each other, which bind
+            // as the shared translations do.
+            let pair = stages.get(1).and_then(|(ps, _)| linked(ms, ps));
+            let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            };
+            let (ms_code, ps_code) = match &pair {
+                Some(pair) => (bytecode(&pair.0.dxil), bytecode(&pair.1.dxil)),
+                None => (code(0), code(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -583,10 +643,10 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -634,7 +694,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -841,6 +901,59 @@ fn graphics_depth_bounds_pipeline(
     }
 }
 
+/// The mesh program `ms` and the pixel program `ps` translated for one pipeline
+/// ([`victory_shader::emit::link_mesh`]), when `ms`'s outputs pass D3D12's 32 KiB as it is
+/// translated alone: 71 of the title's mesh programs (pedestrian, vehicle and prop transforms
+/// with fire, spatter, decal and transmission variants) declare 65 to 71 output components
+/// for 128 vertices, which the validator refuses; NVIDIA's driver built them anyway. Linked,
+/// the mesh program writes only the outputs `ps` reads and `ps` declares only the inputs it
+/// reads. Made once per pair (both programs translated again, not kept on disk: the pipeline
+/// library keeps the pipeline); `None` when `ms` fits, or the pair does not link (then the
+/// pipeline is made of the shared translations, as before). `VICTORY_MESH_LINK=0` turns it
+/// off.
+fn linked(
+    ms: &Arc<Shader>,
+    ps: &Arc<Shader>,
+) -> Option<Arc<(victory_shader::emit::HostShader, victory_shader::emit::HostShader)>> {
+    type Pair = Option<Arc<(victory_shader::emit::HostShader, victory_shader::emit::HostShader)>>;
+    static PAIRS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), Pair>>> =
+        std::sync::Mutex::new(None);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LINK").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let (tm, tp) = (ms.translated()?, ps.translated()?);
+    // (most mesh programs fit: nothing more to do for them)
+    if victory_shader::emit::mesh_fits(&tm.host.dxil).unwrap_or(true) {
+        return None;
+    }
+    let key = (ms.hash.clone(), ps.hash.clone());
+    if let Some(pair) = PAIRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&key) {
+        return pair.clone();
+    }
+    // (translated outside the lock: two workers on one pair translate it twice at worst)
+    let pair = match victory_shader::emit::link_mesh(&ms.container, &tm.host, &ps.container, &tp.host) {
+        Ok(Some(pair)) => {
+            tracing::info!(shaders = ?[ms, ps], "mesh outputs over 32 KiB: the pair is linked for its pipeline");
+            Some(Arc::new(pair))
+        }
+        Ok(None) => {
+            tracing::warn!(shaders = ?[ms, ps], "mesh outputs over 32 KiB, and the pair does not link");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(shaders = ?[ms, ps], error = %e, "mesh outputs over 32 KiB, and the pair does not translate linked");
+            None
+        }
+    };
+    PAIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key, pair.clone());
+    pair
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -881,7 +994,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +1013,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1115,7 +1228,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1315,5 +1428,73 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn state(formats: &[i32], independent: bool, enable: &[bool]) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = formats.len() as u32;
+        for (i, &f) in formats.iter().enumerate() {
+            g.targets.RTFormats[i] = DXGI_FORMAT(f);
+        }
+        g.blend.IndependentBlendEnable = independent.into();
+        for (i, &e) in enable.iter().enumerate() {
+            g.blend.RenderTarget[i].BlendEnable = e.into();
+        }
+        g
+    }
+
+    #[test]
+    fn float_targets_keep_the_title_blend() {
+        // R8G8B8A8_UNORM, R16G16B16A16_FLOAT
+        let g = state(&[28, 10], false, &[true]);
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn an_integer_target_under_shared_blend_turns_off_there_only() {
+        // UNORM, UNORM, R8_UINT under one shared, enabled blend.
+        let g = state(&[28, 28, 62], false, &[true]);
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1].SrcBlend, g.blend.RenderTarget[0].SrcBlend);
+    }
+
+    #[test]
+    fn independent_blend_turns_off_only_the_integer_slot() {
+        let g = state(&[28, 57], true, &[true, true]);
+        let b = g.host_blend();
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn the_name_follows_the_host_blend() {
+        // The integer slot blends in one description and not in the other:
+        // the host makes the same pipeline of both, under the same name.
+        let a = state(&[28, 62], true, &[true, true]);
+        let b = state(&[28, 62], true, &[true, false]);
+        assert_ne!(format!("{:?}", a.blend), format!("{:?}", b.blend));
+        assert_eq!(a.describe(), b.describe());
+        // A float slot's blend still tells pipelines apart.
+        let c = state(&[28, 62], true, &[false, false]);
+        assert_ne!(a.describe(), c.describe());
+    }
+
+    #[test]
+    fn an_integer_target_that_does_not_blend_changes_nothing() {
+        let g = state(&[28, 62], true, &[true, false]);
+        let b = g.host_blend();
+        assert_eq!(b.RenderTarget[1].BlendEnable, g.blend.RenderTarget[1].BlendEnable);
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
     }
 }
