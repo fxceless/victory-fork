@@ -44,6 +44,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod present_audit;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]

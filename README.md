@@ -235,6 +235,12 @@ Tools and diagnostics:
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
+- `VICTORY_PRESENT_AUDIT=1` (diagnostics builds) logs the time between
+  host `Present` calls returning `S_OK` under `victory_present_audit`. It
+  counts other statuses and errors separately. The intervals measure host
+  call completions and can include repeated frames. To show the reports
+  with a custom log filter, include `victory_present_audit=info` in
+  `VICTORY_LOG`.
 
 ### What this fork changed (summary)
 

@@ -7369,6 +7369,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    #[cfg(feature = "diagnostics")]
+    audit: Option<crate::present_audit::PresentAudit>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -7800,7 +7802,13 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if let Some(audit) = &mut p.audit {
+                audit.record(frame, result);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = result;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -7852,6 +7860,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                audit: crate::present_audit::PresentAudit::configured(),
             })
         }
     }
