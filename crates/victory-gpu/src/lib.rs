@@ -24,6 +24,7 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+pub mod display;
 #[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]

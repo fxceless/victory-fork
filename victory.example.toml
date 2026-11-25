@@ -17,3 +17,11 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+# The window the title is shown in. Both keys are optional.
+# [display]
+# Presents per second at most (0 = no limit).   env: VICTORY_FPS_LIMIT
+# fps_limit = 60
+# "windowed" or "borderless" (a popup over the monitor). F11 or Alt+Enter
+# switch while running.   env: VICTORY_WINDOW_MODE
+# window_mode = "windowed"

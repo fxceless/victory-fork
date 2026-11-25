@@ -575,6 +575,12 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+The window the title is shown in can be set in `victory.toml` under `[display]`
+(`fps_limit`, `window_mode`) or with `VICTORY_FPS_LIMIT` and
+`VICTORY_WINDOW_MODE`; F11 or Alt+Enter switch between windowed and borderless
+while it runs. The limit only delays our present; it does not change the
+title's own frame clock.
+
 Run the title:
 
 ```powershell

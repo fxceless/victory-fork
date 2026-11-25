@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -7569,6 +7570,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The frame-rate limit (`[display] fps_limit`) and the last present.
+    pacer: crate::display::Pacer,
+    last_present: Option<std::time::Instant>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -7652,6 +7656,9 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        if let Some(line) = crate::display::take_line() {
+            tracing::info!("{line}");
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
@@ -8004,7 +8011,11 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let limited = p.pacer.wait();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let now = std::time::Instant::now();
+            crate::display::note_present(p.last_present.map(|t| now.duration_since(t)), limited);
+            p.last_present = Some(now);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8056,6 +8067,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                pacer: crate::display::Pacer::new(crate::display::settings().fps_limit),
+                last_present: None,
             })
         }
     }
@@ -8386,6 +8399,11 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
         .name("victory-window".into())
         .spawn(move || {
             let made = make_window(width, height);
+            if let Ok(h) = &made
+                && crate::display::settings().mode == crate::display::WindowMode::Borderless
+            {
+                toggle_borderless(*h);
+            }
             let ok = made.is_ok();
             let _ = sender.send(made.map(|h| h.0 as usize));
             if ok {
@@ -8405,8 +8423,68 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // F11 and Alt+Enter switch between windowed and borderless. They run on
+    // this window's own thread, which is the one that may change its style.
+    let alt_enter = message == WM_SYSKEYDOWN
+        && wparam.0 == 0x0D
+        && lparam.0 & (1 << 30) == 0;
+    let f11 = message == WM_KEYDOWN && wparam.0 == 0x7A && lparam.0 & (1 << 30) == 0;
+    if alt_enter || f11 {
+        toggle_borderless(hwnd);
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+/// The windowed rectangle and style kept while the window is borderless.
+static WINDOWED: Mutex<Option<(RECT, isize)>> = Mutex::new(None);
+
+/// Switches the window between its windowed frame and a borderless popup
+/// over the monitor it is on (flip-model borderless, not exclusive
+/// fullscreen). The swap chain keeps the title's size and is stretched.
+fn toggle_borderless(hwnd: HWND) {
+    let mut kept = WINDOWED.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a window of this thread; plain style and position calls.
+    unsafe {
+        if let Some((rect, style)) = kept.take() {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            tracing::info!("window mode: windowed");
+            return;
+        }
+        let mut rect = RECT::default();
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if GetWindowRect(hwnd, &mut rect).is_err() || !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        *kept = Some((rect, style));
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as isize)) | WS_POPUP.0 as isize);
+        let m = info.rcMonitor;
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            m.left,
+            m.top,
+            m.right - m.left,
+            m.bottom - m.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
+        tracing::info!("window mode: borderless");
+    }
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {

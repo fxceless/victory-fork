@@ -19,6 +19,14 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    victory_gpu::display::set(victory_gpu::display::Settings {
+        fps_limit: cfg.display.fps_limit,
+        mode: if cfg.display.borderless {
+            victory_gpu::display::WindowMode::Borderless
+        } else {
+            victory_gpu::display::WindowMode::Windowed
+        },
+    });
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
