@@ -243,8 +243,8 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 ///
 /// With the switch, the texture queue's rule (`resource::room`) counts the
 /// part of [`card_limits`]' second number that no copy has taken yet as
-/// used, and a copy may be made up to nine tenths of the budget: the room
-/// it takes was kept for it. After the burst what is kept is what the
+/// used. Copies share the automatic 80% allowance with textures. After
+/// the burst what is kept is what the
 /// burst left of the limit (87 MB of 1,024 in run 189).
 ///
 /// On by default from the build after run 199
@@ -254,7 +254,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// turned down is not asked for again (`lookup` asks once), while its room
 /// went on being kept (616 MB to the end of the run). So now: the texture
 /// queue also keeps room for the targets (`resource::targets_room_kept`),
-/// a copy is made up to 97 hundredths of the budget (its room was kept),
+/// copies now share `Host::game_video_memory`'s automatic allowance,
 /// and the room of a copy turned down is given up ([`CARD_REFUSED`]).
 fn card_room_kept_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -374,17 +374,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
-    // (With `card_room_kept_on` the texture queue kept this copy's room
-    // free, and the copy may go up to the queue's own line.)
-    let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+    // Buffer copies and textures share the automatic 80% VRAM allowance.
+    // The texture queue keeps room for copies not made yet; each copy's
+    // actual allocation still has to fit the current process allowance.
+    if let Some([allowance, used, _]) = host.game_video_memory()
+        && used.saturating_add(size) > allowance
     {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
@@ -393,12 +387,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
         if n <= 64 || n.is_multiple_of(32) {
             tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+                "no card copy for a title buffer of {} KiB: the card has {} MB in use of an automatic game allowance of \
                  {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
                 size >> 10,
                 used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
+                allowance >> 20,
                 CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
                 most >> 20,
                 n,
@@ -532,8 +525,8 @@ fn window_card_room(size: u64, how: &str) -> bool {
             );
         }
     };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+    if let Some([allowance, used, _]) = host.game_video_memory()
+        && used.saturating_add(size) > allowance
     {
         say(1, "no room on the card for");
         return false;

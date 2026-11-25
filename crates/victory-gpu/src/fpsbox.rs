@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -23,6 +24,27 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 /// The frame rate in tenths of a frame a second, as last measured (once a
 /// second, by the presenter's meter); `u32::MAX` before the first.
 static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Process and renderer measurements shown in the panel. They update once
+/// a second: sampling must never become work the title notices every frame.
+#[derive(Clone, Copy, Default)]
+struct Readings {
+    cpu_percent: Option<u32>,
+    /// Timed renderer-queue work over wall time, rather than whole-card use.
+    gpu_frame_percent: Option<u32>,
+    ram_mib: Option<u64>,
+    vram_mib: Option<(u64, u64)>,
+}
+
+struct Telemetry {
+    sampled: Instant,
+    process_us: Option<u64>,
+    process_sampled: Option<Instant>,
+    gpu_us: Option<u64>,
+    readings: Readings,
+}
+
+static TELEMETRY: Mutex<Option<Telemetry>> = Mutex::new(None);
 
 /// Whether the counter is drawn.
 fn on() -> bool {
@@ -51,9 +73,20 @@ fn glyph(c: char) -> [u8; 7] {
         '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
         '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
         '.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
+        '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         _ => [0; 7],
     }
 }
@@ -61,6 +94,108 @@ fn glyph(c: char) -> [u8; 7] {
 /// The text for a frame rate in tenths.
 fn text(tenths: u32) -> String {
     format!("{}.{} FPS", tenths / 10, tenths % 10)
+}
+
+fn process_cpu_us() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: our own process and four valid output locations.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    let micros = |time: FILETIME| (u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)) / 10;
+    ok.then(|| micros(kernel).saturating_add(micros(user)))
+}
+
+fn working_set_mib() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: our own process and the correctly sized counters structure.
+    (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0)
+        .then_some(counters.WorkingSetSize as u64 >> 20)
+}
+
+fn percent(numerator: u64, denominator: u64) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    ((u128::from(numerator) * 100 / u128::from(denominator)).min(100)) as u32
+}
+
+/// Cached process CPU, working-set RAM, renderer-frame time and VRAM use.
+fn telemetry(host: &crate::host::Host) -> Readings {
+    let now = Instant::now();
+    let mut state = TELEMETRY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(previous) = state.as_mut() else {
+        let process_us = process_cpu_us();
+        let gpu_us = crate::framelog::gpu_work_us();
+        let ram_mib = working_set_mib();
+        let vram_mib = host
+            .game_video_memory()
+            .map(|[_, used, budget]| (used >> 20, budget >> 20));
+        let readings = Readings { ram_mib, vram_mib, ..Default::default() };
+        *state = Some(Telemetry {
+            sampled: now,
+            process_us,
+            process_sampled: process_us.map(|_| now),
+            gpu_us,
+            readings,
+        });
+        return readings;
+    };
+    if now.duration_since(previous.sampled) < Duration::from_secs(1) {
+        return previous.readings;
+    }
+    let elapsed_us = now.duration_since(previous.sampled).as_micros() as u64;
+    let sampled_process_us = process_cpu_us();
+    let gpu_us = crate::framelog::gpu_work_us();
+    let ram_mib = working_set_mib();
+    let vram_mib = host.game_video_memory().map(|[_, used, budget]| (used >> 20, budget >> 20));
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    let cpu_percent = sampled_process_us
+        .zip(previous.process_us)
+        .zip(previous.process_sampled)
+        .map(|((current, then), then_sampled)| {
+            let cpu_elapsed = now.duration_since(then_sampled).as_micros() as u64;
+            percent(current.saturating_sub(then), cpu_elapsed.saturating_mul(cores))
+        });
+    let gpu_frame_percent = gpu_us
+        .zip(previous.gpu_us)
+        .map(|(current, then)| percent(current.saturating_sub(then), elapsed_us))
+        .or(previous.readings.gpu_frame_percent);
+    let readings = Readings { cpu_percent, gpu_frame_percent, ram_mib, vram_mib };
+    *previous = Telemetry {
+        sampled: now,
+        process_us: sampled_process_us.or(previous.process_us),
+        process_sampled: sampled_process_us.map(|_| now).or(previous.process_sampled),
+        gpu_us: gpu_us.or(previous.gpu_us),
+        readings,
+    };
+    readings
+}
+
+fn gib_tenths(mib: u64) -> String {
+    format!("{}.{}G", mib / 1024, (mib % 1024) * 10 / 1024)
+}
+
+fn panel(tenths: u32, readings: Readings) -> String {
+    // The FPS meter is a rolling rate, so this is its reciprocal average,
+    // not the duration of one particular frame.
+    let avg_ms_tenths = 100_000 / tenths.max(1);
+    let cpu = readings.cpu_percent.map_or_else(|| "--".to_owned(), |n| format!("{n}%"));
+    let ram = readings.ram_mib.map_or_else(|| "--".to_owned(), gib_tenths);
+    let gpu = readings.gpu_frame_percent.map_or_else(|| "--".to_owned(), |n| format!("{n}%"));
+    let vram = readings.vram_mib.map_or_else(
+        || "--".to_owned(),
+        |(used, budget)| format!("{}/{}", gib_tenths(used), gib_tenths(budget)),
+    );
+    format!(
+        "{} {}.{} AVG MS CPU {cpu} GPU {gpu} RAM {ram} VRAM {vram}",
+        text(tenths),
+        avg_ms_tenths / 10,
+        avg_ms_tenths % 10,
+    )
 }
 
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
@@ -146,7 +281,7 @@ struct Made {
 unsafe impl Send for Made {}
 
 /// The boxes made so far, by text, format and scale.
-static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
+static MADE: Mutex<Option<HashMap<(String, i32, u32), Made>>> = Mutex::new(None);
 
 /// Copies the frame rate's box onto `back`, a back buffer of `width` by
 /// `height` pixels of `format` that `list` holds as a copy's destination.
@@ -163,6 +298,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     // About a fortieth of the frame's height a glyph: 6 dots a pixel at
     // 2160 lines, 3 at 1080.
     let scale = (height / 360).clamp(2, 12);
+    let label = panel(tenths, telemetry(host));
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     let made = made.get_or_insert_with(HashMap::new);
     if made.len() > 2048 {
@@ -170,9 +306,9 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         // over thousands of values is not expected.)
         made.clear();
     }
-    let key = (tenths, format.0, scale);
+    let key = (label.clone(), format.0, scale);
     if !made.contains_key(&key) {
-        let (w, h, lit) = bitmap(&text(tenths), scale);
+        let (w, h, lit) = bitmap(&label, scale);
         let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
         let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
             return;
@@ -185,7 +321,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
                 pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
             }
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        made.insert(key.clone(), Made { buffer, width: w, height: h, pitch: pitch as u32 });
     }
     let Some(m) = made.get(&key) else {
         return;

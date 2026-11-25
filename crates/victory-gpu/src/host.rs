@@ -36,6 +36,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// The caption used by the title window and its FPS refresh.
+const GAME_WINDOW_CAPTION: &str = "moKobuild Americas";
+
 /// Whether the host device has GPU upload heaps (asked when it is made).
 static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -60,6 +63,39 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Dedicated VRAM of the adapter that actually owns the D3D12 device.
+    dedicated_vram: u64,
+}
+
+/// Soft admission threshold for optional streaming copies: 80% of physical
+/// VRAM, capped by Windows' live process budget. UMA has no dedicated VRAM;
+/// use 80% of its local-memory budget. This does not reserve memory.
+fn game_vram_limit(dedicated: u64, budget: u64) -> u64 {
+    let capacity = if dedicated == 0 {
+        budget
+    } else {
+        dedicated
+    };
+    (((u128::from(capacity) * 80) / 100) as u64).min(budget)
+}
+
+#[cfg(test)]
+mod game_vram_tests {
+    use super::game_vram_limit;
+
+    #[test]
+    fn allowance_respects_capacity_and_a_shrinking_os_budget() {
+        let gib = 1u64 << 30;
+        assert_eq!(game_vram_limit(16 * gib, 20 * gib), 16 * gib * 80 / 100);
+        assert_eq!(game_vram_limit(16 * gib, 10 * gib), 10 * gib);
+        assert_eq!(game_vram_limit(0, 10 * gib), 8 * gib);
+        assert_eq!(game_vram_limit(16 * gib, 0), 0);
+        assert_eq!(game_vram_limit(0, 0), 0);
+        assert_eq!(
+            game_vram_limit(u64::MAX, u64::MAX),
+            (u128::from(u64::MAX) * 80 / 100) as u64
+        );
+    }
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -719,6 +755,21 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        let dedicated_vram = adapter
+            .as_ref()
+            .and_then(|a| a.GetDesc1().ok())
+            .map_or(0, |d| d.DedicatedVideoMemory as u64);
+        if let Some(adapter) = &adapter {
+            let mut memory = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            if adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut memory).is_ok() {
+                tracing::info!(
+                    dedicated_vram_mb = dedicated_vram >> 20,
+                    windows_budget_mb = memory.Budget >> 20,
+                    game_allowance_mb = game_vram_limit(dedicated_vram, memory.Budget) >> 20,
+                    "automatic VRAM allowance: 80% for streamed textures and buffer copies; allocated as needed"
+                );
+            }
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -735,6 +786,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            dedicated_vram,
         })
     }
 }
@@ -7884,7 +7936,7 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
+    /// The caption retained while its FPS suffix is refreshed.
     caption: Option<Vec<u16>>,
 }
 
@@ -8148,12 +8200,7 @@ impl Meter {
             }
         }
         if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
+            self.caption = Some(GAME_WINDOW_CAPTION.encode_utf16().collect());
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
@@ -8416,6 +8463,24 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Streaming allowance, current process usage, and OS budget, in bytes. Query the
+    /// live OS budget so another application's memory pressure is respected.
+    /// This is a soft admission threshold; concurrent and required allocations
+    /// can exceed it, and it does not reclaim memory already in use.
+    pub(crate) fn game_video_memory(&self) -> Option<[u64; 3]> {
+        let adapter = self.adapter.as_ref()?;
+        let mut memory = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: the adapter fills a valid, sized structure we own.
+        unsafe {
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut memory).ok()?;
+        }
+        Some([
+            game_vram_limit(self.dedicated_vram, memory.Budget),
+            memory.CurrentUsage,
+            memory.Budget,
+        ])
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
@@ -8824,7 +8889,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("moKobuild Americas"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

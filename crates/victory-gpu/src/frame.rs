@@ -25,6 +25,17 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// Optional host pace for testing beyond a title's requested frame cap.
+/// This changes virtual flip timing and may affect timing-dependent title
+/// behavior, so it is unset by default.
+fn frame_rate_override() -> Option<u32> {
+    static FPS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FPS.get_or_init(|| {
+        let fps = std::env::var("VICTORY_FRAME_RATE").ok()?.trim().parse::<u32>().ok()?;
+        (1..=240).contains(&fps).then_some(fps)
+    })
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
@@ -49,11 +60,20 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
-        0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
-    };
-    tracing::info!(?interval, "frame interval");
+    let override_fps = frame_rate_override();
+    let interval = override_fps.map_or_else(
+        || match length {
+            0 => SIXTIETH,
+            us => Duration::from_micros(u64::from(us)),
+        },
+        |fps| Duration::from_nanos(1_000_000_000 / u64::from(fps)),
+    );
+    tracing::info!(
+        ?interval,
+        override_fps = override_fps.unwrap_or(0),
+        requested_us = length,
+        "frame interval"
+    );
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()

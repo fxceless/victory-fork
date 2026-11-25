@@ -117,6 +117,17 @@ pub fn sub(t: T, n: u64) {
     TOTAL[t as usize].fetch_sub(n, Relaxed);
 }
 
+/// Cumulative timed GPU work in microseconds, collected asynchronously.
+/// Sample differences over wall time for renderer queue occupancy, not
+/// whole-card utilization. Pipeline spans overlap list spans and are excluded.
+pub(crate) fn gpu_work_us() -> Option<u64> {
+    let work = [T::CardSyncUs, T::CardCheckUs, T::CardListsUs]
+        .into_iter()
+        .map(|t| TOTAL[t as usize].load(Relaxed))
+        .fold(0u64, u64::saturating_add);
+    (work > 0).then_some(work)
+}
+
 /// What a thread did inside our calls since its last present: for the
 /// thread that presents (the title's render thread).
 #[derive(Clone, Copy)]

@@ -1406,11 +1406,10 @@ pub(crate) fn host_made<'a>(
 }
 
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
+/// shaders that pick textures by index (`draw.rs` `heap_textures`), while
+/// process usage and space kept for buffers/targets fit the automatic 80%
+/// VRAM allowance. Explicit texture limits may reduce this allowance.
+/// Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
@@ -1425,6 +1424,13 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let host = crate::host::host();
+    if let Some([allowance, used, _]) = host.and_then(|h| h.game_video_memory()) {
+        let kept = crate::shadow::card_room_kept().saturating_add(targets_room_kept());
+        if used.saturating_add(kept) >= allowance {
+            return false;
+        }
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }

@@ -58,6 +58,12 @@ pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize)
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+/// The title's original caption, replaced only for its main window.
+const GAME_WINDOW_CAPTION: &[u16] = &[
+    b'A' as u16, b'm' as u16, b'e' as u16, b'r' as u16, b'i' as u16, b'c' as u16, b'a' as u16,
+    b's' as u16,
+];
+const BRANDED_GAME_WINDOW_CAPTION: PCWSTR = w!("moKobuild Americas");
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -81,6 +87,7 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    brand_game_window(hwnd);
     hwnd
 }
 
@@ -107,7 +114,25 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    brand_game_window(hwnd);
     hwnd
+}
+
+/// Rebrand the title's main window after either ANSI or wide creation. Other
+/// top-level windows, such as system dialogs, keep the caption they request.
+fn brand_game_window(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut caption = [0u16; 32];
+    // SAFETY: `hwnd` was just returned by CreateWindowEx, and `caption` has
+    // room for its NUL terminator.
+    let n = unsafe { wm::GetWindowTextW(hwnd, caption.as_mut_ptr(), caption.len() as i32) };
+    if n == GAME_WINDOW_CAPTION.len() as i32 && caption[..n as usize] == GAME_WINDOW_CAPTION[..]
+    {
+        // SAFETY: a live window and a static NUL-terminated caption.
+        unsafe { wm::SetWindowTextW(hwnd, BRANDED_GAME_WINDOW_CAPTION) };
+    }
 }
 
 /// A console title sizes its window to its render target (
@@ -372,6 +397,36 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            wm::DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn game_window_caption_is_branded() {
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("Americas"),
+            0,
+            0,
+            0,
+            10,
+            10,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        let mut text = [0u16; 32];
+        // SAFETY: our window; the buffer holds the branded caption.
+        unsafe {
+            let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..n as usize]),
+                "moKobuild Americas"
+            );
             wm::DestroyWindow(hwnd);
         }
     }
