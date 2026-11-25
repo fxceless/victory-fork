@@ -108,6 +108,9 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   copy's CPU side. The layer's sync lists on the card fall from 12 to 8
   ms a frame, the submit thread pays 3.6 ms for the compare and is then
   the limit: no net gain yet.
+- `VICTORY_BATCH_PAGE_MAPPINGS=1` tries one host view for consecutive
+  texture-streaming pages. A failed batch retries the original mappings
+  in order. This is experimental.
 - HONEST LIMIT OF ALL THE ABOVE: those numbers are the scene standing
   still. While the camera moves the title streams assets, and about half
   the time goes to frames of ~490 ms in which the card is idle for ~330
