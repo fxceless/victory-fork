@@ -518,6 +518,15 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// Entries in the view registry and entries free for reuse, for the frame
+/// line: every record the title writes that names a new view appends one,
+/// and an entry is freed only when the title releases the resource it
+/// names - so this says whether the registry grows with play.
+pub(crate) fn registry() -> (u64, u64) {
+    let views = views_read();
+    (views.list.len() as u64, views.free.len() as u64)
+}
+
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
 /// what the other 62 bits are: 0, entry `i` of the table at that
