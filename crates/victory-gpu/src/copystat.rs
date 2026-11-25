@@ -133,6 +133,11 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Actual GetWriteWatch calls, requested bytes and time in those calls,
+    /// including refused calls and retries.
+    WatchKernelCalls,
+    WatchKernelBytes,
+    WatchKernelUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1124,6 +1129,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "  write-watch kernel requests per frame: {:.0} calls for {:.1} MB, {:.2} ms in calls",
+        c[C::WatchKernelCalls as usize],
+        mb(c[C::WatchKernelBytes as usize]),
+        ms(c[C::WatchKernelUs as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

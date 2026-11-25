@@ -325,29 +325,45 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     ask_run(j, b);
 }
 
+fn kernel_write_watch(first: usize, last: usize, found: &mut [usize], count: &mut usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let bytes = (last - first) * PAGE;
+    assert!(*count <= found.len());
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the callers size the answer buffer before setting its capacity.
+    let succeeded = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            bytes,
+            found.as_mut_ptr().cast(),
+            count,
+            &mut granularity,
+        )
+    } == 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let elapsed = started.elapsed().as_micros() as u64;
+        add(C::WatchKernelCalls, 1);
+        add(C::WatchKernelBytes, bytes as u64);
+        add(C::WatchKernelUs, elapsed);
+    }
+    succeeded
+}
+
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    if failed {
+    if !kernel_write_watch(first, last, &mut j.found, &mut count) {
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -385,8 +401,6 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -402,25 +416,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
+    let failed = known_view || !kernel_write_watch(first, last, &mut j.found, &mut count);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
