@@ -69,6 +69,11 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// raw thread count along axis `dword` (0 = X, 1 = Y, 2 = Z) of a
+/// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
+/// for a normal thread-group dispatch (all threads in every group active).
+pub const USER_DISPATCH_THREADS: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
