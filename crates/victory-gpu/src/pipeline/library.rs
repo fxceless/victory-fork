@@ -452,10 +452,38 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// An empty library, asked for as D3D12 documents it: no blob (a null
+/// pointer) and length 0. The `&[u8]` binding passes an empty slice's
+/// dangling, non-null pointer, which vkd3d-proton takes for a blob and
+/// rejects: on Wine every run went without a library ("no host pipeline
+/// library: pipelines are not kept"; the fork's own
+/// `a_rejected_blob_gives_an_empty_library` failed on RADV), so no host
+/// pipeline and no early-start list was kept between runs (fx-amd).
+fn empty_library(device: &ID3D12Device1) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    use windows::core::Interface;
+    let mut out = std::ptr::null_mut();
+    // SAFETY: a plain creation call with a null blob of length 0 and a
+    // valid IID and out pointer; the result is an owned reference.
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut out,
+        )
+        .ok()?;
+        ID3D12PipelineLibrary::from_raw(out).cast()
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        if bytes.is_empty() {
+            return empty_library(device);
+        }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
