@@ -51,8 +51,17 @@ pub(crate) struct HostHeap {
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
-    /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+    /// the low and then the high dword of the title address of the buffer view
+    /// at that slot (0: none). For a program that takes a buffer view out of the
+    /// heap at an index it computes and reads the address out of the descriptor
+    /// to walk the memory behind it (the shadow-ray trace programs take their
+    /// ray-tracing structure this way).
+    /// The host keeps, after the strides of `SLOT_STRIDES`, two more dwords
+    /// per heap slot (low and high of the title address of the buffer view
+    /// there), written where the strides are written, and the shader reads them
+    /// by heap slot (`SLOT_ADDRESSES`). No new root parameter; the table grows
+    /// from 8 MB to 24 MB per view heap.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
