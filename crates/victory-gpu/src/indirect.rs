@@ -37,7 +37,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -48,6 +48,7 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    uint first_record;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -73,7 +74,7 @@ groupshared uint largest_asked;
 groupshared uint all_asked;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+void main(uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
@@ -81,9 +82,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
-    bool active = id.x < eff_count;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint record_index = first_record + gi;
+    bool active = record_index < eff_count;
+    uint src_at = args_offset + record_index * stride;
+    uint dst_at = record_index * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -152,8 +154,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
     // touches the budget not at all, as its threads did not before.
-    uint first = id.x - gi;
-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    uint n = eff_count > first_record ? min(64u, eff_count - first_record) : 0u;
     if (gi == 0 && n > 0) {
         // What the records charge, from `before` on, in lane order: a
         // record that does not fit whole runs empty and takes the rest.
@@ -219,6 +220,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    #[cfg(test)]
+    legacy_benchmark: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -296,7 +299,12 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(Clamp {
+            root,
+            pso,
+            #[cfg(test)]
+            legacy_benchmark: false,
+        })
     }
 }
 
@@ -447,7 +455,15 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let mut constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1),
+        count_offset,
+        0,
+    ];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -481,12 +497,29 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            #[cfg(test)]
+            let legacy_benchmark = c.legacy_benchmark;
+            #[cfg(not(test))]
+            let legacy_benchmark = false;
+            if legacy_benchmark {
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.Dispatch(records.div_ceil(64), 1, 1);
+            } else {
+                // Groups in one dispatch can charge the budget in either order.
+                // Order the chunks explicitly; the shader orders lanes in each chunk.
+                for first_record in (0..records).step_by(64) {
+                    if first_record != 0 {
+                        l.ResourceBarrier(&[uav_barrier()]);
+                    }
+                    constants[6] = first_record;
+                    l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                    l.Dispatch(1, 1, 1);
+                }
+            }
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -948,7 +981,11 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Clamp {
+                root,
+                pso,
+                legacy_benchmark: false,
+            })
         }
     }
 
@@ -1531,13 +1568,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1547,7 +1583,9 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert_eq!(kept, [1, 2], "the first two real draws fit the budget");
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
+        eprintln!("WARP kept draw records {kept:?}");
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

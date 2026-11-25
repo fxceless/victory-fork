@@ -184,10 +184,9 @@ fn bench_indirect_draw_barriers() {
         return;
     };
     let device = &host.device;
-    let clamps = [
-        make_from(device, OLD_SOURCE).expect("the old clamp"),
-        make_for(device).expect("the clamp"),
-    ];
+    let mut old_clamp = make_from(device, OLD_SOURCE).expect("the old clamp");
+    old_clamp.legacy_benchmark = true;
+    let clamps = [old_clamp, make_for(device).expect("the clamp")];
     // SAFETY: plain D3D12 object creation with valid descriptions; the
     // objects outlive every list recorded and run below.
     unsafe {
