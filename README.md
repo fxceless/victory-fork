@@ -173,6 +173,7 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- The host's own HLSL (the indirect-argument clamp, the compare of copies in the card's memory, the depth-plane twins, the in-place probe) falls back to DXC when the system compiler fails it: on the Wine and Proton builds that need it, `d3dcompiler_47` is vkd3d-shader, which rejects `RWByteAddressBuffer` methods, and also compiles the rest of this source but drops the root signature the shader asks for, so `CreateRootSignature` failed and the twins had no pipeline; either way the clamp, card buffers and twins then silently switched off. Wine 11.22 and Proton Experimental experimental-11.0-20261112 both reject the clamp (`E5005: InterlockedMax`), the card compare (`E5005: Load4`) and the in-place probe (`E5005: Load`), and accept the twins' pixel shader but drop its root signature; a run into the prologue took the fallback for the clamp, the card compare, the probe and the twins' pixel shader. `dxcompiler.dll` is looked for in `VICTORY_DXC` (the DLL or its folder), beside the `dxil.dll` that shader validation uses, then the executable's folder and System32; on Windows, where `D3DCompile` succeeds and keeps the root signature, nothing changes. This fixes the compiles only: a separate GPU execution fault/device removal under vkd3d-proton 3.2 is not addressed.
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -192,6 +193,8 @@ Each is described in a comment where it is read.
 ### Known problems
 
 - Everything in shadow is black (see above).
+- On Wine and Proton builds whose built-in `d3dcompiler_47` rejects this source (Wine 11.22, GE-Proton 11-12/11-14 and Proton Experimental experimental-11.0-20261112 do), the run-time HLSL compiles need DXC's `dxcompiler.dll` and `dxil.dll` (see the last rendering item above).
+- On GE-Proton11-14 / vkd3d-proton 3.2 the helper shaders compile with DXC, but a separate GPU/driver fault (NVRM `gpu_vaspace.c` assertions) still hangs the machine after a few minutes; this change does not address it.
 - The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
 - Around 24 GB of memory is in use during play.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.

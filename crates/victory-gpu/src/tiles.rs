@@ -737,7 +737,7 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows::core::{Interface, s};
+    use windows::core::Interface;
 
     use super::*;
     use crate::host::{compile, transition, warp_adapter};
@@ -1269,7 +1269,7 @@ void look() {
     /// the title asked returns zero.
     fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
         rig.step = "step 5, the view from the first level with tiles";
-        let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
+        let cs = compile(LOOK, "look", "cs_5_1").ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let desc = Rig::desc(format, SIDE, LEVELS, true);
         let layout = rig.footprints(&desc);
