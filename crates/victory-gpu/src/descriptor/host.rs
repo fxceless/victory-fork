@@ -500,6 +500,19 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// `VICTORY_TABLED_SKIP_FRAMES=<n>`: a slot is left to its draws only if a
+/// draw read it through a table within the last `n` frames (0: such slots
+/// are mirrored again, as with `VICTORY_HEAP_SYNC_TABLES=1`). Unset: the
+/// window is [`TABLED_FRAMES`] and the read bit is not asked for.
+fn skip_frames() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TABLED_SKIP_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1472,10 +1485,23 @@ impl HostHeap {
     /// Whether title slot `index` was a table's within the last
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
+    ///
+    /// `VICTORY_TABLED_SKIP_FRAMES=<n>` asks the stricter question the
+    /// mirror pass needs: a slot may be left to its draws only if a draw
+    /// read it **through a table** within the last `n` frames, because only
+    /// then did that draw make its own view of it. Without the read bit the
+    /// window of [`TABLED_FRAMES`] (240) also lets a slot the title stopped
+    /// using through a table be written directly while the mirror skips it,
+    /// and a draw then reads a record no pass made.
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
-        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let stamp = self.tabled_stamp(index);
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        if let Some(frames) = skip_frames() {
+            return stamp & TABLED_READ != 0
+                && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= frames;
+        }
+        tabled_out() && stamp & !TABLED_READ != 0
+            && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -1991,9 +2017,16 @@ impl HostHeap {
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
+                MIRROR_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 None
             } else {
-                make(&view, self.cpu(index))
+                MIRROR_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MIRROR_MADE_KIND[made_kind(&view)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.sampler {
+                    make(&view, self.cpu(index))
+                } else {
+                    copy_or_make(key, &view, self.cpu(index))
+                }
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -2236,6 +2269,35 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: host descriptor views made for records that
+/// changed, by kind: constant buffer, placed texture, placed buffer, shader
+/// (a resource object's view). Says which kind the uncached creations are.
+pub(crate) static MIRROR_MADE_KIND: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The kind of `view` as [`MIRROR_MADE_KIND`] counts it.
+fn made_kind(view: &View) -> usize {
+    match view {
+        View::Constant(..) => 0,
+        View::Placed(..) => {
+            if is_texture_view(view) {
+                1
+            } else {
+                2
+            }
+        }
+        View::Shader(..) => 3,
+        View::Unordered(..) => 2,
+        View::Sampler(..) | View::ConsoleSampler(..) => 1,
+    }
+}
+
+/// Since the last frame line: host descriptor views made for records that
+/// changed (`make`), and those left to the draw or the pass that reads them
+/// (buffer views and textures still waiting for a host copy).
+pub(crate) static MIRROR_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MIRROR_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -2703,6 +2765,93 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
+/// `VICTORY_VIEW_CACHE=0` makes every view as before (see [`copy_or_make`]).
+fn view_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: slots made by copying a view made before.
+pub(crate) static VIEW_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Views already made, each once, in a heap of our own that nothing rewrites:
+/// the record key it was made from, where it is, and the resource it keeps
+/// alive. 40,000 to 113,000 views are made a frame and the same records come
+/// back (draws read the same slots every frame), so a slot that shows one
+/// again is a 32-byte descriptor copy instead of a call into the driver.
+struct Models {
+    heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: u32,
+    next: u32,
+    made: std::collections::BTreeMap<View, (u32, Kept)>,
+}
+
+/// The most views kept (a heap of that many descriptors, 8 MB at 32 bytes);
+/// past it every view is made as before.
+static MOST_MODELS: u32 = 262_144;
+
+static MODELS: Mutex<Option<Models>> = Mutex::new(None);
+
+/// Makes `view` for slot `key` by copying a view of the same record made
+/// before, or makes it and keeps it for the next slot that shows it.
+fn copy_or_make(key: u64, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    if !view_cache() {
+        return make(view, at);
+    }
+    let Some(host) = host() else {
+        return make(view, at);
+    };
+    let device = &host.device;
+    let mut models = MODELS.lock().unwrap_or_else(|e| e.into_inner());
+    if models.is_none() {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: MOST_MODELS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        // SAFETY: a plain call on our device.
+        match unsafe { device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc) } {
+            Ok(heap) => {
+                let step = unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+                let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                *models = Some(Models { heap, cpu, step, next: 0, made: Default::default() });
+            }
+            Err(_) => return make(view, at),
+        }
+    }
+    let Some(models) = models.as_mut() else {
+        return make(view, at);
+    };
+    if let Some((at_model, kept)) = models.made.get(view) {
+        let from = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: models.cpu + *at_model as usize * models.step as usize,
+        };
+        // SAFETY: both are CBV_SRV_UAV slots of heaps of ours, the source
+        // holding a descriptor made from this very record.
+        unsafe { device.CopyDescriptorsSimple(1, at, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        VIEW_COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(kept.clone());
+    }
+    if models.next >= MOST_MODELS {
+        return make(view, at);
+    }
+    let at_model = models.next;
+    models.next += 1;
+    let slot = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: models.cpu + at_model as usize * models.step as usize,
+    };
+    // Made at the model's slot first: the slot itself may be rewritten by a
+    // later record, the model never is.
+    let kept = make(view, slot)?;
+    models.made.insert(view.clone(), (at_model, kept.clone()));
+    let _ = &models.heap;
+    // SAFETY: as above; the model slot is written.
+    unsafe { device.CopyDescriptorsSimple(1, at, slot, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    Some(kept)
+}
+
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;

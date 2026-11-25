@@ -532,9 +532,16 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let began = std::time::Instant::now();
+    let answer = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    let took = began.elapsed();
+    if took >= std::time::Duration::from_millis(250) {
+        // Where a load's seconds go (see `fread`).
+        tracing::warn!(wanted = len, ms = took.as_millis() as u64, "slow ReadFile");
+    }
+    answer
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -552,8 +559,18 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         return read(buffer, size, count, stream);
     }
     const CHUNK: usize = 1 << 20;
-    let mut beside = vec![0u8; total.min(CHUNK)];
+    // One buffer a thread, not a megabyte of zeros allocated for every
+    // call: the title reads its assets through here, and the allocation
+    // (and the zeroing of it) was paid per call.
+    thread_local! {
+        static BESIDE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut beside = BESIDE.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    if beside.len() < total.min(CHUNK) {
+        beside.resize(total.min(CHUNK), 0);
+    }
     let mut done = 0;
+    let began = std::time::Instant::now();
     while done < total {
         let want = (total - done).min(CHUNK);
         let n = read(beside.as_mut_ptr(), 1, want, stream);
@@ -568,6 +585,19 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
             break;
         }
     }
+    let took = began.elapsed();
+    if took >= std::time::Duration::from_millis(250) {
+        // Where the load's seconds go: a 27 s frame at a loading screen had
+        // 46 ms of the layer's GPU work in it, so the read path is the
+        // first place to look (`VICTORY_SLOW_READS=0` silences this).
+        tracing::warn!(
+            wanted = total,
+            read = done,
+            ms = took.as_millis() as u64,
+            "slow fread"
+        );
+    }
+    BESIDE.with(|b| *b.borrow_mut() = beside);
     done / size
 }
 

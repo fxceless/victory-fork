@@ -118,19 +118,39 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
+    /// `FILE_FLAG_NO_BUFFERING`: the drive reads straight into our buffer,
+    /// with no file cache in the way.
+    const NO_BUFFERING: u32 = 0x2000_0000;
     if path.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
+    // `VICTORY_DSTORAGE_UNBUFFERED=0` reads through the cache, as before.
+    let unbuffered = std::env::var_os("VICTORY_DSTORAGE_UNBUFFERED").is_none_or(|v| v != "0");
+    let mut handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        if unbuffered { NO_BUFFERING } else { 0 },
         std::ptr::null_mut(),
     );
+    let mut unbuffered = unbuffered && handle as isize != -1;
+    if handle as isize == -1 && unbuffered {
+        // A path the flag is refused for (a device, an emulated drive):
+        // open it as before.
+        handle = super::files::CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        unbuffered = false;
+    }
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
@@ -145,7 +165,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, unbuffered });
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -260,6 +280,9 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// Opened with `FILE_FLAG_NO_BUFFERING`: every read must be a whole
+    /// number of sectors, in a buffer aligned to one ([`read_uncached`]).
+    unbuffered: bool,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -1020,6 +1043,34 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// A read of a file opened with `FILE_FLAG_NO_BUFFERING`: the drive takes
+/// whole sectors in a buffer aligned to one, so the request is widened to
+/// the sectors around it, read into an aligned buffer, and the wanted bytes
+/// are copied out. Returns how many bytes of `out` the file had.
+fn read_uncached(file: &std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    const SECTOR: usize = 4096;
+    let start = offset & !(SECTOR as u64 - 1);
+    let delta = (offset - start) as usize;
+    let span = (delta + out.len()).div_ceil(SECTOR) * SECTOR;
+    // One sector of slack, so the read's buffer can start aligned inside it.
+    let mut raw = vec![0u8; span + SECTOR];
+    let skip = (SECTOR - (raw.as_ptr() as usize % SECTOR)) % SECTOR;
+    let buf = &mut raw[skip..skip + span];
+    let mut done = 0;
+    while done < span {
+        match file.seek_read(&mut buf[done..], start + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(error) if done == 0 => return Err(error),
+            Err(_) => break,
+        }
+    }
+    let available = done.saturating_sub(delta).min(out.len());
+    out[..available].copy_from_slice(&buf[delta..delta + available]);
+    Ok(available)
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -1028,23 +1079,35 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
+    let result = if unbuffered(file) {
+        // No file cache between the drive and us.
+        match read_uncached(&file.file, request.offset, out) {
+            Ok(n) if n == out.len() => Ok(()),
+            Ok(_) => Err(END_OF_FILE),
+            Err(error) => Err(from_win32(&error)),
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+    } else {
+        let mut done = 0;
+        loop {
+            if done == out.len() {
+                break Ok(());
+            }
+            match file.file.seek_read(&mut out[done..], request.offset + done as u64) {
+                Ok(0) => break Err(END_OF_FILE),
+                Ok(n) => done += n,
+                Err(error) => break Err(from_win32(&error)),
+            }
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Whether `file` was opened without the file cache.
+fn unbuffered(file: &File) -> bool {
+    file.unbuffered
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how

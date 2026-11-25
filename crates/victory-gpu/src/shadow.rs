@@ -1676,6 +1676,43 @@ mod wide_tests {
 /// those are to be written, so a title write that lands between the read
 /// and the write elsewhere in the stretch stays (upstream VIctory #2009).
 /// `mask` is scratch.
+/// How far apart two pieces that differ may be and still be written with
+/// one stretch (`coalesce_pieces`): a 64 KiB piece here is one kernel read
+/// and one kernel write of title memory.
+const PIECE_GAP: usize = 64 << 10;
+
+/// The most one merged stretch may hold (longer ones are cut): the read and
+/// the write of it are one call each, but 75 MB a frame arriving in a
+/// handful of very long stretches would stall the submitting thread.
+const PIECE_MOST: usize = 4 << 20;
+
+/// Spans of a copy that differ, as `Shadow::differing` returns them (one per
+/// 64 KiB piece): neighbouring ones within [`PIECE_GAP`] become one stretch.
+/// `back_piece` already reads and writes title memory from the first byte
+/// that differs to the last, and writes only what the GPU wrote, so the
+/// bytes between two such spans cost a read of title memory and no write.
+fn coalesce_pieces(mut spans: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    if spans.len() < 2 {
+        return spans;
+    }
+    spans.sort_unstable_by_key(|&(at, _)| at);
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (at, n) in spans {
+        let mut joined = false;
+        if let Some(last) = out.last_mut() {
+            let end = last.0 + last.1;
+            if at <= end.saturating_add(gap) && (at + n).saturating_sub(last.0) <= PIECE_MOST {
+                last.1 = end.max(at + n) - last.0;
+                joined = true;
+            }
+        }
+        if !joined {
+            out.push((at, n));
+        }
+    }
+    out
+}
+
 fn back_piece(
     host: &mut [u8],
     old: &[u8],
@@ -2499,6 +2536,9 @@ impl Shadow {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            // Pieces that lie together are one stretch: at 970 pieces and
+            // ~300 ms a frame (75 MB), the calls are most of the cost.
+            let differing = coalesce_pieces(differing, PIECE_GAP);
             #[cfg(feature = "diagnostics")]
             let syncing = {
                 use crate::copystat::{C, add};
