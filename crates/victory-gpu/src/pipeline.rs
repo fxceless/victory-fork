@@ -775,6 +775,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(any(windows, test))]
+mod bvh_pass;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]

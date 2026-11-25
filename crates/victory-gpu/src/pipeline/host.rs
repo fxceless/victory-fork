@@ -347,6 +347,9 @@ impl HostPipeline {
             [cs] if cs.stage == "compute" => Some(cs),
             _ => None,
         };
+        if compute.is_some_and(|cs| super::bvh_pass::skip(&cs.container)) {
+            return refuse("BVH-only compute pass skipped (VICTORY_BVH_PASSES=0)", shaders);
+        }
         if compute.is_none()
             && shaders
                 .iter()
