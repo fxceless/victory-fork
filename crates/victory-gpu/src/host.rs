@@ -3142,8 +3142,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
-/// ([`relay`]): a list, a fence and an event of its own (the host's are
-/// behind the submission lock), and the memory the pieces come down to.
+/// ([`relay`]): a list, fence and event of its own (the host's are behind
+/// the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
     fence: ID3D12Fence,
@@ -4291,7 +4291,7 @@ impl Host {
         }
     }
 
-    /// The relay's own list, fence, event for [`Host::relay_card_back`].
+    /// The relay's own list, fence and event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         // SAFETY: plain objects of our own.
@@ -4485,11 +4485,10 @@ impl Host {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
                 list.Close()?;
-                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -4523,16 +4522,44 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let each = pieces.len().div_ceil(8);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .chunks(each)
+                .map(|chunk| {
+                    let chunk: Vec<_> = chunk.to_vec();
+                    let total_written = total_written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut local = 0usize;
+                        for (shadow, lo, hi, at) in chunk {
+                            // SAFETY: the mapping of the fetched bytes; the copy
+                            // into it has run, and `wide_run` waits for this job.
+                            let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.walls_merged(gpu.len(), merged);
+                            local += merged;
+                        }
+                        total_written.fetch_add(local, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total_written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
@@ -4579,7 +4606,7 @@ impl Host {
     fn relay_card_inflight(&self, plans: &[&CardPlan]) -> bool {
         use std::sync::Arc;
         type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
-        let mut pieces: Vec<Piece> = Vec::new();
+        let mut plan_pieces: Vec<Vec<Piece>> = Vec::new();
         {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let Some(work) = work.as_ref() else {
@@ -4632,6 +4659,7 @@ impl Host {
                 }
                 let fetched = flagged_pieces(&flags);
                 let mut seen = std::collections::HashSet::new();
+                let mut batch: Vec<Piece> = Vec::new();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -4659,22 +4687,58 @@ impl Host {
                             .map(|b| (b.1, b.2))
                             .collect();
                         for (a, b) in crate::shadow::outside(lo, hi, newer) {
-                            pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
+                            batch.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
                         }
                     }
+                }
+                if !batch.is_empty() {
+                    plan_pieces.push(batch);
                 }
             }
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
+        // Plans merge in the line's order; within a single plan, pieces are
+        // apart from one another so `wide_merge` can merge them in parallel.
+        let (mut written, mut bytes, mut count) = (0usize, 0u64, 0u64);
+        for batch in plan_pieces {
+            count += batch.len() as u64;
+            for &(_, lo, hi, _, _) in &batch {
+                bytes += (hi - lo) as u64;
+            }
+            if wide_merge() && batch.len() >= 8 {
+                let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let each = batch.len().div_ceil(8);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = batch
+                    .chunks(each)
+                    .map(|chunk| {
+                        let chunk: Vec<_> = chunk.to_vec();
+                        let total_written = total_written.clone();
+                        Box::new(move || {
+                            let mut title = Vec::new();
+                            let mut local = 0usize;
+                            for (shadow, lo, hi, at, after) in chunk {
+                                // SAFETY: inside the mapping of the slots (checked above);
+                                // the copy into it ran in the plan's flight, which the card
+                                // has run, and `wide_run` waits for this job.
+                                let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
+                                local += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            }
+                            total_written.fetch_add(local, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                written += total_written.load(Ordering::Relaxed);
+            } else {
+                let mut title = Vec::new();
+                for (shadow, lo, hi, at, after) in &batch {
+                    // SAFETY: inside the mapping of the slots (checked above); the
+                    // copy into it ran in the plan's flight, which the card has run.
+                    let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                    written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                }
+            }
         }
         for plan in plans {
             for r in &plan.ranges {
@@ -4682,7 +4746,7 @@ impl Host {
             }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        INFLIGHT_STATS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        INFLIGHT_STATS[0].fetch_add(count, Ordering::Relaxed);
         INFLIGHT_STATS[1].fetch_add(bytes, Ordering::Relaxed);
         // The next merge is of a later plan, or a fetch the old way sent now.
         if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
