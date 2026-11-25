@@ -260,6 +260,65 @@ fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
     ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
 }
 
+/// Where the table by pipeline also goes at every flush, every pipeline of
+/// it and not the largest 48 (`VICTORY_CARD_METER_FILE=<path>`; unset: nowhere).
+fn table_file() -> Option<&'static std::path::Path> {
+    static FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_METER_FILE").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+/// The first line of the file.
+const TABLE_HEADER: &str =
+    "flush\tframes\ttotal_ms_per_frame\tpipeline_ms_per_frame\tbindings_per_frame\tus_per_binding\tpipeline\n";
+
+/// One pipeline's line in the file: the numbers of the log's line (`us` in
+/// `n` bindings over `frames` frames, `total_us` of all pipelines), with
+/// more decimals.
+fn table_row(flush: u64, frames: u64, total_us: u64, name: &str, n: u64, us: u64) -> String {
+    let f = frames as f64;
+    format!(
+        "{flush}\t{frames}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{name}\n",
+        total_us as f64 / 1e3 / f,
+        us as f64 / 1e3 / f,
+        n as f64 / f,
+        us as f64 / n.max(1) as f64
+    )
+}
+
+/// Appends the whole table by pipeline to the file, if there is one. An
+/// error is said once and the file is left alone from then on.
+fn write_table(frames: u64, total_us: u64, table: &[(String, (u64, u64))]) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    let Some(path) = table_file() else {
+        return;
+    };
+    if FAILED.load(Relaxed) {
+        return;
+    }
+    let flush = FLUSHES.fetch_add(1, Relaxed);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut text = String::new();
+        if file.metadata()?.len() == 0 {
+            text.push_str(TABLE_HEADER);
+        }
+        for (name, (n, us)) in table {
+            text.push_str(&table_row(flush, frames, total_us, name, *n, *us));
+        }
+        file.write_all(text.as_bytes())
+    })();
+    if let Err(e) = written {
+        FAILED.store(true, Relaxed);
+        tracing::warn!("VICTORY_CARD_METER_FILE {}: {e}; the table is not written there any more", path.display());
+    }
+}
+
 /// The pairs recorded long enough ago are read and added to the frame
 /// log's totals. Called once a frame.
 pub(crate) fn collect() {
@@ -341,6 +400,7 @@ pub(crate) fn collect() {
                 table.iter().map(|&(_, (n, _))| n).sum::<u64>() as f64 / frames,
                 table.len()
             );
+            write_table(m.frames, all, &table);
             for (name, (n, us)) in table.into_iter().take(48) {
                 tracing::info!(
                     "  pipeline {:6.2} ms a frame in {:6.1} bindings ({:7.1} us each): {name}",
@@ -367,6 +427,15 @@ mod tests {
         names.insert("mesh VS_A, pixel PS_B".to_string());
         names.insert("a".repeat(100));
         assert_eq!(name_of(&names), format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60)));
+    }
+
+    #[test]
+    fn a_pipelines_line_in_the_file_has_the_numbers_of_the_log() {
+        // 4 frames: 8 ms of all pipelines, 4 ms of this one in 8 bindings.
+        assert_eq!(
+            table_row(3, 4, 8_000, "[compute ab]", 8, 4_000),
+            "3\t4\t2.0000\t1.0000\t2.0000\t500.00\t[compute ab]\n"
+        );
     }
 
     #[test]
