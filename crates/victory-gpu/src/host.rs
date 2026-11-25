@@ -1364,10 +1364,19 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// Whether host objects are named without device-removed data on, for
+/// crash tools that read the names themselves (Radeon GPU Detective):
+/// `VICTORY_D3D12_NAMES=1`.
+fn names_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_NAMES").is_some_and(|v| v != "0"))
+}
+
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (with device-removed data on, or
+/// `VICTORY_D3D12_NAMES=1`).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if (dred_on() || names_on())
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
