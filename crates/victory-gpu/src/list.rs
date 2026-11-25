@@ -127,6 +127,11 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// Closed host lists that run before `host`, in order, with no wait
+    /// between them: the recording before a run of indirect draws and the
+    /// list of that run's clamps (`crate::indirect::hoisting`).
+    #[cfg(windows)]
+    runs: Vec<crate::host::HostList>,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -310,6 +315,13 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    // Runs before the host list become parts of their own, so that the
+    // wait stands after them.
+    end_hoist(list);
+    for (i, host) in std::mem::take(&mut list.runs).into_iter().enumerate() {
+        let waits = if i == 0 { std::mem::take(&mut list.gate) } else { Vec::new() };
+        list.earlier.push(Part { waits, host });
+    }
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -330,6 +342,7 @@ fn cut(this: This, wait: ValueWait) {
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
     }
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).budget_of = None;
     if let Some(done) = list.host.replace(fresh) {
         let waits = std::mem::replace(&mut list.gate, vec![wait]);
         list.earlier.push(Part { waits, host: done });
@@ -341,6 +354,103 @@ fn cut(this: This, wait: ValueWait) {
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
     }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the
+/// clamps of the list's draws already go to a list before it and no title
+/// command since may have written arguments, the recording is cut here.
+/// What was recorded is closed into [`List::runs`], a list for the clamps
+/// of the draws to come is opened after it, and the recording goes on in a
+/// new list, with the state the title set.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if this.is_null() || !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and no reference to its host list is in use here.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    {
+        let state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.hoist.as_ref().is_some_and(|h| h.writes == state.writes) {
+            return;
+        }
+    }
+    end_hoist(list);
+    let Some(current) = list.host.as_ref() else { return };
+    let untouched = current.untouched();
+    // Every piece of the title list charges one budget, as the one host
+    // list did: the first piece's (a fresh budget per piece let a dispatch
+    // after a run do all the work the pieces before had spent, 982f in the
+    // A/B of 2026-11-25 23:45, 12 -> 169 ms).
+    let lent = {
+        let state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.budget_of.clone()
+    }
+    .or_else(|| current.budget_to_lend());
+    let Some(next) = fresh_list() else { return };
+    // An empty recording holds the clamps itself.
+    let clamps = if untouched {
+        list.host.replace(next)
+    } else {
+        let Some(clamps) = fresh_list() else { return };
+        current.close();
+        if let Some(done) = list.host.replace(next) {
+            list.runs.push(done);
+        }
+        Some(clamps)
+    };
+    let Some(clamps) = clamps else { return };
+    if let Some(lent) = &lent {
+        // The first piece keeps its own (it is the one lent).
+        if !untouched || clamps.budget_to_lend().as_ref().is_none_or(|own| own.0 != lent.0) {
+            clamps.lend_budget(lent.clone());
+        }
+        if let Some(host) = list.host.as_ref() {
+            host.lend_budget(lent.clone());
+        }
+    }
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.budget_of = lent;
+    if let Some(host) = list.host.as_ref() {
+        state.replay(host);
+    }
+    let writes = state.writes;
+    state.hoist = Some(crate::indirect::Hoist::new(clamps, writes));
+}
+
+/// The run of hoisted clamps of `list` ends: its list, closed, joins the
+/// runs before the current host list.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    let hoist = list.state.lock().unwrap_or_else(|e| e.into_inner()).hoist.take();
+    if let Some(h) = hoist {
+        list.runs.push(h.finish());
+    }
+}
+
+/// A title command that may write indirect arguments: a run of hoisted
+/// clamps ends before the next indirect draw.
+#[cfg(windows)]
+fn note_write(this: This) {
+    if this.is_null() || !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).writes += 1;
+}
+
+/// The host lists a title list runs, in order, when nothing waits between
+/// them: its runs, then its host list (the paths that execute lists in place).
+#[cfg(windows)]
+pub(crate) fn host_runs<'a>(this: This) -> Vec<&'a crate::host::HostList> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists, closed and submitted.
+    let list = unsafe { &*this.cast::<List>() };
+    list.runs.iter().chain(list.host.as_ref()).collect()
 }
 
 /// Whether list `this` recorded a wait for a memory value (with waits cut
@@ -410,7 +520,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-        let single = earlier.is_empty() && gate.is_empty();
+        let single = earlier.is_empty() && gate.is_empty() && list.runs.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
             .map(|part| {
@@ -424,8 +534,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 )
             })
             .collect();
+        let mut gate = Some(gate);
+        for run in std::mem::take(&mut list.runs) {
+            pieces.push((gate.take().unwrap_or_default(), Detached { host: run, _uploads: Vec::new(), _state: Default::default() }));
+        }
         pieces.push((
-            gate,
+            gate.unwrap_or_default(),
             Detached {
                 host,
                 _uploads: uploads,
@@ -462,8 +576,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
-            order.push(i);
+        if taken.iter().any(|(t, _)| *t == this) {
+            // Every host list of it again, in order.
+            order.extend(taken.iter().enumerate().filter(|(_, (t, _))| *t == this).map(|(i, _)| i));
             continue;
         }
         let Some(fresh) = fresh_list() else {
@@ -475,16 +590,21 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let (host, uploads, state) = unsafe {
+        let (host, uploads, state, runs) = unsafe {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            let runs = std::mem::take(&mut (*list).runs);
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            (host, uploads, state)
+            (host, uploads, state, runs)
         };
+        for run in runs {
+            order.push(taken.len());
+            taken.push((this, Detached { host: run, _uploads: Vec::new(), _state: Default::default() }));
+        }
         order.push(taken.len());
         taken.push((
             this,
@@ -596,6 +716,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        runs: Vec::new(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -626,6 +748,11 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists, and records nothing into it while closing.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -653,6 +780,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        list.runs.clear();
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -822,6 +950,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    note_write(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -853,6 +983,8 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    note_write(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -943,6 +1075,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    note_write(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1351,6 +1485,8 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
+    note_write(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -1406,6 +1542,8 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    #[cfg(windows)]
+    note_write(this);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1757,6 +1895,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2017,10 +2158,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    note_write(this);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    note_write(this);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {

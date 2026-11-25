@@ -412,6 +412,24 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    record_clamp_full(c, l, (dst, before), None, budget, (src, src_offset), count, (kind, stride, records), ahead)
+}
+
+/// [`record_clamp_as`]; with `hoisted_dst`, the clamp writes at that offset
+/// of `dst` (a hoisted list's buffer, already writable: [`Hoist::room`])
+/// with no barriers of its own.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_full(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    hoisted_dst: Option<u64>,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,
@@ -420,7 +438,8 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_gpu) =
+        unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + hoisted_dst.unwrap_or(0)) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
@@ -456,6 +475,13 @@ fn record_clamp_as(
         None => (src_gpu, 0u32, 0u32),
     };
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    if hoisted_dst.is_some() {
+        // SAFETY: an open list; our root signature and pipeline; live source,
+        // count, destination and budget buffers; the destination is in
+        // unordered access and each clamp writes its own bytes of it.
+        unsafe { clamp_dispatch(c, l, &constants, src_gpu, count_gpu, dst_gpu, budget, records) };
+        return true;
+    }
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -486,16 +512,7 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
-        }
+        clamp_dispatch(c, l, &constants, src_gpu, count_gpu, dst_gpu, budget, records);
         l.ResourceBarrier(&second[skip..]);
     }
     true
@@ -687,6 +704,135 @@ pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], 
         l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
     }
     all
+}
+
+/// The clamp's dispatch: our root signature and pipeline, its constants
+/// and buffers, one thread a record.
+/// # Safety
+/// An open list; live buffers at those addresses.
+#[allow(clippy::too_many_arguments)]
+unsafe fn clamp_dispatch(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    constants: &[u32; 6],
+    src_gpu: u64,
+    count_gpu: u64,
+    dst_gpu: u64,
+    budget: u64,
+    records: u32,
+) {
+    if records == 0 {
+        return;
+    }
+    // SAFETY: as the caller says.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+    }
+}
+
+/// Whether the clamps of a run of indirect draws go to a host list of
+/// their own that runs before the one that draws (`VICTORY_HOIST_CLAMPS=1`;
+/// off by default), as in Belobug's ccab973: then nothing of ours, and no
+/// barrier, stands between the draws of the run. Every clamp inline had
+/// two waits for all earlier shader work around it (4,200-5,350 a frame,
+/// 35-50 ms of card time in the run of 2026-11-25 23:34).
+///
+/// The run ends, and the next indirect draw starts another, at any title
+/// command that may write arguments (a dispatch, a copy, a resolve, a
+/// memory write: `crate::list::note_write`), at a cut for a wait, and at
+/// the list's close or reset.
+/// shortcut: a draw whose shaders write the arguments of a later draw of
+/// the same run is not seen (the later draw reads them as they were before
+/// the run); none is known.
+pub(crate) fn hoisting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_CLAMPS").is_some_and(|v| v == "1"))
+}
+
+/// The open host list that takes the clamps of a run, and its buffer.
+pub(crate) struct Hoist {
+    pub(crate) clamps: HostList,
+    /// The title's writes counted when the run began (`crate::draw::State::writes`).
+    pub(crate) writes: u64,
+    /// The buffer of clamped records and the bytes used of it.
+    room: Option<(ID3D12Resource, u64)>,
+}
+
+/// The bytes of clamped records one hoisted list holds; past them the
+/// clamps of the run go inline again.
+const HOIST_ROOM: u64 = 1 << 20;
+
+impl Hoist {
+    pub(crate) fn new(clamps: HostList, writes: u64) -> Hoist {
+        Hoist { clamps, writes, room: None }
+    }
+
+    /// Room for `bytes` of records: the buffer and the offset. The first
+    /// time, the list waits for earlier shader writes (the title's passes
+    /// that wrote the arguments ran before it) and makes the buffer writable.
+    fn room(&mut self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        let bytes = bytes.next_multiple_of(16);
+        if self.room.is_none() {
+            let buffer = self.clamps.indirect_scratch(HOIST_ROOM)?;
+            let before = self.clamps.indirect_state(&buffer);
+            // SAFETY: an open list and a live buffer in `before`.
+            unsafe {
+                self.clamps
+                    .list
+                    .ResourceBarrier(&[uav_barrier(), transition(&buffer, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)])
+            };
+            self.room = Some((buffer, 0));
+        }
+        let (buffer, used) = self.room.as_mut()?;
+        if *used + bytes > HOIST_ROOM {
+            return None;
+        }
+        let at = *used;
+        *used += bytes;
+        Some((buffer.clone(), at))
+    }
+
+    /// The list, closed, with its records left common: the draws read them
+    /// as indirect arguments by promotion, after the transition has made
+    /// the clamps' writes visible.
+    pub(crate) fn finish(self) -> HostList {
+        if let Some((buffer, _)) = &self.room {
+            // SAFETY: an open list; the buffer is in unordered access.
+            unsafe {
+                self.clamps.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
+        self.clamps.close();
+        self.clamps
+    }
+}
+
+/// As [`bound`], recorded in the run's hoisted list: the buffer and offset
+/// of the clamped records. `None` (nothing recorded) where the inline
+/// clamp must do it.
+pub(crate) fn bound_before(
+    h: &mut Hoist,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget) = (clamp()?, h.clamps.budget()?);
+    let (buffer, at) = h.room(bytes)?;
+    let list = &h.clamps.list;
+    record_clamp_full(c, list, (&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), Some(at), budget, src, count, spec, false)
+        .then_some((buffer, at))
 }
 
 /// Whether every draw served from a window is checked against a fresh
@@ -2172,6 +2318,148 @@ void main() {
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
         assert_eq!(hits, 1, "the budget starts empty at the next submission");
+    }
+
+    /// Hoisted clamps (`VICTORY_HOIST_CLAMPS`): records clamped in a list of
+    /// their own, at offsets of one buffer, are read by executions in the
+    /// list after it with no barrier of ours between them, and run as many
+    /// groups as the inline clamp would give them.
+    #[test]
+    fn host_list_hoisted_clamps_serve_the_next_list_at_their_offsets() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (Ok(clamps), Ok(draws)) = (host.new_list(), host.new_list()) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: STRIDE, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap() };
+            sig.unwrap()
+        };
+        let (Some((src, src_ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(64), host.shared_buffer(256)) else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            let words = [2u32, 1, 1, 3, 1, 1, 4, 1, 1];
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr, words.len() * 4);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        let mut hoist = Hoist::new(clamps, 0);
+        let a = bound_before(&mut hoist, (&src, 0), None, (KIND_DISPATCH, STRIDE, 1)).expect("first hoisted clamp");
+        // Two records in one clamp, after the first one's bytes.
+        let b = bound_before(&mut hoist, (&src, 12), None, (KIND_DISPATCH, STRIDE, 2)).expect("second hoisted clamp");
+        assert_eq!(a.1, 0);
+        assert_eq!(b.1, 16, "each clamp takes its bytes rounded to 16");
+        assert_eq!(windows::core::Interface::as_raw(&a.0), windows::core::Interface::as_raw(&b.0), "one buffer for the run");
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: an open list; the worker's root signature and pipeline;
+        // buffers the test holds until the lists have run.
+        unsafe {
+            draws.list.SetComputeRootSignature(&worker.root);
+            draws.list.SetPipelineState(&worker.pso);
+            draws.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            draws.list.ExecuteIndirect(&signature, 1, &a.0, a.1, None, 0);
+            draws.list.ExecuteIndirect(&signature, 2, &b.0, b.1, None, 0);
+        }
+        let clamps = hoist.finish();
+        draws.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&clamps, &draws]);
+        assert_eq!(host.log_messages(), None, "the debug layer found an error while running");
+        // SAFETY: the lists have run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 2 + 3 + 4, "every hoisted record runs its groups");
+    }
+
+    /// Pieces of one title list (`VICTORY_HOIST_CLAMPS`) share the first
+    /// piece's budget: what a clamp in the first spent, a clamp in a later
+    /// list cannot spend again, with the card's copy handed on between them.
+    #[test]
+    fn host_list_lent_budget_is_spent_across_lists() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (Ok(first), Ok(later)) = (host.new_list(), host.new_list()) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: STRIDE, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap() };
+            sig.unwrap()
+        };
+        let (Some((big, big_ptr)), Some((small, small_ptr)), Some((hits_buf, hits_ptr))) =
+            (host.shared_buffer(3 * u64::from(STRIDE)), host.shared_buffer(u64::from(STRIDE)), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            for i in 0..3 {
+                std::ptr::copy_nonoverlapping([65535u32, 16, 1].as_ptr().cast::<u8>(), big_ptr.add(i * STRIDE as usize), 12);
+            }
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        let run = |list: &HostList, scratch: &ID3D12Resource| {
+            // SAFETY: an open list; the worker's root signature and pipeline;
+            // buffers the test holds until the lists have run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, 0, None, 0);
+            }
+        };
+        // The first list spends the budget (clamped, not executed).
+        bound(&first, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+        let lent = first.budget_to_lend().expect("a budget to lend");
+        later.lend_budget(lent);
+        first.close();
+        let scratch = bound(&later, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        run(&later, &scratch);
+        later.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&first, &later]);
+        assert_eq!(host.log_messages(), None, "the debug layer found an error while running");
+        // SAFETY: the lists have run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 0, "the later list's record finds the first list's budget spent");
+        // After their resets each list has its own budget again.
+        first.reset();
+        later.reset();
+        let scratch = bound(&later, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        run(&later, &scratch);
+        later.close();
+        first.close();
+        host.execute(&[&first, &later]);
+        // SAFETY: as above.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 1, "a reset list charges its own budget");
     }
 
     /// The window check: a record nothing wrote since its window clamped
