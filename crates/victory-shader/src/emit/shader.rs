@@ -27,6 +27,21 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// Title addresses of the buffer views of the view heap by slot, for
+/// console code that reads a descriptor's address out of a table at an
+/// index it computes (ray-tracing structures and the programs that walk
+/// them) and finds no root view to ask the host about. Four dwords per
+/// slot (`SLOT_VIEWS_RECORD_BYTES`): the title address of the view's first
+/// byte (low, high), its byte length and its element stride. Slots without a
+/// buffer view read zero. Like [`SLOT_STRIDES`], the host readies the
+/// buffer views of the whole heap when a shader has this root SRV.
+pub const SLOT_VIEWS: u8 = 252;
+/// Slots of the [`SLOT_VIEWS`] buffer (heap indices are clamped to it).
+pub const SLOT_VIEWS_COUNT: u32 = SLOT_STRIDES_COUNT;
+/// Bytes of one [`SLOT_VIEWS`] record (four dwords); a power of two, the
+/// shader indexes it by shifting.
+pub const SLOT_VIEWS_RECORD_BYTES: u32 = 16;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the

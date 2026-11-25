@@ -86,6 +86,12 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Shift taking a heap slot to the byte of its [`shader::SLOT_VIEWS`] record.
+fn view_record_shift() -> u32 {
+    debug_assert!(super::shader::SLOT_VIEWS_RECORD_BYTES.is_power_of_two());
+    super::shader::SLOT_VIEWS_RECORD_BYTES.trailing_zeros()
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -2767,6 +2773,60 @@ impl<'a> Lower<'a> {
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
         Some((lo, hi))
+    }
+
+    /// [`view_address`] for a table entry chosen at run time (a computed
+    /// index into a descriptor table or the resource heap): the host's table
+    /// of the buffer views' title addresses by heap slot
+    /// ([`shader::SLOT_VIEWS`]).
+    fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V, V)>, Why> {
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("an untracked descriptor load")?;
+        let root = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .map(|p| p.root)
+            .ok_or("a descriptor outside the tables")?;
+        if !matches!(root, RootType::Table | RootType::ResourceHeap) || a.dynamic.is_none() {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, first, false)?;
+        let last = self.s.m.i32(super::shader::SLOT_VIEWS_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let shift = self.s.m.i32(view_record_shift());
+        let byte = self.s.m.bin(c, Bin::Shl, slot, shift);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(0xF);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        let len = self.s.m.extract(c, r, 2);
+        let stride = self.s.m.extract(c, r, 3);
+        let (lo, hi, len, stride) = (
+            self.as_int(lo),
+            self.as_int(hi),
+            self.as_int(len),
+            self.as_int(stride),
+        );
+        // The loaded address is the view's own: `a.offset` is a place in the
+        // descriptor table (already part of `slot`), not in the buffer.
+        Ok(Some((lo, hi, len, stride)))
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -5736,7 +5796,9 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // from the host, the other dwords have no value. A table entry
+            // chosen at run time asks the host's table of view addresses;
+            // one load may carry two descriptors (8 dwords).
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
@@ -5754,6 +5816,31 @@ impl<'a> Lower<'a> {
                     }
                 }
                 return Ok(());
+            }
+            if count <= 8 && count % 4 == 0 {
+                let mut wrote = false;
+                for group in 0..count / 4 {
+                    let first = (4 * group) as u8;
+                    let Some((lo, hi, len, stride)) =
+                        self.view_address_indexed(site, first).ok().flatten()
+                    else {
+                        continue;
+                    };
+                    wrote = true;
+                    for k in 4 * group..4 * group + 4 {
+                        let reg = Reg::S(code + k as u8);
+                        let v = match k % 4 {
+                            0 => lo,
+                            1 => hi,
+                            2 => len,
+                            _ => stride,
+                        };
+                        self.write(inst, reg, v, None);
+                    }
+                }
+                if wrote {
+                    return Ok(());
+                }
             }
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
@@ -5890,7 +5977,12 @@ impl<'a> Lower<'a> {
                 // a buffer whose address alone is read does.)
                 if first == 0
                     && (computed || unused.is_some())
-                    && let Some((lo, hi)) = self.view_address(site)
+                    && let Some((lo, hi)) = self.view_address(site).or_else(|| {
+                        self.view_address_indexed(site, 0)
+                            .ok()
+                            .flatten()
+                            .map(|(lo, hi, _, _)| (lo, hi))
+                    })
                 {
                     words.extend([(0, lo), (1, hi)]);
                 }
@@ -11298,6 +11390,28 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn view_records_are_indexed_by_their_sixteen_byte_size() {
+        // The host writes four dwords per slot (address lo/hi, length,
+        // stride); the shader must step 16 bytes, not 8.
+        assert_eq!(super::super::shader::SLOT_VIEWS_RECORD_BYTES, 16);
+        assert_eq!(1u32 << super::view_record_shift(), 16);
+        assert_eq!(5u32 << super::view_record_shift(), 80);
+    }
+
+    #[test]
+    fn view_address_indexed_keeps_the_loaded_address() {
+        // The table offset is part of the slot, not of the buffer address:
+        // the function must not add `a.offset` to what the table holds.
+        let src = include_str!("lower.rs");
+        let body = src
+            .split("fn view_address_indexed")
+            .nth(1)
+            .and_then(|s| s.split("fn address_plus").next())
+            .unwrap();
+        assert!(!body.contains("address_plus("));
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
