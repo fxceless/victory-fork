@@ -199,6 +199,85 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     eprintln!("ran on the hardware device: the sum {:#x} of the console's tree", tree[0]);
 }
 
+/// Two live wave64s exchange dwords via LDS. A third wave takes the
+/// empty-EXEC exit. Its lanes must reach both host rendezvous without
+/// writing their result slots. Every lane initializes its own output first.
+#[test]
+fn retired_waves_leave_the_live_groups_lds_exchange_intact() {
+    let body = [
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (byte offset)
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000E, // s_cbranch_execz to s_endpgm
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x3A08_00C0, // v_xor_b32 v4, 64, v0 (neighboring wave)
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xE070_1000,
+        0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&body, true, 192);
+    let StageIo::Cs(io) = &mut native.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 2 << 15; // 1024 bytes of LDS
+    let ir = crate::spill::build(&native).expect("build handwritten program");
+    let p = ir::without_early_outs(&ir).expect("empty waves follow the common barriers");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower for 32 lanes");
+    if let Ok(mut v) = validator::Validator::load(None) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("validate the LDS exchange");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (backend, warp) in [("WARP", true), ("hardware", false)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("No SM 6.6 {backend} device; dispatch skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{backend}: {e}"));
+        for below in [0, 128] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                    ud[u.index as usize] = below;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(192)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{backend}: {e}"));
+            let expected: Vec<_> = (0..192)
+                .map(|t| if t < below { (t ^ 64) + 1 } else { 0 })
+                .collect();
+            assert_eq!(out[0], expected, "{backend}, {below} active threads");
+            eprintln!("{backend}: verified 192 dwords with {below} active threads");
+        }
+    }
+}
+
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
 /// (0x4000) is 3 + 1.5 steps of that range, which the console rounds up to 0x4202. The
 /// host's `f32tof16` may give 0x4201 (toward zero); with `VICTORY_F16_NEAREST=1` the
