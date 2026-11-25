@@ -999,6 +999,10 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        // The heap gives out addresses it gave out before: a hole the
+        // guards noted there is one no more.
+        #[cfg(windows)]
+        crate::watch::title_pages_changed(ptr.as_ptr() as usize, layout.size());
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
