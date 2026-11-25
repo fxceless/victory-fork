@@ -567,6 +567,9 @@ by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
+To compare CPU load, GPU engines and memory pressure during a run, see
+[Recording resource usage on Windows](docs/resource-logging.md).
+
 ### Known problems
 
 - Everything in shadow is black (see above).

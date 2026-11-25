@@ -31,3 +31,16 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Resource collector smoke test
+        shell: powershell
+        run: |
+          $rows = @(.\tools\watch-resources.ps1 -ProcessId $PID -Samples 2 -IntervalSeconds 1 |
+              ForEach-Object { $_ | ConvertFrom-Json })
+          $session = @($rows | Where-Object kind -eq session)
+          $samples = @($rows | Where-Object kind -eq sample)
+          if ($session.Count -ne 1 -or !($session[0].data.cargo_packages -like 'victory *')) {
+              throw 'Missing Cargo package inventory'
+          }
+          if ($samples.Count -ne 2 -or $samples[1].pid -ne $PID -or
+              $null -ne $samples[0].data.process.cpu_cores -or $null -eq $samples[1].data.process.cpu_cores -or
+              $samples[1].data.process.working_set_bytes -le 0) { throw 'Invalid process samples' }
