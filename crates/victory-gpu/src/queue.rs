@@ -1501,26 +1501,109 @@ extern "system" fn copy_page_mappings(
         }
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
-        }
+        static BATCHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let batching = *BATCHING.get_or_init(|| {
+            std::env::var("VICTORY_PAGE_BATCHING").is_ok_and(|v| v == "1")
+        });
+
+        ok &= map_page_ranges(ranges, b.destination, pool, pool_pages, batching, map);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+fn map_page_ranges(
+    ranges: &[PageRange],
+    destination: u64,
+    pool: u64,
+    pool_pages: u32,
+    batching: bool,
+    mut map: impl FnMut(u64, u64, u64) -> bool,
+) -> bool {
+    let mut ok = true;
+    let mut at = destination;
+    let mut i = 0;
+
+    while i < ranges.len() {
+        let r = &ranges[i];
+        let len = u64::from(r.count) * PAGE;
+        let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+        if at.checked_add(len).is_none() {
+            return false;
+        }
+
+        let source = match r.kind {
+            0 | 1 => {
+                let Some(source) = pool.checked_add(u64::from(r.start) * PAGE) else {
+                    return false;
+                };
+
+                let source_len = if r.kind == 1 { PAGE } else { len };
+
+                if source.checked_add(source_len).is_none() {
+                    return false;
+                }
+
+                source
+            }
+            _ => 0,
+        };
+
+        // Adjacent single-page requests may form a consecutive run.
+        if batching && r.count == 1 && matches!(r.kind, 0 | 1)
+            && inside(1) && source != 0
+        {
+            let mut run = 1usize;
+
+            while run < ranges.len() - i && run < 64 {
+                let next = &ranges[i + run];
+                if next.count != 1
+                    || !matches!(next.kind, 0 | 1)
+                    || r.start.checked_add(run as u32) != Some(next.start)
+                    || next.start >= pool_pages
+                {
+                    break;
+                }
+                run += 1;
+            }
+
+            let bytes = run as u64 * PAGE;
+            let disjoint = match (
+                at.checked_add(bytes),
+                source.checked_add(bytes),
+            ) {
+                (Some(dst_end), Some(src_end)) => {
+                    dst_end <= source || src_end <= at
+                }
+                _ => false,
+            };
+
+            if run > 1 && disjoint
+                && at % PAGE == 0 && source % PAGE == 0
+            {
+                ok &= map(at, source, bytes);
+
+                at += bytes;
+                i += run;
+                continue;
+            }
+        }
+
+        ok &= match r.kind {
+            0 if inside(r.count) => map(at, source, len),
+            1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+            2 => map(at, 0, len),
+            3 => true,
+            _ => false,
+        };
+
+        at += len;
+        i += 1;
+    }
+    ok
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1579,6 +1662,173 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_batching_handles_overlap_and_failure() {
+        let pool = 0x20000000u64;
+        let dst = 0x10000000u64;
+
+        let ranges: Vec<_> = (0..3)
+            .map(|start| PageRange {
+                kind: 0,
+                start,
+                count: 1,
+            })
+            .collect();
+
+        // Overlapping mappings must remain individual.
+        let mut overlap = Vec::new();
+
+        assert!(map_page_ranges(
+            &ranges, pool + PAGE, pool, 3, true,
+            |to, from, len| {
+                overlap.push((to, from, len));
+                true
+            },
+        ));
+
+        assert_eq!(overlap, [
+            (pool + PAGE, pool, PAGE),
+            (pool + 2 * PAGE, pool + PAGE, PAGE),
+            (pool + 3 * PAGE, pool + 2 * PAGE, PAGE),
+        ]);
+
+        // A failed batch must retry individual pages.
+        // An individual failure must propagate.
+        let mut attempts = Vec::new();
+
+        assert!(!map_page_ranges(
+            &ranges, dst, pool, 3, true,
+            |to, from, len| {
+                attempts.push((to, from, len));
+                len == PAGE && to != dst + PAGE
+            },
+        ));
+
+        assert_eq!(attempts, [
+            (dst, pool, 3 * PAGE),
+        ]);
+    }
+
+    #[test]
+    fn page_batching_rejects_address_overflow() {
+        let high = u64::MAX - PAGE + 1;
+        let dst = 0x10000000u64;
+        let pool = 0x20000000u64;
+
+        for batching in [false, true] {
+            let cases = [
+                (high, pool, 0, 2),
+                (dst, high, 1, 1),
+                (dst, high, 0, 2),
+            ];
+
+            for (destination, source, start, count) in cases {
+                let ranges = [PageRange {
+                    kind: 0,
+                    start,
+                    count,
+                }];
+
+                let mut calls = 0;
+
+                assert!(!map_page_ranges(
+                    &ranges, destination, source, 4, batching,
+                    |_, _, _| {
+                        calls += 1;
+                        true
+                    },
+                ));
+
+                assert_eq!(calls, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn page_batching_respects_run_limit() {
+        let dst = 0x10000000u64;
+        let pool = 0x20000000u64;
+
+        let ranges: Vec<_> = (0..65)
+            .map(|start| PageRange {
+                kind: 0,
+                start,
+                count: 1,
+            })
+            .collect();
+
+        let mut calls = Vec::new();
+
+        assert!(map_page_ranges(
+            &ranges, dst, pool, 65, true,
+            |to, from, len| {
+                calls.push((to, from, len));
+                true
+            },
+        ));
+
+        assert_eq!(calls, [
+            (dst, pool, 64 * PAGE),
+            (dst + 64 * PAGE, pool + 64 * PAGE, PAGE),
+        ]);
+    }
+
+    #[test]
+    fn page_batching_preserves_requests_and_fallback() {
+        let dst = 0x10000000u64;
+        let pool = 0x20000000u64;
+
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 1 },
+            PageRange { kind: 1, start: 3, count: 1 },
+            PageRange { kind: 1, start: 7, count: 2 },
+            PageRange { kind: 2, start: 0, count: 1 },
+            PageRange { kind: 3, start: 0, count: 1 },
+            PageRange { kind: 0, start: 9, count: 1 },
+            PageRange { kind: 1, start: 10, count: 1 },
+        ];
+
+        let mut calls = Vec::new();
+        assert!(map_page_ranges(
+            &ranges, dst, pool, 16, true,
+            |to, from, len| {
+                calls.push((to, from, len));
+                true
+            },
+        ));
+
+        assert_eq!(calls, [
+            (dst, pool + 2 * PAGE, 2 * PAGE),
+            (dst + 2 * PAGE, pool + 7 * PAGE, PAGE),
+            (dst + 3 * PAGE, pool + 7 * PAGE, PAGE),
+            (dst + 4 * PAGE, 0, PAGE),
+            (dst + 6 * PAGE, pool + 9 * PAGE, 2 * PAGE),
+        ]);
+
+        let mut baseline = Vec::new();
+        assert!(map_page_ranges(
+            &ranges, dst, pool, 16, false,
+            |to, from, len| {
+                baseline.push((to, from, len));
+                true
+            },
+        ));
+
+        assert_eq!(baseline.len(), 7);
+
+        let mut attempted = Vec::new();
+        assert!(!map_page_ranges(
+            &ranges, dst, pool, 16, true,
+            |to, from, len| {
+                attempted.push((to, from, len));
+                len == PAGE
+            },
+        ));
+
+        assert_eq!(attempted, calls);
+    }
+
 
     #[cfg(windows)]
     #[test]
