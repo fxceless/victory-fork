@@ -1148,6 +1148,23 @@ void main() {
         }
     }
 
+    #[test]
+    fn host_list_keeps_pipeline_objects_once_per_recording() {
+        let Some(host) = super::host() else { return };
+        let a = compile_cs(&host.device, crate::host::CARD_COMPARE).unwrap();
+        let b = compile_cs(&host.device, crate::host::CARD_COMPARE_WIDE).unwrap();
+        let list = host.new_list().unwrap();
+        list.keep_pipeline(&a.pso, &a.root);
+        list.keep_pipeline(&b.pso, &b.root);
+        list.keep_pipeline(&a.pso, &a.root);
+        assert_eq!(list.kept_pipeline_counts(), (2, 4));
+        list.close();
+        list.reset();
+        assert_eq!(list.kept_pipeline_counts(), (0, 0));
+        list.keep_pipeline(&a.pso, &a.root);
+        assert_eq!(list.kept_pipeline_counts(), (1, 2));
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed

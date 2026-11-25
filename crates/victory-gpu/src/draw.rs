@@ -1154,8 +1154,7 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep_pipeline(&p.pso, &p.root);
         }
         for stage in &p.stages {
             let t = stage.translated();

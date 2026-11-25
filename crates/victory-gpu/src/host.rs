@@ -2051,6 +2051,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Pipeline and root-signature handles already kept by this recording.
+    kept_pipelines: std::collections::HashSet<(usize, usize)>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -7131,6 +7133,22 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps both objects once per list recording. The owned references
+    /// prevent either address from being reused until reset.
+    pub(crate) fn keep_pipeline(&self, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        let mut deferred = self.deferred();
+        if deferred.kept_pipelines.insert((pso.as_raw() as usize, root.as_raw() as usize)) {
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_pipeline_counts(&self) -> (usize, usize) {
+        let deferred = self.deferred();
+        (deferred.kept_pipelines.len(), deferred.kept.len())
     }
 
     /// Whether this is the first time since the reset that the list asks
