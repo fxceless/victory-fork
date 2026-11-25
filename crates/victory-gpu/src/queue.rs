@@ -1009,6 +1009,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Tests: a present of `n` frames, as far as the frame count goes.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn presented_add(n: u64) {
+    FRAMES.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in

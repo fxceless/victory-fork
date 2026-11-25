@@ -360,17 +360,43 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
-/// Notes a title texture the frame being built renders to or writes.
-pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+/// Notes a title texture `list` renders to or writes. It counts for the
+/// frame the list is submitted in, not the one being presented while it is
+/// recorded: the title records a frame's lists while the frame before is
+/// still on its way to the screen, and those notes went to that frame or to
+/// none (dumps of 30 to 313 textures of frames that hold about 250).
+/// shortcut: with `VICTORY_ASYNC_PRESENT=1` a present goes behind its
+/// queue's line and the frame count moves on before the lists in that line
+/// are submitted, so their notes may count for the frame after.
+pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    if resource.is_null() || !dump_on() {
         return;
     }
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy));
+    // The list is submitted in one of the next two frames: nothing to keep
+    // unless one of them is listed.
+    let presented = crate::queue::presented();
+    if !listed(presented + 1) && !listed(presented + 2) {
+        return;
     }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    let resource = resource as usize;
+    list.defer_host(move || {
+        if !listed(submitted_frame()) {
+            return;
+        }
+        let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        if !targets.iter().any(|&(r, _)| r == resource) {
+            targets.push((resource, copy.clone()));
+        }
+    });
+}
+
+/// The frame a list submitted now belongs to: the one after the last
+/// presented.
+fn submitted_frame() -> u64 {
+    crate::queue::presented() + 1
 }
 
 /// At the present of frame `frame`: saves the noted targets.
@@ -859,5 +885,29 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// A target noted while a list is recorded counts for the frame the
+    /// list is submitted in: the frame before may be presented between the
+    /// recording and the submission, as when the title records ahead.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_list_counts_for_the_frame_it_is_submitted_in() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let recorded = super::submitted_frame();
+        let seen = std::sync::Arc::new(AtomicU64::new(0));
+        {
+            let seen = seen.clone();
+            list.defer_host(move || seen.store(super::submitted_frame(), SeqCst));
+        }
+        // The frame before reaches the screen; then the list is submitted.
+        crate::queue::presented_add(1);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(seen.load(SeqCst), recorded + 1);
     }
 }
