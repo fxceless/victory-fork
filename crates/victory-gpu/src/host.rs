@@ -1962,6 +1962,12 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title-written textures whose staging buffer is copied into the host
+    /// texture in this list's prelude if refreshed or not uploaded yet.
+    texture_uploads: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Staging>,
+    )>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5516,10 +5522,14 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // The shared full staging buffer is only safe for a band when
+        // no earlier flight can still be reading it and this is the
+        // only list in the submission. Other paths preserve the full copy.
+        let bands = !late && runs.len() == 1;
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, bands);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(bands) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6412,11 +6422,35 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// from the other, if a list submitted earlier left it behind. For
+    /// title-written textures whose staging buffer was refreshed (or has
+    /// not been uploaded yet) it copies the staging buffer into the host
+    /// texture before the list uses it.
+    fn prelude(&self, bands: bool) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // `run_deferred` has already refreshed each staging buffer, so we
+        // know here exactly which textures need a GPU copy on this submission.
+        let uploads: Vec<_> = {
+            let deferred = self.deferred();
+            deferred
+                .texture_uploads
+                .iter()
+                .filter_map(|(copy, staging)| {
+                    if staging.take_upload() {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+                        crate::framelog::add(crate::framelog::T::Uploads, 1);
+                        Some((copy.clone(), staging.clone()))
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                        None
+                    }
+                })
+                .collect()
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -6475,6 +6509,28 @@ impl HostList {
         let shot_begins = crate::shot::of_the_frame(self);
         #[cfg(feature = "diagnostics")]
         let mut leaving: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32, u32)> = Vec::new();
+        for (copy, _) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(
+                    &copy.texture,
+                    host_state(real),
+                    host_state(COPY_DEST),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
+                        &copy.texture,
+                        host_state(COPY_DEST),
+                        host_state(real),
+                    ));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
@@ -6491,7 +6547,7 @@ impl HostList {
         // The records the list's draws read from slots (`crate::indirect::gather`).
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if barriers.is_empty() && syncs.is_empty() && !gathered {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() && !gathered {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6513,6 +6569,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (copy, staging) in &uploads {
+                    staging.record_copy(list, &copy.texture, bands);
                 }
                 #[cfg(feature = "diagnostics")]
                 for (copy, real, first) in &leaving {
@@ -6677,6 +6736,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.texture_uploads.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
                 && deferred.texture_backs.is_empty())
@@ -7062,10 +7122,20 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Copies `staging` into `copy` in this list's prelude when submitted,
+    /// if `staging` has not been uploaded yet or was detiled by `refresh`.
+    pub(crate) fn defer_texture_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().texture_uploads.push((copy, staging));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, bands: bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -7144,7 +7214,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        staging.refresh(bands);
                     }
                     continue;
                 }
