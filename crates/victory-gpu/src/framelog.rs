@@ -396,12 +396,28 @@ fn text(f: &Frame) -> String {
     let ms = |x: T| f.t[x as usize] / 1e3;
     let s = |i: usize| f.s[i];
     let h = |x: H| f.h[x as usize];
+    let card_samples = if [T::CardSyncLists, T::CardCheckLists, T::CardLists]
+        .into_iter()
+        .all(|kind| t(kind) == 0.0)
+    {
+        "no GPU timestamp samples".to_owned()
+    } else {
+        format!(
+            "by its own clock, of the lists of a moment ago: our send-and-hash lists {:.1} ms in {:.0}, \
+             our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0}",
+            ms(T::CardSyncUs),
+            t(T::CardSyncLists),
+            ms(T::CardCheckUs),
+            t(T::CardCheckLists),
+            ms(T::CardListsUs),
+            t(T::CardLists),
+        )
+    };
     format!(
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
-         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
-         send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
+         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); {card_samples} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
@@ -429,12 +445,6 @@ fn text(f: &Frame) -> String {
         t(T::CopyBackBytes) / 1e6,
         ms(T::CardIdleUs),
         ms(T::CardIdleBehindUs),
-        ms(T::CardSyncUs),
-        t(T::CardSyncLists),
-        ms(T::CardCheckUs),
-        t(T::CardCheckLists),
-        ms(T::CardListsUs),
-        t(T::CardLists),
         t(T::RecordNs) / 1e6,
         t(T::RecordCalls),
         ms(T::ExecuteUs),
@@ -601,6 +611,19 @@ mod tests {
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
         f
+    }
+
+    #[test]
+    fn a_frame_without_gpu_samples_distinguishes_missing_time_from_zero() {
+        let mut frame = frame(1, 100.0);
+        let no_samples = text(&frame);
+        assert!(no_samples.contains("no GPU timestamp samples"), "{no_samples}");
+        assert!(!no_samples.contains("all other lists"), "{no_samples}");
+
+        frame.t[T::CardLists as usize] = 1.0;
+        let zero_time = text(&frame);
+        assert!(zero_time.contains("all other lists 0.0 ms in 1"), "{zero_time}");
+        assert!(!zero_time.contains("no GPU timestamp samples"), "{zero_time}");
     }
 
     #[test]

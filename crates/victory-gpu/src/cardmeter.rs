@@ -170,14 +170,13 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
     }
 }
 
-/// Microseconds between two timestamps of a clock of `frequency` ticks a
-/// second; 0 if the second is not after the first (a pair the card has not
-/// written, or a list that never ran).
-fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
-    if end <= begin || frequency == 0 {
-        return 0;
+/// Microseconds between two written timestamps of a clock of `frequency`
+/// ticks a second. Equal nonzero timestamps are a measured zero.
+fn micros(begin: u64, end: u64, frequency: u64) -> Option<u64> {
+    if end == 0 || end < begin || frequency == 0 {
+        return None;
     }
-    ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
+    Some(((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64)
 }
 
 /// The pairs recorded long enough ago are read and added to the frame
@@ -205,7 +204,9 @@ pub(crate) fn collect() {
         if std::mem::replace(&mut m.seen[pair as usize], (begin, end)) == (begin, end) {
             continue;
         }
-        let us = micros(begin, end, m.frequency);
+        let Some(us) = micros(begin, end, m.frequency) else {
+            continue;
+        };
         use crate::framelog::{T, add};
         match kind {
             Kind::Sync => {
@@ -229,14 +230,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unavailable_timestamp_pair_differs_from_a_measured_zero() {
+        assert_eq!(micros(1, 2, 10_000_000), Some(0));
+        assert_eq!(micros(5, 5, 1_000), Some(0));
+        assert_eq!(micros(9, 5, 1_000), None);
+        assert_eq!(micros(0, 0, 1_000), None);
+        assert_eq!(micros(1, 2, 0), None);
+    }
+
+    #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {
-        assert_eq!(micros(1_000, 11_000, 10_000_000), 1_000);
-        assert_eq!(micros(0, 25_000_000, 25_000_000), 1_000_000);
-        // Not written, or the wrong way round: nothing.
-        assert_eq!(micros(5, 5, 1_000), 0);
-        assert_eq!(micros(9, 5, 1_000), 0);
-        assert_eq!(micros(1, 2, 0), 0);
+        assert_eq!(micros(1_000, 11_000, 10_000_000), Some(1_000));
+        assert_eq!(micros(0, 25_000_000, 25_000_000), Some(1_000_000));
         // A stale second stamp from the ring's last round cannot add hours.
-        assert_eq!(micros(1, u64::MAX, 1), 10_000_000);
+        assert_eq!(micros(1, u64::MAX, 1), Some(10_000_000));
     }
 }
