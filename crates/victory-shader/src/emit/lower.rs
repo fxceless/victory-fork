@@ -24,6 +24,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+/// Software IEEE-754 binary64 arithmetic and wave reduction when the host lacks
+/// `DoublePrecisionFloatShaderOps`.
+#[path = "f64.rs"]
+mod f64;
 
 type Why = &'static str;
 
@@ -287,6 +291,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Cached `(lo, hi)` results of [`Self::active_f64_sum`] in a block so the
+    /// two halves of one 64-bit wave sum emit one reduction.
+    f64_sums: HashMap<(usize, Value, Value, Value), (V, V)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -936,10 +943,19 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Whether the host GPU supports `DoublePrecisionFloatShaderOps`; defaults to
+/// `false` so shaders stay portable when no device was queried.
+static HOST_DOUBLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
 pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Records whether the host GPU supports `DoublePrecisionFloatShaderOps`.
+pub fn set_host_doubles(supported: bool) {
+    HOST_DOUBLES.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
 thread_local! {
@@ -1044,10 +1060,20 @@ pub(super) fn host_max_wave() -> u32 {
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub(super) fn host_doubles() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = TEST_HOST_DOUBLES.get() {
+        return supported;
+    }
+    HOST_DOUBLES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`host_doubles`], for its thread only.
+    pub(super) static TEST_HOST_DOUBLES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1586,6 +1612,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            f64_sums: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -2000,6 +2027,9 @@ impl<'a> Lower<'a> {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
+        if let Some(&(r_lo, r_hi)) = self.f64_sums.get(&(c, lo, hi, mask)) {
+            return Ok(if high { r_hi } else { r_lo });
+        }
         let &m = self
             .x
             .st
@@ -2007,11 +2037,22 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let lo = self.i32_of(lo)?;
-        let hi = self.i32_of(hi)?;
+        let lo_v = self.i32_of(lo)?;
+        let hi_v = self.i32_of(hi)?;
         let z = self.s.m.i32(0);
-        let lo = self.s.m.select(c, on, lo, z);
-        let hi = self.s.m.select(c, on, hi, z);
+        let lo_v = self.s.m.select(c, on, lo_v, z);
+        let hi_v = self.s.m.select(c, on, hi_v, z);
+        let (r_lo, r_hi) = if host_doubles() {
+            self.hw_active_f64_sum(lo_v, hi_v)?
+        } else {
+            self.sw_active_f64_sum(lo_v, hi_v)?
+        };
+        self.f64_sums.insert((c, lo, hi, mask), (r_lo, r_hi));
+        Ok(if high { r_hi } else { r_lo })
+    }
+
+    fn hw_active_f64_sum(&mut self, lo: V, hi: V) -> Result<(V, V), Why> {
+        let c = self.cur;
         self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
         let f64t = self.s.m.double();
         let i32t = self.s.t.i32;
@@ -2031,7 +2072,7 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        if !self.local && self.exchange.as_ref().is_some_and(|e| !e.1) {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -2052,7 +2093,7 @@ impl<'a> Lower<'a> {
             r_lo = self.s.m.extract(c, split, 0);
             r_hi = self.s.m.extract(c, split, 1);
         }
-        Ok(if high { r_hi } else { r_lo })
+        Ok((r_lo, r_hi))
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's

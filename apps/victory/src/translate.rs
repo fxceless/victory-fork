@@ -256,7 +256,8 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        victory_shader::emit::set_host_doubles(host.doubles());
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

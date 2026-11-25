@@ -61,6 +61,8 @@ pub const ALL: u32 = MODULE | FIRST;
 /// declares by flag (the validator's "flags must match usage").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
+    /// A 64-bit float (`double`), as a result or an operand.
+    pub doubles: bool,
     /// A wave or quad operation.
     pub wave_ops: bool,
     /// A 64-bit integer, as a result or an operand.
@@ -968,6 +970,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let is_double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -995,8 +998,13 @@ impl Module {
         for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
+                u.doubles |= is_double(inst.ty);
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                for_each_operand(&inst.op, |v| {
+                    let ty = self.type_of(v);
+                    u.doubles |= is_double(ty);
+                    u.int64 |= wide(ty);
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };

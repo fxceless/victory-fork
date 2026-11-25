@@ -455,6 +455,7 @@ impl Shader {
             self.m.optimise(passes);
             let used = self.m.usage();
             for (flag, used) in [
+                (flags::DOUBLES, used.doubles),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),

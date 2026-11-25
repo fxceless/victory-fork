@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{set_host_doubles, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -191,9 +191,10 @@ pub fn shader_opt() -> u32 {
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
+/// wave, double support, view heap limit) and the settings above. The shader
+/// cache keys on this instead of on the whole executable, so a rebuild that
+/// leaves the translator alone keeps its translations. Call it after the
+/// device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
@@ -208,6 +209,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.push(u8::from(lower::host_doubles()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
@@ -812,6 +814,16 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn translation_fingerprint_tracks_host_doubles() {
+        let prev = lower::TEST_HOST_DOUBLES.replace(Some(false));
+        let sw = translation_fingerprint();
+        lower::TEST_HOST_DOUBLES.set(Some(true));
+        let hw = translation_fingerprint();
+        lower::TEST_HOST_DOUBLES.set(prev);
+        assert_ne!(sw, hw);
     }
 
     #[test]

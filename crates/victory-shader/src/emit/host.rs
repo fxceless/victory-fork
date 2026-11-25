@@ -15,6 +15,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    doubles: bool,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -119,8 +120,22 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            let doubles = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.DoublePrecisionFloatShaderOps.as_bool();
+            Ok(Host { device, doubles })
         }
+    }
+
+    /// Whether the device supports `double` shader operations.
+    pub fn doubles(&self) -> bool {
+        self.doubles
     }
 
     /// The root signature translated shaders expect: user data per stage
