@@ -59,9 +59,8 @@ enum Held {
     /// this (the line is not empty), signals too.
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
-    /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// what the queue holds before it: the host texture and frame number.
+    Present(std::sync::Arc<crate::resource::HostTexture>, u64),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -131,18 +130,12 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     }
     // SAFETY: the plane lists `count` resources.
     let resource = unsafe { *plane.resources };
-    let Some(texture) = crate::resource::host_resource(resource) else {
+    let Some(texture) = crate::resource::host_copy(resource) else {
         return false;
     };
-    // The state the lists recorded so far leave the texture in: what our
-    // copy finds it in when it runs behind them (looked at, not changed).
-    const COPY_SOURCE: u32 = 0x800;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-    crate::resource::host_transition(resource, state);
-    let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -629,10 +622,10 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, frame);
                             }
                         };
                         if all {
@@ -1011,8 +1004,7 @@ pub(crate) fn presented() -> u64 {
 
 /// Shows the first plane's first resource in our window.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: one plane, no scaling or placement.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1122,14 +1114,12 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(texture) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        #[cfg(feature = "diagnostics")]
+        let state = texture.state.load(Ordering::Relaxed);
+        let shown = host.present(&texture, frame);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

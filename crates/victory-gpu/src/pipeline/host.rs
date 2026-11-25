@@ -335,6 +335,31 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Pair translation is independent of graphics state. Keep failures too and
+/// initialize each pair only once, even when pipeline workers race.
+fn mesh_pair(ms: &Shader, ps: &Shader) -> Option<Arc<(Vec<u8>, Vec<u8>)>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Entry = Arc<OnceLock<Option<Arc<(Vec<u8>, Vec<u8>)>>>>;
+    type PairCache = Mutex<HashMap<([u8; 32], [u8; 32]), Entry>>;
+    static PAIRS: OnceLock<PairCache> = OnceLock::new();
+    let entry = PAIRS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((ms.full_hash, ps.full_hash))
+        .or_default()
+        .clone();
+    entry
+        .get_or_init(|| {
+            let ms_host = &ms.translated()?.host;
+            let ps_host = &ps.translated()?.host;
+            victory_shader::emit::prune_mesh_pair((&ms.container, ms_host), (&ps.container, ps_host))
+                .map(Arc::new)
+        })
+        .clone()
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -580,13 +605,40 @@ impl HostPipeline {
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
-                "mesh triangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pair = mesh
+                .zip(find("pixel"))
+                .and_then(|(ms, ps)| mesh_pair(ms, ps));
+            let make = |ms: D3D12_SHADER_BYTECODE, ps: D3D12_SHADER_BYTECODE| {
+                let name = super::library::name(
+                    "mesh triangles",
+                    &root_blob,
+                    &[&code_bytes(&ms), &code_bytes(&ps)],
+                    &state,
+                );
+                mesh_pipeline(&host.device, &root, ms, ps, g, depth_bounds, &name)
+            };
+            let specialized = pair.as_ref().map(|pair| {
+                let bytecode = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                };
+                make(bytecode(&pair.0), bytecode(&pair.1))
+            });
+            let made = match specialized {
+                Some(Ok(pso)) => Ok(pso),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, ?shaders, "specialized host mesh pipeline refused");
+                    host.log_messages();
+                    // Do not issue another pipeline request after device removal.
+                    if unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
+                        Err(e)
+                    } else {
+                        make(code(0), code(1))
+                    }
+                }
+                None => make(code(0), code(1)),
+            };
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -773,8 +825,12 @@ fn stream_pipeline<S>(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
-        // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        || unsafe {
+            // A library load can fail because the device has been removed.
+            device.GetDeviceRemovedReason()?;
+            // SAFETY: the stream subobjects and their data are still live.
+            device.CreatePipelineState(&desc)
+        },
     )
 }
 

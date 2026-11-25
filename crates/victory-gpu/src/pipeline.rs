@@ -60,7 +60,13 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    full_hash: [u8; 32],
     container: Vec<u8>,
+    /// Its result is replaced by the stand-in for indirect light
+    /// ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -114,7 +120,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                full_hash: *full.as_bytes(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: crate::ambient::resolves(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -132,6 +142,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]):
+    /// only then are the host's copies of that memory compared after it.
+    pub(crate) address_stores: bool,
 }
 
 #[cfg(windows)]
@@ -190,6 +203,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let address_stores = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -200,7 +214,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        address_stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -420,6 +439,32 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`]. The programs that walk the ray-tracing structures read them
+/// by address and store their results through views: before this, each of
+/// their dispatches declared every numbered copy of title memory written,
+/// which with the structure builder running was 12 GB snapshotted and
+/// compared on the CPU a frame (3030 ranges of 4 MiB).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),

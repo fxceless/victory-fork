@@ -1012,9 +1012,11 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. Its copies
+            // are given as written only to a shader that can store by address.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let memory_writes = writes && (t.address_stores || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2091,6 +2093,41 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            // The pass bound its own heap, root signature and pipeline:
+            // the next draw or dispatch binds the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the stand-in for indirect light
+    /// ([`crate::ambient`]), if `p` is the program that resolves it and
+    /// the stand-in is on. Whether anything was recorded.
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        if crate::ambient::level().is_none() {
+            return false;
+        }
+        let (slot, offset) = crate::ambient::LIGHT;
+        let named = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let light = match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
+                Some(View::Unordered(r, ..)) => r,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no stand-in for indirect light: the resolve's tables are not as expected");
+            return false;
+        }
+        crate::ambient::replace(list, light as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

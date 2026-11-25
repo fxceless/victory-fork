@@ -1980,6 +1980,12 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // A texture with levels on demand: its tiles are in heaps of ours,
+        // not in the texture, so they stay given until nothing names the
+        // texture any more (`crate::tiles::let_go`).
+        if let Some(tiled) = self.tiled.take() {
+            crate::tiles::let_go(self.texture.clone(), tiled);
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -1998,8 +2004,8 @@ pub(crate) fn placed_textures() -> u64 {
 
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
+#[cfg(all(windows, test))]
+fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
     let before = host
@@ -2859,6 +2865,44 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires a Windows desktop and VICTORY_D3D12_WARP=1"]
+    fn present_tracks_the_copy_source_on_repeated_submissions() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        };
+
+        assert!(std::env::var_os("VICTORY_D3D12_WARP").is_some());
+        let host = crate::host::host().expect("WARP D3D12 device");
+        let before = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        let copied = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &texture(64, 64, 28, 1),
+                before,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image,
+            ),
+            S_OK
+        );
+        let copy = host_copy(image).unwrap();
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+        assert_eq!(copy.state.load(Relaxed), before);
+
+        for frame in 1..=2 {
+            assert!(host.present(&copy, frame).is_some());
+            assert_eq!(copy.state.load(Relaxed), copied, "frame {frame}");
         }
     }
 

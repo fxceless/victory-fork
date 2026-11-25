@@ -202,6 +202,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::tiles::give_back_let_go();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -6795,7 +6796,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            batch.textures_due.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6870,6 +6875,10 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: textures due, refreshed together at the next
+    /// flush (before a step that writes title memory, and before the lists
+    /// run), several at a time.
+    textures_due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -7032,7 +7041,55 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.refresh_textures();
     }
+
+    /// The textures queued by [`wide_textures`], several at a time. Each
+    /// refresh reads its texture's title memory and writes its own staging
+    /// buffer and notes (under its own lock); a texture is queued once per
+    /// batch ([`Batch::texture_due`]). The time counted is the time it
+    /// took, not the threads' sum.
+    fn refresh_textures(&mut self) {
+        match self.textures_due.len() {
+            0 => {}
+            1 => {
+                if let Some(staging) = self.textures_due.pop() {
+                    staging.refresh();
+                }
+            }
+            _ => {
+                let started = std::time::Instant::now();
+                let before = PREPARING[2].load(Ordering::Relaxed);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                    .textures_due
+                    .drain(..)
+                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Whether a submission's texture checks run several at a time
+/// (`VICTORY_WIDE_TEXTURES=1`; off by default).
+///
+/// While the world streams in, a submission checks hundreds of textures,
+/// one after another on the submitting thread: each is read, hashed whole
+/// and, when it changed, detiled into its staging buffer. On an RTX 3090 Ti
+/// machine that was the frame line's "textures", 100-1,400 ms and 250-930
+/// MB a frame for the first two minutes of the world (the opening
+/// cutscene at 0.3-2 fps, some of its frames white), against about 5 ms
+/// later. The textures have nothing to do with one another, so with the
+/// switch the checks due in a batch are queued and run at its next flush
+/// (before a step that writes title memory, and before the lists run: the
+/// order against those steps is as before) on the threads kept for the
+/// snapshots (`crate::shadow::wide`).
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -7550,7 +7607,7 @@ impl Meter {
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                     {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                     {} ranges of memory mapped, unmapped or written under texture views ({} gaps joined at capacity), {} slots made due by them, \
                      {} made slots found unmapped and made null",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
@@ -7565,10 +7622,10 @@ impl Meter {
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
-                let [kept, dropped, slots, uploaded] =
+                let [kept, gaps, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({gaps} gaps joined at capacity);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },
@@ -7677,17 +7734,26 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `source` as frame `frame` and leaves it in `COPY_SOURCE`.
+    /// Returns `None` if nothing was shown and, in diagnostics builds,
+    /// whether the frame was black otherwise.
+    pub(crate) fn present(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(source, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
+        let texture = &source.texture;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7732,7 +7798,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -7762,15 +7827,15 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            // The submission prelude transitions the source in queue order.
+            // The copy list keeps it alive until the list can be reset.
+            copy.settle(source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -7780,14 +7845,11 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {

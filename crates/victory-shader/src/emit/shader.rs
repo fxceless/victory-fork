@@ -26,6 +26,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+/// the low and then the high dword of the title address of the buffer view
+/// at that slot (0: none). For a program that takes a buffer view out of the
+/// heap at an index it computes and reads the address out of the descriptor
+/// to walk the memory behind it (the shadow-ray trace programs take their
+/// ray-tracing structure this way).
+pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
+/// addresses ([`SLOT_ADDRESSES`]).
+pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -72,6 +82,8 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -96,6 +108,9 @@ pub(crate) struct Types {
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
 }
+
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+pub(crate) const COHERENT: u32 = 0x4000;
 
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +172,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Every UAV globally coherent (see `lower::wants_coherent`).
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -213,6 +230,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -346,7 +364,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let props = 11 | 0x1000 | if self.coherent { COHERENT } else { 0 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -431,6 +450,12 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // Resource properties: bit 12 a UAV, bit 14 globally coherent.
+        let props = if self.coherent && props.0 & 0x1000 != 0 {
+            (props.0 | COHERENT, props.1)
+        } else {
+            props
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -570,6 +595,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -583,7 +610,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

@@ -1142,7 +1142,6 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
 const DROPPED: &[&str] = &[
     "s_nop",
     "s_waitcnt",
-    "s_waitcnt_vscnt",
     "s_waitcnt_vmcnt",
     "s_waitcnt_expcnt",
     "s_waitcnt_lgkmcnt",
@@ -1203,6 +1202,9 @@ fn effects(
         Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
     );
     match fields {
+        // The emitter uses this wait to order device memory. Its encoded
+        // scalar operand does not provide a value to the shader.
+        Fields::Sop { .. } if name == "s_waitcnt_vscnt" => {}
         Fields::Sop { dst, src, .. } => {
             if name.starts_with("s_movrel")
                 || name.starts_with("s_subvector_loop")
