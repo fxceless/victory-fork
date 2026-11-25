@@ -192,9 +192,19 @@ What did it, on top of the list below:
   (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
   for lack of room; 44,613 textures let go and made again in 13 minutes).
   Cause of that removal not known either.
-- Known and counted, not fixed yet: an indirect compute pass asks for
-  about 77,500 thread groups in x where one dispatch runs 65,535 (the
-  rest is cut off).
+- A dispatch whose group count is known on the processor (`Dispatch`,
+  `DispatchX`, `DispatchMesh`) and asks for more groups in x than the host
+  runs is now run whole: the host runs it as pieces of at most 65,535, and the
+  translated program adds the piece's first group to its group id (compute
+  and mesh stages; `VICTORY_GROUP_SPLIT=0` gives the old truncation back).
+  Built and unit-tested; not yet seen in a run of the title here.
+- Known and counted, still not fixed: a group count that arrives in GPU
+  memory is clamped instead (the indirect light pass's compute record that
+  asks for about 77,500 thread groups in x runs 65,535, and the rest is cut
+  off). Splitting one would need the host to read each record's count, or a
+  per-record group base, which the argument buffer does not carry. The clamp
+  now counts these too (the frame line reports the largest group count an
+  indirect compute record asked for), so the next run measures what is lost.
 
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken

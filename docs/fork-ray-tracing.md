@@ -39,7 +39,12 @@ shaders and emulates the one instruction.
    the scenes tested). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
-   accesses, and several control-flow shapes.
+   accesses, and several control-flow shapes. A dispatch recorded with its
+   group count on the processor and asking for more groups in `x` than the
+   host runs in one dispatch is now run in pieces, each told where its groups
+   start (`VICTORY_GROUP_SPLIT=0` restores the old truncation). A group count
+   that arrives in GPU memory (the indirect light pass's compute
+   record of about 77,500 groups) is still clamped to 65,535.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.

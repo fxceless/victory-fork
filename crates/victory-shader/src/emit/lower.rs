@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, flags};
+use super::shader::{Shader, USER_GROUP_BASE, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -1007,6 +1007,24 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a dispatch of more groups in `x` than the host runs is split into
+/// several, each told where its groups start ([`Lower::compute_id`]):
+/// on, `VICTORY_GROUP_SPLIT=0` as before (the first 65,535 groups only).
+fn group_split_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GROUP_SPLIT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`group_split_on`], for its thread only.
+    pub(super) static TEST_GROUP_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -2427,12 +2445,26 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    ///
+    /// The host runs a console dispatch of more than 65,535 groups in `x` as
+    /// several dispatches of at most that many (its own limit), one after the
+    /// other. A later one starts at group `x` 65,535: the host says where in
+    /// [`USER_GROUP_BASE`], which this adds to the id. Every id the host
+    /// derives from the group id (`SV_DispatchThreadID`, the mesh stage's
+    /// group) is built from this op too, so all of them move with it.
+    /// `VICTORY_GROUP_SPLIT=0`: the id is the console's own again (and a
+    /// dispatch over the host's limit runs only its first 65,535 groups).
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
-        let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        Val::I32(
-            self.s
-                .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
-        )
+        let (entry, component) = (self.s.entry, self.s.m.i32(u32::from(c)));
+        let id = self
+            .s
+            .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[component]);
+        // Only `x` is split; `y` and `z` are the console's.
+        if c != 0 || !group_split_on() {
+            return Val::I32(id);
+        }
+        let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(entry, Bin::Add, id, base))
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -11291,7 +11323,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, TEST_GROUP_SPLIT, USER_GROUP_BASE, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -11423,6 +11455,11 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_ids(words, rsrc2).map(|_| ())
+    }
+
+    /// [`lowers`], with what it lowered.
+    fn lowers_ids(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -11451,7 +11488,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -11799,6 +11835,30 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// A program that reads its group id reads the host's base too, so that a
+    /// dispatch the host runs in pieces moves its ids; `VICTORY_GROUP_SPLIT=0`
+    /// leaves the id as the console's.
+    #[test]
+    fn a_program_that_reads_its_group_id_gets_the_group_base() {
+        let words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let group_id_x = 1 << 7;
+        let base = |l: &Lowered| {
+            l.user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(USER_GROUP_BASE))
+        };
+        TEST_GROUP_SPLIT.set(Some(true));
+        assert!(base(&lowers_ids(&words, group_id_x).expect("group id")));
+        TEST_GROUP_SPLIT.set(Some(false));
+        assert!(!base(&lowers_ids(&words, group_id_x).expect("group id")));
+        TEST_GROUP_SPLIT.set(None);
     }
 
     #[test]

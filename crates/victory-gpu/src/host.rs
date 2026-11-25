@@ -1315,10 +1315,13 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Indirect mesh dispatches since the last frame line: the largest group
+/// Indirect dispatch records since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
-/// budget buffers, a run late).
+/// budget buffers, a run late). MESH_GROUPS are the mesh records,
+/// COMPUTE_GROUPS the compute ones.
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
@@ -6516,15 +6519,19 @@ impl HostList {
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; with the card's copy, as
+            // list's last run (dispatch records: the largest group count
+            // asked for and the groups asked in all, mesh in words 1 and 2,
+            // compute in words 3 and 4; with the card's copy, as
             // the list's end copied them here): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (largest, all) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                COMPUTE_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6558,7 +6565,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -6599,7 +6606,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7434,13 +7441,19 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
+        let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
-        // (Run 200 counted indirect compute records asking for 77,000 to
-        // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
-        // dispatch runs; the counter went when the clamp's budget moved to
-        // the card's memory.)
+        // Counted by the clamp since the group split of the dispatches
+        // whose count is known on the processor. (Run 200 counted indirect
+        // compute records asking for 77,000 to 98,000 groups in x, 0.2 to
+        // 0.8 a frame, cut to the 65,535 one dispatch runs; the counter
+        // went when the clamp's budget moved to the card's memory.)
+        tracing::info!(
+            "indirect compute dispatches: the largest group count asked for {compute_largest} (clamped: at most 65535), {compute_groups:.0} groups asked per frame"
+        );
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(

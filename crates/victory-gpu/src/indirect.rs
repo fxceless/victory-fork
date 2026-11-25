@@ -118,11 +118,15 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 want = src_args.Load3(src_at);
+        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        // Counted in the budget buffer's words 12 and 16 (below): what the
+        // record asked, before the clamp that keeps the first 65,535 only.
+        asked = want.x;
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
@@ -141,10 +145,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind >= 2) {
         // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh record asked for, and the groups
-        // asked in all.
+        // largest group count a record asked for, and the groups asked in
+        // all. Mesh dispatches in words 4 and 8, compute dispatches in
+        // words 12 and 16.
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
@@ -187,10 +192,15 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
+    if (gi == 0 && kind >= 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        if (kind > 2) {
+            budget.InterlockedMax(4, largest_asked, was);
+            budget.InterlockedAdd(8, all_asked, was);
+        } else {
+            budget.InterlockedMax(12, largest_asked, was);
+            budget.InterlockedAdd(16, all_asked, was);
+        }
     }
     if (!active) {
         return;
