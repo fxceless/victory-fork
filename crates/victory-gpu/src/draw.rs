@@ -3131,7 +3131,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
+        let (bounded, at, compacted_count) = match hit {
             Some((scratch, at, step)) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -3155,7 +3155,7 @@ impl State {
                         self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
                     }
                 }
-                (scratch, at)
+                (scratch, at, None)
             }
             None => {
                 // A window opened at the remembered step that no draw read
@@ -3212,16 +3212,31 @@ impl State {
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
-                // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                // whose unfilled slots must not spend the list's budget, and
+                // whose offsets must stay in-slot for later cached draws.
+                let (bounded, compacted_count) = if windowed && records > 1 {
+                    let Some(scratch) = crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                    ) else {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    (scratch, None)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
-                };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                    let Some(bounded) = crate::indirect::bound(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    ) else {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    (bounded.buffer, bounded.count)
                 };
                 #[cfg(feature = "diagnostics")]
                 if why_not < WINDOW_WHY.len() {
@@ -3259,7 +3274,7 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, 0, compacted_count)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3283,6 +3298,13 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        let (count_buffer, count_offset) = match compacted_count {
+            Some(offset) => (Some(&bounded), offset),
+            None => (
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            ),
+        };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3291,8 +3313,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                count_buffer,
+                count_offset,
             )
         };
         if kind == MESH {
