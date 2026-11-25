@@ -51,15 +51,18 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`).
-pub fn use_shader_cache(dir: std::path::PathBuf) {
+/// (`pipelines`); together they take `max_bytes` on disk at most.
+pub fn use_shader_cache(dir: std::path::PathBuf, max_bytes: u64) {
     #[cfg(windows)]
     {
-        victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
-        victory_gpu::shader_cache::use_shader_cache(dir);
+        // A quarter for the shaders, which compress; the rest for the
+        // pipelines, which do not, in two generations of three eighths.
+        let shaders = max_bytes / 4;
+        victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"), max_bytes - shaders);
+        victory_gpu::shader_cache::use_shader_cache(dir, shaders);
     }
     #[cfg(not(windows))]
-    let _ = dir;
+    let _ = (dir, max_bytes);
 }
 
 pub(crate) fn module() -> HleModule {

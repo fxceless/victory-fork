@@ -10,6 +10,23 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## This copy (wolfattack199/victory-fork)
+
+This is a copy of [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+(at `8dd30ab`) with the changes below on top. Its aim is correct shaders and
+graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
+
+| | State (2026-11-25) |
+|---|---|
+| Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
+| Checks | 537 tests pass, 0 fail, 10 are ignored; three lints that failed the strict check are fixed |
+| In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
+| Graphics in the game | **not measured on this PC yet** |
+| Frame rate in the world | **not measured on this PC yet** |
+
+The results in "Status of this fork" further down are fxceless's, measured on
+another PC.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

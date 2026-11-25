@@ -805,10 +805,11 @@ pub(crate) fn library_removal_note() -> String {
 }
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
-/// early, in `dir` (a folder of the cache) across runs.
+/// early, in `dir` (a folder of the cache) across runs, `max_bytes` of them
+/// on disk at most.
 #[cfg(windows)]
-pub fn use_pipeline_cache(dir: std::path::PathBuf) {
-    library::use_pipeline_cache(dir);
+pub fn use_pipeline_cache(dir: std::path::PathBuf, max_bytes: u64) {
+    library::use_pipeline_cache(dir, max_bytes);
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).

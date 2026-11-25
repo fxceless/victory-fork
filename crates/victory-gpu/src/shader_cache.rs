@@ -2,8 +2,10 @@
 //! cache folder, keyed by the container's content and by the translator
 //! that translated it (its source fingerprint and settings, see `build`), so
 //! a changed translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! `victory-pipeline`'s content-addressed cache, which compresses them,
+//! writes them atomically and keeps them below a limit (a changed translator
+//! leaves every entry of the one before it unused: without a limit they
+//! stayed for good); an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -13,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
@@ -22,9 +24,10 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
-pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+/// Keeps translated shaders in `dir` from now on, `max_bytes` of them on
+/// disk at most.
+pub fn use_shader_cache(dir: PathBuf, max_bytes: u64) {
+    match Cache::open_limited(dir, max_bytes) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
         }
@@ -135,21 +138,21 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
+        let out = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
+        if let Some(shader) = decode(&out.bytes) {
+            let (counter, what) = if out.converted {
+                (&MISSES, "translated")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            tracing::debug!("shader {what}");
             return Ok(shader);
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
+        tracing::debug!("unreadable shader cache entry; translating again");
+        cache.remove(&CacheKey::new(&converter, &input));
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)

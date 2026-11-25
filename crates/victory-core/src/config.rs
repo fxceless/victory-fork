@@ -22,15 +22,31 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The most disk space the shader and pipeline caches take together.
+    pub cache_max_bytes: u64,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
+
+/// What the shader and pipeline caches take at most, unless configured.
+const DEFAULT_CACHE_MB: u64 = 2048;
+/// Below this the caches hold too little of a run to be worth keeping: every
+/// run would translate and compile most of its shaders again.
+const MIN_CACHE_MB: u64 = 256;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    cache: FileCache,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileCache {
+    max_mb: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,14 +86,26 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
-        file: FilePaths,
+        file: FileConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
+        let FileConfig { paths: file, cache } = file;
+        let cache_max_mb = match env("VICTORY_CACHE_MAX_MB").filter(|v| !v.is_empty()) {
+            Some(v) => v
+                .to_str()
+                .and_then(|v| v.trim().parse().ok())
+                .with_context(|| format!("VICTORY_CACHE_MAX_MB is not a number: {v:?}"))?,
+            None => cache.max_mb.unwrap_or(DEFAULT_CACHE_MB),
+        };
+        anyhow::ensure!(
+            cache_max_mb >= MIN_CACHE_MB,
+            "the cache limit is {cache_max_mb} MB; it must be {MIN_CACHE_MB} MB or more"
+        );
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let test_titles = match env("VICTORY_TEST_TITLES") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
@@ -96,6 +124,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            cache_max_bytes: cache_max_mb.saturating_mul(1 << 20),
             source,
         })
     }
@@ -141,6 +170,35 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    fn of(paths: FilePaths) -> FileConfig {
+        FileConfig {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_cache_limit_has_a_default_and_can_be_set() {
+        let limit = |file: Option<u64>, env: Option<&str>| {
+            let file = FileConfig {
+                cache: FileCache { max_mb: file },
+                ..Default::default()
+            };
+            let env = env.map(OsString::from);
+            Config::resolve(file, None, |k| {
+                (k == "VICTORY_CACHE_MAX_MB").then(|| env.clone()).flatten()
+            })
+            .map(|c| c.cache_max_bytes >> 20)
+        };
+        assert_eq!(limit(None, None).unwrap(), DEFAULT_CACHE_MB);
+        assert_eq!(limit(Some(4096), None).unwrap(), 4096);
+        assert_eq!(limit(Some(4096), Some("1024")).unwrap(), 1024);
+        assert_eq!(limit(Some(4096), Some("")).unwrap(), 4096);
+        assert!(limit(None, Some("lots")).is_err());
+        assert!(limit(None, Some("0")).is_err());
+        assert!(limit(Some(MIN_CACHE_MB - 1), None).is_err());
+    }
+
     #[test]
     fn environment_overrides_file() {
         let file = FilePaths {
@@ -149,7 +207,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(of(file), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -161,7 +219,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(of(file), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -172,7 +230,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(of(file), None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -181,7 +239,7 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(of(file), None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]

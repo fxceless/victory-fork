@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod cache;
 mod census;
 mod inspect;
 mod run;
@@ -114,6 +115,13 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Show what the caches take on disk, and their limit.
+    Cache {
+        /// Empty the shader and pipeline caches first (not saves or
+        /// settings); the next run makes them again.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -183,6 +191,7 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::Cache { clear } => cache::run(clear),
     }
 }
 
@@ -201,6 +210,7 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("cache limit : {} MB (shaders and pipelines)", cfg.cache_max_bytes >> 20);
     println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
