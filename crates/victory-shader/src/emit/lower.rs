@@ -7928,7 +7928,17 @@ impl<'a> Lower<'a> {
             x
         };
         let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+        let x = self.s.m.bin(c, Bin::And, x, m);
+        // The neg modifier, per operand (the VOP3P has no abs): the 16-bit
+        // two's complement wraps.
+        let x = if v.neg >> k & 1 != 0 {
+            let z = self.s.m.i32(0);
+            let x = self.s.m.bin(c, Bin::Sub, z, x);
+            self.s.m.bin(c, Bin::And, x, m)
+        } else {
+            x
+        };
+        Ok(x)
     }
 
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
@@ -8228,8 +8238,10 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integers: computed on the low halves, the low 16 bits
+        // kept; the per-operand neg modifier is applied in `half_src`,
+        // the clamp, output modifier and abs are not lowered yet.
+        if v.clamp || v.omod != 0 || v.abs != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {

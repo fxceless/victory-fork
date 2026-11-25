@@ -1001,9 +1001,14 @@ mod tests {
         }
     }
 
-    /// `ds_bpermute_b32` stores nothing: each lane reads the lane its address
-    /// names. It stopped as "LDS the program does not allocate" (sticky lips)
-    /// or "an LDS operation" (the checkerboard shadow masks).
+    /// The VOP3P neg modifier per operand on a plain 16-bit integer
+    /// operation lowers (the two's complement wraps to 16 bits).
+    #[test]
+    fn a_16bit_operation_with_a_neg_modifier_lowers() {
+        // v_add_nc_u16 v0, -v1, v2 (VOP3 opcode 0x303, neg on src0)
+        stores_v1(&[0xD703_0000, 0x2000_0401]).unwrap();
+    }
+
     #[test]
     fn a_backward_permute_reads_the_lane_its_address_names() {
         // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2

@@ -287,6 +287,18 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// The VOP3 neg modifier per operand, on a plain 16-bit integer
+/// operation: the two's complement wraps to 16 bits, so
+/// v_add_nc_u16 v0, -v1, v2 with 1 and 10 gives 0xFFFF + 10 = 9.
+#[test]
+fn v_add_nc_u16_neg_modifier_wraps_to_16_bits() {
+    // v_add_nc_u16 v0, -v1, v2 (VOP3 opcode 0x303, neg on src0)
+    let shader = build_valu_cs(&[0xD703_0000, 0x2000_0401]);
+    run_cases(&shader, &[[1, 10, 0, 0]], |_, _, _, got| {
+        assert_eq!(got, 9, "the neg wraps to 16 bits");
+    });
+}
+
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
