@@ -7758,23 +7758,27 @@ impl HostList {
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
-    pub(crate) fn texture_written(&self, resource: crate::object::This) {
-        if !crate::texback::wanted(resource) {
-            return;
-        }
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&[u32; 10]>) {
+        let Some(format) = crate::texback::wanted_format(resource) else { return };
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
+        if let Some(target) = deferred.back_wanted.iter_mut().find(|target| target.owner() == resource as usize) {
+            target.include(view);
+        } else if let Some(target) = crate::texback::Target::new(resource, format, view) {
             deferred.back_wanted.push(target);
         }
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn recorded_texture_readbacks(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
     /// back go into read-back buffers ([`crate::texback::record`]).
     fn textures_back(&self) {
         const COPY_SOURCE: u32 = 0x800;
-        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        let wanted = std::mem::take(&mut self.deferred().back_wanted)
+            .into_iter().filter(crate::texback::Target::can_tile);
         for target in wanted {
             self.settle(&target.copy, COPY_SOURCE);
             // With device-removed data in its full form: the copies that

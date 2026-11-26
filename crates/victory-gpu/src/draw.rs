@@ -4820,11 +4820,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
-            list.texture_written(*resource as This);
+            list.texture_written(*resource as This, desc.as_ref());
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -5088,3 +5088,7 @@ mod tests {
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "draw/texback_test.rs"]
+mod texback_test;
