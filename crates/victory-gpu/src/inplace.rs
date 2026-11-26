@@ -167,6 +167,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Bytes of title memory in place now: windows, title buffers.
+pub(crate) fn in_place_bytes() -> [u64; 2] {
+    [STATS[1].load(Ordering::Relaxed), STATS[3].load(Ordering::Relaxed)]
+}
+
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
 /// [`place_for`] counts, so that [`gone`] takes it off again.
 pub(crate) fn counted(window: bool, bytes: u64) {

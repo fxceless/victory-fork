@@ -5668,6 +5668,10 @@ static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::ne
 /// new buffer, and copies given a spare one ([`exact_reuse`]).
 static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Since the last frame line: askings of [`exact`] for memory renderer port 1
+/// may hold in place.
+static EXACT_PORTED: AtomicU64 = AtomicU64::new(0);
+
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
 /// element of the copy its buffer has (`descriptor/host.rs` `view_home`).
@@ -5695,6 +5699,14 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let _lap = crate::draw::BindLap::start(7);
+    // v10: views off their elements in memory renderer port 1 has in place
+    // (`VICTORY_PORT_CONSTANTS=1`): their copy is the CPU's snapshot of
+    // memory the card writes in place with nothing waited for (see
+    // `crate::port`'s "What it assumes"); counted for the frame line.
+    if crate::port::wanted(address, len) {
+        EXACT_PORTED.fetch_add(1, Ordering::Relaxed);
+    }
     let width = len.next_multiple_of(256);
     let reuse = exact_reuse();
     let gone = {
@@ -5716,8 +5728,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let due = !reuse || EXACT_SWEEP.fetch_add(1, Ordering::Relaxed).is_multiple_of(SWEEP_EVERY);
         if map.len() >= MANY && due {
             map.retain(|_, (shadow, used)| {
+                // (The cheap tests first: `references` is two calls into the
+                // buffer object, under the lock every list thread takes.)
                 let keep =
-                    Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+                    Arc::strong_count(shadow) > 1 || *used + LATELY > now || crate::host::references(&shadow.buffer) > 1;
                 if !keep {
                     gone.push(shadow.clone());
                 }
@@ -5970,6 +5984,57 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames,
         reused as f64 / frames
+    );
+    let ported = EXACT_PORTED.swap(0, Ordering::Relaxed);
+    if ported > 0 {
+        tracing::info!(
+            "of them, per frame, {:.1} in memory renderer port 1 may hold in place (VICTORY_PORT_CONSTANTS=1): a CPU \
+             snapshot of memory the card writes there with nothing waited for",
+            ported as f64 / frames
+        );
+    }
+}
+
+/// Whether [`shared_line`] is said (`VICTORY_SHARED_LINE`, on unless `0`).
+fn shared_line_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_LINE").is_none_or(|v| v != "0"))
+}
+
+/// v10, with the frame line: what of ours lies in the PC's memory the card
+/// reads (the HUD's SHR, `QueryVideoMemoryInfo` of the non-local group), by
+/// kind, as far as our counters go: host copies' CPU sides (every copy has
+/// one, also those with a side on the card), title memory in place,
+/// spare buffers of copies of views' own bytes, the upload pool's blocks
+/// and the texture uploads alive; then the card sides of copies (in the
+/// card's own memory) for comparison.
+pub(crate) fn shared_line() {
+    if !shared_line_on() {
+        return;
+    }
+    let mb = |b: u64| b >> 20;
+    let [windows_in_place, buffers_in_place] = crate::inplace::in_place_bytes();
+    let spares = SPARES.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+    let pool = crate::pool::memory();
+    let shared = crate::host::host().and_then(|h| h.video_memory()).map_or(0, |[_, _, _, s]| s);
+    let copies = LIVE[1].load(Ordering::Relaxed);
+    let known = copies + windows_in_place + buffers_in_place + spares + (pool[1] << 20) + crate::texture::live_staging_bytes();
+    tracing::info!(
+        "the PC's memory the card reads (SHR {} MB as the system counts it), ours by kind (VICTORY_SHARED_LINE=0: not said): \
+         {} host copies' CPU sides {} MB (of title memory, the copies' own widths a little more), in place {} MB \
+         (windows {}, title buffers {}), spare buffers {} MB, the upload pool {} MB, texture uploads alive {} MB; the rest \
+         ({} MB) is the driver's, read-backs, rings and heaps of ours; the copies' sides on the card {} MB (not in SHR)",
+        mb(shared),
+        LIVE[0].load(Ordering::Relaxed),
+        mb(copies),
+        mb(windows_in_place + buffers_in_place),
+        mb(windows_in_place),
+        mb(buffers_in_place),
+        mb(spares),
+        pool[1],
+        mb(crate::texture::live_staging_bytes()),
+        mb(shared.saturating_sub(known)),
+        mb(CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed)),
     );
 }
 
