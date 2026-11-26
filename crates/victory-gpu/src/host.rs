@@ -1622,6 +1622,12 @@ struct Gather {
     budget: Option<ID3D12Resource>,
     /// Scratch buffers of earlier recordings, kept for the next sets.
     spare: Vec<ID3D12Resource>,
+    /// The sets of the run the list is in (`crate::indirect::gather_runs`):
+    /// their passes are recorded in the list, behind what closed it.
+    runs: Vec<crate::indirect::GatherSet>,
+    /// Scratch buffers of runs that ended, and whether a pass of this
+    /// recording left them readable as indirect arguments.
+    run_spare: Vec<(ID3D12Resource, bool)>,
 }
 
 /// The most argument buffers a list gathers from.
@@ -7376,6 +7382,18 @@ impl HostList {
         self.card_budget_out();
         // The scratch buffers its prelude fills and leaves readable as
         // arguments: common again behind the list, as every scratch buffer.
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather { runs, run_spare, .. } = &mut *gather;
+            run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+            for (scratch, readable) in run_spare.iter_mut().filter(|s| s.1) {
+                // SAFETY: an open list and a live buffer.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                *readable = false;
+            }
+        }
         for set in self.gather.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().filter(|s| s.records() > 0) {
             // SAFETY: an open list and a live buffer.
             unsafe {
@@ -7423,13 +7441,18 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-            let Gather { closed, written, sets, spare, .. } = &mut *gather;
+            let Gather { closed, written, sets, spare, runs, run_spare, .. } = &mut *gather;
             *closed = false;
             written.clear();
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
                 }
+            }
+            run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), false)));
+            run_spare.truncate(GATHER_SETS);
+            for spare in run_spare.iter_mut() {
+                spare.1 = false;
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -7890,7 +7913,71 @@ impl HostList {
     /// From here on the list gathers no records (`crate::indirect::gather`):
     /// what is about to be recorded may write arguments.
     pub(crate) fn gather_close(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        gather.closed = true;
+        // The run ends too: its records were read by the passes before here.
+        let Gather { runs, run_spare, .. } = &mut *gather;
+        run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+    }
+
+    /// Something recorded here may write arguments, and the list goes on
+    /// gathering for its prelude copy by copy
+    /// (`crate::indirect::gather_by_copy`): the run still ends, whatever
+    /// was written. Its passes stand before this point and have read
+    /// their records; a record asked for from here on gets a new pass
+    /// behind it.
+    pub(crate) fn gather_run_ends(&self) {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let Gather { runs, run_spare, .. } = &mut *gather;
+        run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+    }
+
+    /// [`HostList::gather_slot`] in a list that no longer gathers for its
+    /// prelude: a slot of the run's set, whose pass is recorded here when
+    /// the set is new (`crate::indirect::gather_runs`).
+    fn gather_run_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
+        let none = |why: usize| {
+            crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        // (before the lock: it takes the list's other locks)
+        let Some(budget) = self.budget() else {
+            return none(4);
+        };
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        for set in gather.runs.iter_mut().filter(|s| s.is_of(src, src_id, (kind, stride))) {
+            if let Some(slot) = set.slot(offset) {
+                crate::indirect::GATHER_RUNS[1].fetch_add(1, Ordering::Relaxed);
+                return Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), false));
+            }
+        }
+        // None of the run yet for this buffer, or it is full: a pass here.
+        let (scratch, readable) = match gather.run_spare.pop() {
+            Some(spare) => spare,
+            None => {
+                let Some(scratch) = host().and_then(|h| h.uav_buffer(u64::from(crate::indirect::RUN_MOST) * u64::from(crate::indirect::GATHER_STRIDE))) else {
+                    return none(4);
+                };
+                name(&scratch, || "indirect arguments, gathered by runs".to_owned());
+                (scratch, false)
+            }
+        };
+        let Some(table) = self.scratch(u64::from(crate::indirect::RUN_MOST) * 4) else {
+            gather.run_spare.push((scratch, readable));
+            return none(4);
+        };
+        let mut set = crate::indirect::GatherSet::new_run(src.clone(), src_id, (kind, stride), scratch, table);
+        let before = if readable { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON };
+        if !crate::indirect::record_run(&self.list, &set, before, budget) {
+            gather.run_spare.push((set.into_scratch(), readable));
+            return none(0);
+        }
+        crate::indirect::GATHER_RUNS[0].fetch_add(1, Ordering::Relaxed);
+        crate::indirect::GATHER_RUNS[1].fetch_add(1, Ordering::Relaxed);
+        let slot = set.slot(offset)?;
+        let scratch = set.scratch.clone();
+        gather.runs.push(set);
+        Some((scratch, u64::from(slot) * u64::from(stride), true))
     }
 
     /// Shaders of the list were declared to write the host copy numbered
@@ -7907,13 +7994,20 @@ impl HostList {
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
-    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u32, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
         let none = |why: usize| {
             crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
             None
         };
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        // Not for the prelude any more (whole, or this copy: the list's
+        // shaders were declared to write it, `gather_wrote`): for the run,
+        // whose pass stands behind those writes.
         if gather.closed || gather.written.contains(&src_id) {
+            if crate::indirect::gather_runs() {
+                drop(gather);
+                return self.gather_run_slot(src, src_id, offset, (kind, stride));
+            }
             return none(1);
         }
         let found = gather
@@ -7962,7 +8056,7 @@ impl HostList {
         let Some(slot) = set.slot(offset) else {
             return none(3);
         };
-        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), false))
     }
 
     /// Notes what the command about to be recorded does, as a marker

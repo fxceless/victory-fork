@@ -90,6 +90,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     [branch]
     if ((has_count & 4u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
+        // A slot no draw has taken: the table of a run is filled while
+        // the list is recorded, after this pass was (`gather_runs`).
+        if (src_at == 0xffffffffu) {
+            active = false;
+        }
     }
     uint dst_at = id.x * stride;
     uint cost = 0;
@@ -521,6 +526,8 @@ pub(crate) struct GatherSet {
     pub(crate) scratch: ID3D12Resource,
     table_gpu: u64,
     table: usize,
+    /// The slots its table and scratch buffer hold.
+    most: u32,
     /// A record's offset in the buffer, and its slot.
     slots: std::collections::HashMap<u32, u32>,
 }
@@ -531,7 +538,21 @@ unsafe impl Send for GatherSet {}
 
 impl GatherSet {
     pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
-        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
+        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, most: GATHER_MOST, slots: Default::default() }
+    }
+
+    /// A set of one run inside a list ([`gather_runs`]): `RUN_MOST` slots,
+    /// its table all "no record" until draws take slots.
+    pub(crate) fn new_run(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
+        // SAFETY: the table holds `RUN_MOST` words of the list's upload memory.
+        unsafe { std::ptr::write_bytes(table, 0xff, RUN_MOST as usize * 4) };
+        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, most: RUN_MOST, slots: Default::default() }
+    }
+
+    /// Whether the set is of `src` (its number `src_id`), `kind` and `stride`.
+    pub(crate) fn is_of(&self, src: &ID3D12Resource, src_id: u64, (kind, stride): (u32, u32)) -> bool {
+        use windows::core::Interface;
+        self.src_id == src_id && self.kind == kind && self.stride == stride && self.src.as_raw() == src.as_raw()
     }
 
     /// The records gathered so far.
@@ -546,10 +567,10 @@ impl GatherSet {
             return Some(slot);
         }
         let slot = self.slots.len() as u32;
-        if slot >= GATHER_MOST {
+        if slot >= self.most {
             return None;
         }
-        // SAFETY: the table holds `GATHER_MOST` words.
+        // SAFETY: the table holds `most` words.
         unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
         self.slots.insert(offset, slot);
         Some(slot)
@@ -589,7 +610,11 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+///
+/// The third value: a pass was recorded in the list for it just now (the
+/// first record of a run, [`gather_runs`]), which replaced the list's
+/// compute root signature and pipeline.
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
     let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
@@ -597,6 +622,48 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
         return None;
     };
     list.gather_slot(src, src_id, offset, spec)
+}
+
+/// The slots of a run's set ([`gather_runs`]): a pass of four groups.
+pub(crate) const RUN_MOST: u32 = 256;
+
+/// Whether records are also gathered by runs inside a list
+/// (`VICTORY_INDIRECT_GATHER_RUNS=0` turns it off; needs [`gather`]).
+///
+/// A list's prelude can only clamp the records its draws read before
+/// anything in the list may write arguments: after the list's first
+/// dispatch (or draw whose shaders store to buffers) every single record
+/// had a pass of ours in front of its draw again, about 1,090 a frame in
+/// the prologue cell. Each is a wait for every shader write, a compute
+/// dispatch and another wait between two mesh draws; run as the title
+/// wrote them, with no pass (timing only: `VICTORY_INDIRECT_TRUST=draws`),
+/// the title's lists took 42.8 ms of card time a frame instead of 56.
+///
+/// Here the first such record after a dispatch records one pass where it
+/// stands, which is behind that dispatch, for a table of `RUN_MOST` slots
+/// in the list's upload memory that says "no record" everywhere. It and
+/// the single records after it take slots as the list is recorded: the
+/// card reads the table when the pass runs, which is after the list was
+/// recorded. The run ends where the prelude's gathering ends, at the next
+/// dispatch or storing draw; a full table starts another pass.
+pub(crate) fn gather_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: passes recorded for runs, and the records that
+/// took slots of them.
+pub(crate) static GATHER_RUNS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Records in `l`, where it stands, the pass that clamps a run's set
+/// `set` into its scratch buffer (in state `before`), charged to the
+/// list's budget word at `budget`; the scratch buffer is left readable as
+/// indirect arguments. False, with nothing recorded, if it cannot be.
+pub(crate) fn record_run(l: &ID3D12GraphicsCommandList, set: &GatherSet, before: D3D12_RESOURCE_STATES, budget: u64) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    record_gather_as(c, l, (&set.scratch, before), budget, &set.src, set.table_gpu, (set.kind, set.stride, RUN_MOST))
 }
 
 /// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
