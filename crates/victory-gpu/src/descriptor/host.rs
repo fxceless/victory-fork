@@ -1936,15 +1936,38 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: the driver refuses one
+        // that runs past it, and a refused creation leaves the slot holding
+        // whatever was there before, which a shader then reads as a
+        // description of another resource. The declared length is clamped to
+        // what the buffer holds, so reads past it still return zeros.
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let words = size / 4;
+        let first = (offset / 4).min(words).min(u64::from(u32::MAX));
+        let elements = (len / 4).min(words - first).min(u64::from(u32::MAX));
+        if elements == 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    index,
+                    offset,
+                    len,
+                    size,
+                    "a raw buffer view of no bytes inside the buffer: reads nothing"
+                )
+            });
+            self.null_raw_at(index);
+            return;
+        }
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: first,
+                    NumElements: elements as u32,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -1971,14 +1994,36 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all. A UAV
+        // the driver refused would leave another resource's description in
+        // the slot, and a compute shader writing through it removes the
+        // device rather than doing nothing.
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let words = size / 4;
+        let first = (offset / 4).min(words).min(u64::from(u32::MAX));
+        let elements = (len / 4).min(words - first).min(u64::from(u32::MAX));
+        if elements == 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    index,
+                    offset,
+                    len,
+                    size,
+                    "a raw unordered access view of no bytes inside the buffer: writes nowhere"
+                )
+            });
+            self.null_raw_uav_at(index);
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: first,
+                    NumElements: elements as u32,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
