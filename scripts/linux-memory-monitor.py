@@ -85,7 +85,7 @@ def update():
         pass
     try:
         proc = psutil.Process(args.pid)
-        proc_cpu = proc.cpu_percent(None)
+        proc_cpu = proc.cpu_percent(0.2)
         rss, vms = proc.memory_info().rss, proc.memory_info().vms
         threads = proc.num_threads()
         widgets['proc_cpu'].setText(f'{proc_cpu:.0f}% of one core  •  {proc_cpu / psutil.cpu_count() :.1f}% of {psutil.cpu_count()} logical CPUs')
@@ -94,7 +94,7 @@ def update():
         status.setText(f'Game process {args.pid} is running  •  updated continuously')
     except psutil.Error:
         status.setText('Game process is not running')
-    widgets['sys_cpu'].setText(f'{psutil.cpu_percent(None):.0f}% across {psutil.cpu_count()} logical CPUs')
+    widgets['sys_cpu'].setText(f'{psutil.cpu_percent(0.2):.0f}% across {psutil.cpu_count()} logical CPUs')
     vm = psutil.virtual_memory()
     widgets['sys_ram'].setText(f'{vm.available / GIB:.1f} / {vm.total / GIB:.1f} GiB available / total')
     if last_frame:
@@ -121,8 +121,6 @@ def update():
     widgets['target'].setText(f'{args.target_gib:.0f} GiB requested for experiment  •  not reserved')
 
 proc = psutil.Process(args.pid)
-proc.cpu_percent(None)
-psutil.cpu_percent(None)
 timer = QTimer()
 timer.timeout.connect(update)
 timer.start(1000)
