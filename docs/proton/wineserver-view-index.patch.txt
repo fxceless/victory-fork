@@ -1,0 +1,181 @@
+diff --git a/server/file.h b/server/file.h
+index d516681..91eec8b 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -188,6 +188,7 @@ extern struct memory_view *get_exe_view( struct process *process );
+ extern struct file *get_view_file( const struct memory_view *view, unsigned int access, unsigned int sharing );
+ extern const struct pe_image_info *get_view_image_info( const struct memory_view *view, client_ptr_t *base );
+ extern int get_view_nt_name( const struct memory_view *view, struct unicode_str *name );
++extern void init_mapped_views( struct process *process );
+ extern void free_mapped_views( struct process *process );
+ extern size_t get_page_size(void);
+ extern struct mapping *create_fd_mapping( struct object *root, const struct unicode_str *name, struct fd *fd,
+diff --git a/server/mapping.c b/server/mapping.c
+index b9b1b63..2a07e4b 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -131,6 +131,7 @@ static struct list shared_map_list = LIST_INIT( shared_map_list );
+ struct memory_view
+ {
+     struct list     entry;           /* entry in per-process view list */
++    struct rb_entry by_base;         /* entry in per-process address index */
+     struct fd      *fd;              /* fd for mapped file */
+     struct ranges  *committed;       /* list of committed ranges in this mapping */
+     struct shared_map *shared;       /* temp file for shared PE mapping */
+@@ -429,14 +430,45 @@ static int create_temp_file( file_pos_t size )
+     return fd;
+ }
+
++static int compare_view_base( const void *key, const struct rb_entry *entry )
++{
++    client_ptr_t base = *(const client_ptr_t *)key;
++    const struct memory_view *view = RB_ENTRY_VALUE( entry, struct memory_view, by_base );
++
++    return (base > view->base) - (base < view->base);
++}
++
++void init_mapped_views( struct process *process )
++{
++    list_init( &process->views );
++    rb_init( &process->views_by_base, compare_view_base );
++}
++
++/* The view with the greatest base at or below addr, if any. */
++static struct memory_view *view_at_or_before( struct process *process, client_ptr_t addr )
++{
++    struct rb_entry *entry = process->views_by_base.root;
++    struct memory_view *result = NULL;
++
++    while (entry)
++    {
++        struct memory_view *view = RB_ENTRY_VALUE( entry, struct memory_view, by_base );
++        if (addr < view->base) entry = entry->left;
++        else
++        {
++            result = view;
++            entry = entry->right;
++        }
++    }
++    return result;
++}
++
+ /* find a memory view from its base address */
+ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (view->base == base) return view;
++    struct rb_entry *entry = rb_get( &process->views_by_base, &base );
+
++    if (entry) return RB_ENTRY_VALUE( entry, struct memory_view, by_base );
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+ }
+@@ -444,11 +476,9 @@ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base
+ /* find a memory view from any address inside it */
+ static struct memory_view *find_mapped_addr( struct process *process, client_ptr_t addr )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (addr >= view->base && addr < view->base + view->size) return view;
++    struct memory_view *view = view_at_or_before( process, addr );
+
++    if (view && addr - view->base < view->size) return view;
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+ }
+@@ -462,14 +492,10 @@ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_s
+     if (addr & host_page_mask) return 0;
+     if (addr + size < addr) return 0;  /* overflow */
+
+-    /* check for overlapping view */
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-    {
+-        if (view->base + view->size <= addr) continue;
+-        if (view->base >= addr + size) continue;
+-        return 0;
+-    }
+-    return 1;
++    /* Existing views never overlap, so only the last view starting
++     * before the new range ends can overlap it. */
++    view = view_at_or_before( process, addr + size - 1 );
++    return !view || view->base + view->size <= addr;
+ }
+
+ /* get the main exe memory view */
+@@ -492,6 +518,8 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
+     struct process *process = thread->process;
+     struct unicode_str name;
+
++    rb_put( &process->views_by_base, &view->base, &view->by_base );
++
+     if (view->flags & SEC_IMAGE)
+     {
+         if (is_process_init_done( process ))
+@@ -514,11 +542,12 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
+     return 0;
+ }
+
+-static void free_memory_view( struct memory_view *view )
++static void free_memory_view( struct process *process, struct memory_view *view )
+ {
+     if (view->fd) release_object( view->fd );
+     if (view->committed) release_object( view->committed );
+     if (view->shared) release_object( view->shared );
++    rb_remove( &process->views_by_base, &view->by_base );
+     list_remove( &view->entry );
+     free( view );
+ }
+@@ -529,7 +558,7 @@ void free_mapped_views( struct process *process )
+     struct list *ptr;
+
+     while ((ptr = list_head( &process->views )))
+-        free_memory_view( LIST_ENTRY( ptr, struct memory_view, entry ));
++        free_memory_view( process, LIST_ENTRY( ptr, struct memory_view, entry ));
+ }
+
+ /* find the shared PE mapping for a given mapping */
+@@ -1766,7 +1795,7 @@ DECL_HANDLER(unmap_view)
+
+     if (!view) return;
+     generate_dll_event( current, DbgUnloadDllStateChange, view );
+-    free_memory_view( view );
++    free_memory_view( current->process, view );
+ }
+
+ /* get information about a mapped image view */
+diff --git a/server/process.c b/server/process.c
+index 287718a..0a46407 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -711,7 +711,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     list_init( &process->locks );
+     list_init( &process->asyncs );
+     list_init( &process->classes );
+-    list_init( &process->views );
++    init_mapped_views( process );
+
+     process->end_time = 0;
+
+diff --git a/server/process.h b/server/process.h
+index 5d157d6..504d83d 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -22,6 +22,7 @@
+ #define __WINE_SERVER_PROCESS_H
+
+ #include "object.h"
++#include "wine/rbtree.h"
+
+ struct atom_table;
+ struct handle_table;
+@@ -78,6 +79,7 @@ struct process
+     obj_handle_t         desktop;         /* handle to desktop to use for new threads */
+     struct token        *token;           /* security token associated with this process */
+     struct list          views;           /* list of memory views */
++    struct rb_tree       views_by_base;   /* memory views indexed by base address */
+     client_ptr_t         peb;             /* PEB address in client address space */
+     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
+     unsigned int         trace_data;      /* opaque data used by the process tracing mechanism */

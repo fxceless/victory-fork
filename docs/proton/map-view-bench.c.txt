@@ -1,0 +1,40 @@
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void die(const char *operation)
+{
+    fprintf(stderr, "%s failed: %lu\n", operation, GetLastError());
+    exit(1);
+}
+
+int main(int argc, char **argv)
+{
+    const unsigned count = argc == 2 ? strtoul(argv[1], NULL, 10) : 32768;
+    const unsigned samples = 3000;
+    void **views = calloc(count, sizeof(*views));
+    if (!views || !count) return 1;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 65536, NULL);
+    if (!section) die("CreateFileMapping");
+    for (unsigned i = 0; i < count; ++i) {
+        views[i] = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+        if (!views[i]) die("initial MapViewOfFile");
+    }
+
+    LARGE_INTEGER frequency, before, after;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&before);
+    unsigned random = 42;
+    for (unsigned i = 0; i < samples; ++i) {
+        random = random * 1664525u + 1013904223u;
+        unsigned slot = (random >> 8) % count;
+        if (!UnmapViewOfFile(views[slot])) die("UnmapViewOfFile");
+        views[slot] = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+        if (!views[slot]) die("timed MapViewOfFile");
+    }
+    QueryPerformanceCounter(&after);
+    printf("%u live views, %u remaps, %.1f microseconds per pair\n", count, samples,
+           (after.QuadPart - before.QuadPart) * 1e6 / frequency.QuadPart / samples);
+    CloseHandle(section);
+    return 0;
+}

@@ -587,12 +587,35 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Saves new host pipelines and the list of title pipelines to start early.
+/// The early list also works when the host manages its own pipeline cache.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let Some(library) = library() else {
+        // With no library, keep the lock through the early-list write so a
+        // periodic save and the final save cannot use the same temp file.
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+            return;
+        }
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        let used = early_keys();
+        let result = std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        match result {
+            Ok(()) => tracing::info!(early = used.len(), "title pipelines to start early saved"),
+            Err(error) => {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+                tracing::warn!(%error, "title pipelines to start early not saved");
+            }
+        }
+        return;
+    };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -633,7 +656,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used = early_keys();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -704,6 +727,10 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn early_keys() -> Vec<String> {
+    USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect()
+}
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());

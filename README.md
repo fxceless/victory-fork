@@ -10,6 +10,9 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+For the Linux test configuration and memory-mapping benchmark, see
+[Proton testing](docs/proton/README.md).
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
