@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+mod refresh_spans;
+
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -9184,7 +9186,7 @@ fn refresh_once() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<refresh_spans::Pending>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -9227,11 +9229,11 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                r.add(address, end);
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push(refresh_spans::Pending::new(shadow, address, end));
             }
         }
     }
@@ -9242,13 +9244,16 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let r = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
-            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            self.index.insert(std::sync::Arc::as_ptr(&moved.shadow) as usize, at);
         }
-        Self::update(&shadow, from, to);
-        Self::brought(&mut self.current, &shadow, from, to);
+        r.note();
+        for &(from, to) in r.ranges() {
+            Self::update(&r.shadow, from, to);
+            Self::brought(&mut self.current, &r.shadow, from, to);
+        }
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
@@ -9369,7 +9374,7 @@ impl Batch {
         let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
         // The refreshes that hold written bytes: done now, before the write.
         let pending = std::mem::take(&mut self.refreshes);
-        let (due, keep): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| touches(r.1, r.2));
+        let (due, keep): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| r.ranges().iter().any(|&(a, b)| touches(a, b)));
         NEAR[3].fetch_add(due.len() as u64, Relaxed);
         NEAR[4].fetch_add(keep.len() as u64, Relaxed);
         if !due.is_empty() {
@@ -9381,7 +9386,7 @@ impl Batch {
             .refreshes
             .iter()
             .enumerate()
-            .map(|(i, r)| (std::sync::Arc::as_ptr(&r.0) as usize, i))
+            .map(|(i, r)| (std::sync::Arc::as_ptr(&r.shadow) as usize, i))
             .collect();
         // Textures: checked again only where the write lands.
         let before = self.textures.len();
@@ -9466,8 +9471,8 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .filter(|r| !r.shadow.unwatched())
+                .flat_map(|r| r.ranges().iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
@@ -9479,13 +9484,16 @@ impl Batch {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
-            for (shadow, from, to) in &self.refreshes {
-                Self::brought(&mut self.current, shadow, *from, *to);
+            for r in &self.refreshes {
+                r.note();
+                for &(from, to) in r.ranges() {
+                    Self::brought(&mut self.current, &r.shadow, from, to);
+                }
             }
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|r| Box::new(move || { for &(a, b) in r.ranges() { Self::update(&r.shadow, a, b); } }) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
@@ -9493,9 +9501,12 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
-                Self::brought(&mut self.current, &shadow, from, to);
+            for r in self.refreshes.drain(..) {
+                r.note();
+                for &(from, to) in r.ranges() {
+                    Self::update(&r.shadow, from, to);
+                    Self::brought(&mut self.current, &r.shadow, from, to);
+                }
             }
         }
         if ahead {
