@@ -3188,6 +3188,26 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Optional CPU wall-clock breakdown of relay fetches. Separate queue
+/// submission from waiting for its fence; neither is an isolated GPU timer.
+static READBACK_PHASE_US: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn readback_profile() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_PROFILE").is_some_and(|v| v == "1"))
+}
+
+fn readback_phase_start() -> Option<std::time::Instant> {
+    readback_profile().then(std::time::Instant::now)
+}
+
+fn readback_phase_end(phase: usize, start: Option<std::time::Instant>) {
+    if let Some(start) = start {
+        READBACK_PHASE_US[phase].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
 /// went the old way because a plan's pieces overflowed the slots, and
@@ -4774,6 +4794,14 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        if readback_profile() {
+            let [select, prepare, record, wait, merge, inflight] = READBACK_PHASE_US.each_ref().map(|v| {
+                v.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            });
+            tracing::info!(
+                "relay readback CPU phases per frame: {select:.2} ms selection, {prepare:.2} ms buffer preparation, {record:.2} ms recording and submission, {wait:.2} ms fence wait, {merge:.2} ms CPU merge, {inflight:.2} ms inflight attempt"
+            );
+        }
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -5927,13 +5955,16 @@ impl Host {
     /// whatever the compare says ([`BESIDE`]).
     fn relay_card_back(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) {
         if inflight_fetch() {
+            let began = readback_phase_start();
             let only: Vec<&CardPlan> = plans.iter().map(|p| p.1).collect();
             let taken = self.relay_card_inflight(&only);
             inflight_tickets_landed(&only);
+            readback_phase_end(5, began);
             if taken {
                 return;
             }
         }
+        let selecting = readback_phase_start();
         let lane = crate::queue2::second().filter(|s| s.fetches());
         // The pieces fetched beside flights that had started, as noted by
         // earlier landings: looked at for these plans, renewed below.
@@ -5996,6 +6027,7 @@ impl Host {
             }
         }
         BESIDE_STATS[0].fetch_add(again, Ordering::Relaxed);
+        readback_phase_end(0, selecting);
         if pieces.is_empty() {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
@@ -6019,6 +6051,7 @@ impl Host {
             });
             return;
         }
+        let preparing = readback_phase_start();
         if inflight_fetch() {
             INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
         }
@@ -6037,7 +6070,9 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        readback_phase_end(1, preparing);
         let waiting = std::time::Instant::now();
+        let recording = readback_profile().then_some(waiting);
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
@@ -6055,7 +6090,10 @@ impl Host {
                         copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
+                    readback_phase_end(2, recording);
+                    let fence_wait = readback_phase_start();
                     second.down.wait(job, event)?;
+                    readback_phase_end(3, fence_wait);
                     if beside {
                         // Whatever had started by now may have been
                         // writing these pieces while they came down
@@ -6085,7 +6123,10 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
+                readback_phase_end(2, recording);
+                let fence_wait = readback_phase_start();
                 WaitForSingleObject(event, INFINITE);
+                readback_phase_end(3, fence_wait);
                 Ok(after)
             })()
         };
@@ -6113,6 +6154,7 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
+        let merging = readback_phase_start();
         let mut title = Vec::new();
         let mut written = 0;
         for (shadow, lo, hi, at) in &pieces {
@@ -6129,6 +6171,7 @@ impl Host {
         // (`fallback_fetched_mark`).
         let landed = plans.iter().map(|p| p.1.sent_as).max();
         crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch(), after, landed));
+        readback_phase_end(4, merging);
     }
 
     /// [`Host::relay_card_back`] with [`inflight_fetch`]: the pieces these
@@ -10042,6 +10085,14 @@ impl Meter {
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
+            );
+        }
+        if crate::draw::heap_profile() {
+            let [scan, spans, refresh] = crate::draw::HEAP_PHASE_US.each_ref().map(|counter| {
+                counter.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
+            });
+            tracing::info!(
+                "heap buffer CPU phases per frame: {scan:.2} ms descriptor scan and mirror, {spans:.2} ms span aggregation, {refresh:.2} ms refresh"
             );
         }
         crate::shadow::exact_line(frames);
