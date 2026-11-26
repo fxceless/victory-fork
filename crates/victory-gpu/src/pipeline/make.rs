@@ -265,6 +265,12 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    // A pipeline on the skip list is never drawn with, so it is not made
+    // early either (it may be one whose creation crashes the host driver).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if super::skipped_among(&p.shaders).is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
