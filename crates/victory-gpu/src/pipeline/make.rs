@@ -101,6 +101,16 @@ impl Pending {
         }
     }
 
+    /// Its shaders as `stage hash`, the hashes `VICTORY_SKIP_PIPELINES` takes.
+    fn names(&self) -> String {
+        let names: Vec<String> = self
+            .shaders
+            .iter()
+            .map(|s| format!("{} {}", s.stage, s.hash))
+            .collect();
+        names.join(", ")
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             if let Some(hash) = denied(&self.shaders) {
@@ -413,7 +423,7 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -421,7 +431,10 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        hold(i, Some(p.names()), Instant::now());
+                        p.make();
+                        hold(i, None, Instant::now());
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -437,6 +450,65 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+/// How long a worker may hold one pipeline before [`note_slow`] names it.
+const SLOW: Duration = Duration::from_secs(60);
+
+/// A pipeline a worker is making: its shaders ([`Pending::names`]), since
+/// when, and whether [`note_slow`] has named it.
+struct Held {
+    shaders: String,
+    since: Instant,
+    named: bool,
+}
+
+/// What each worker holds, by worker.
+static HELD: Mutex<Vec<Option<Held>>> = Mutex::new(Vec::new());
+
+/// Worker `worker` now holds the pipeline of `shaders`, or none.
+fn hold(worker: usize, shaders: Option<String>, since: Instant) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() <= worker {
+        held.resize_with(worker + 1, || None);
+    }
+    held[worker] = shaders.map(|shaders| Held {
+        shaders,
+        since,
+        named: false,
+    });
+}
+
+/// The pipelines held for [`SLOW`] or longer at `now` and not named yet,
+/// with the seconds held; each is named once.
+fn slow(now: Instant) -> Vec<(String, u64)> {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    held.iter_mut()
+        .flatten()
+        .filter(|h| !h.named && now.saturating_duration_since(h.since) >= SLOW)
+        .map(|h| {
+            h.named = true;
+            (
+                h.shaders.clone(),
+                now.saturating_duration_since(h.since).as_secs(),
+            )
+        })
+        .collect()
+}
+
+/// Names, once each, the pipelines a worker has been making for a minute
+/// or more (from the frame line, every second). Some driver compiles never
+/// end: on an RX 9070 XT, AMD's compiler kept a worker on
+/// `compute 39f0e9aeb156a61c` for whole runs while its own heap grew past
+/// 30 GB, and the frame line only said "(1 being made)".
+pub(crate) fn note_slow() {
+    for (shaders, seconds) in slow(Instant::now()) {
+        tracing::warn!(
+            shaders = %shaders,
+            seconds,
+            "a host pipeline is still being made: the driver's compile may never end (VICTORY_SKIP_PIPELINES takes its shader hashes)"
+        );
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -531,5 +603,31 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// A worker still on one pipeline a minute later is named once, by the
+    /// shader hashes `VICTORY_SKIP_PIPELINES` takes; a later one is not yet.
+    #[test]
+    fn a_pipeline_held_a_minute_is_named_once() {
+        // Above any worker's index (2 to 8 workers).
+        let (old, young) = (60, 61);
+        let now = Instant::now();
+        hold(old, Some("compute 39f0e9aeb156a61c".to_owned()), now);
+        hold(
+            young,
+            Some("pixel 00000000000000a1".to_owned()),
+            now + Duration::from_secs(30),
+        );
+        let named = |at| -> Vec<String> {
+            slow(at)
+                .into_iter()
+                .map(|(shaders, _)| shaders)
+                .filter(|s| s == "compute 39f0e9aeb156a61c" || s == "pixel 00000000000000a1")
+                .collect()
+        };
+        assert_eq!(named(now + SLOW), ["compute 39f0e9aeb156a61c"]);
+        assert!(named(now + SLOW + Duration::from_secs(5)).is_empty());
+        hold(old, None, now);
+        hold(young, None, now);
     }
 }
