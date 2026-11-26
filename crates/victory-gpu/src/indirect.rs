@@ -2772,13 +2772,23 @@ void main() {
             std::ptr::copy_nonoverlapping([11u32, 2, 1].as_ptr().cast::<u8>(), patch_ptr, 12);
         }
         let spec = (KIND_DISPATCH, STEP, records.len() as u32);
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // `src`'s first GPU use is the clamp's SRV read: move it to the
+        // shader-read state explicitly. Left to the card, the implicit
+        // promotion would track it with the reserved raytracing states
+        // as well (a shader-read buffer may hold acceleration
+        // structures), which no later explicit barrier may name.
+        // SAFETY: an open list; `src` is fresh (common).
+        unsafe {
+            list.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COMMON, read)]);
+        }
         let scratch = bound_ahead(&list, (&src, 0), spec).unwrap();
         // Record 0: nothing wrote it.
         assert!(check_hit(&list, (&src, 0), (KIND_DISPATCH, STEP), &scratch, 0));
         // Record 1 is written on the card after the window's clamp.
-        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        // SAFETY: an open list; `src` was read by the clamp (promoted to a
-        // shader read), `patch` is common; both live until the list has run.
+        // SAFETY: an open list; `src` is in the shader-read state the
+        // barrier above (and the clamps' reads) leave it in, `patch` is
+        // common; both live until the list has run.
         unsafe {
             list.list.ResourceBarrier(&[transition(&src, read, D3D12_RESOURCE_STATE_COPY_DEST)]);
             list.list.CopyBufferRegion(&src, u64::from(STEP), &patch, 0, 12);
