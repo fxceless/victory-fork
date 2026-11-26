@@ -2216,6 +2216,16 @@ impl State {
         }
     }
 
+    /// A builder stage that cannot bind its inputs is dropped, whether the
+    /// dispatch arguments come from the title directly or from a buffer.
+    fn bind_dispatch(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let bound = self.bind(list, p, true);
+        if !bound && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_off("one of its dispatches could not be bound");
+        }
+        bound
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2260,13 +2270,8 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind_dispatch(list, p) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            // A stage of the structure builder that cannot be bound is a
-            // dropped stage: the others stop too.
-            if crate::pipeline::is_builder(self.pipeline as This) {
-                crate::pipeline::builder_off("one of its dispatches could not be bound");
-            }
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -3367,7 +3372,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind_dispatch(list, p),
             _ => false,
         };
         if !ran {

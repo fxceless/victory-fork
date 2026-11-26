@@ -226,7 +226,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
-    /// Every one of `pipelines` has a host pipeline.
+    /// Every stage has a host pipeline and none has been dropped.
     whole: bool,
     /// One could not be made.
     off: bool,
@@ -362,6 +362,7 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        b.whole = false;
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
@@ -831,6 +832,38 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_builder_stage_holds_ray_walks_again() {
+        // The builder state and switches last for the process.
+        const CHILD: &str = "VICTORY_TEST_BUILDER_STOP";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_BVH_BUILDER", "1")
+                .env("VICTORY_BVH_HOLD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        // Supply the cached classification of a compute shader that walks.
+        let walk = shader("compute", b"test ray walk");
+        walk.walks.set(true).unwrap();
+        let mut p = std::ptr::null();
+        assert_eq!(hand_out(vec![walk], None, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert!(walk_held(p));
+        assert!(builder_runs());
+        assert!(!walk_held(p));
+
+        builder_off("test stage could not be bound");
+        assert!(!builder_runs());
+        assert!(walk_held(p), "a stopped builder cannot supply subsequent ray walks");
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
