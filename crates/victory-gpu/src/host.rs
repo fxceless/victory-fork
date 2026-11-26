@@ -7839,7 +7839,7 @@ impl HostList {
         // same as in any other frame.
         #[cfg(feature = "diagnostics")]
         if crate::shot::recording() {
-            crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, &copy, before, wanted);
+            crate::shot::leaves(&self.list, self, None, &copy, before, wanted);
         }
         Some((texture, before))
     }
@@ -8168,14 +8168,14 @@ impl HostList {
         // in between lists, each before the moves below and left in the
         // state it was found in.
         #[cfg(feature = "diagnostics")]
-        let shot_begins = crate::shot::of_the_frame(self);
+        let mut shot = crate::shot::of_the_frame(self);
         #[cfg(feature = "diagnostics")]
         let mut leaving: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32, u32)> = Vec::new();
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             #[cfg(feature = "diagnostics")]
-            if shot_begins.is_some() && !copying.contains_key(key) && crate::shot::might_leave(real, *first) {
+            if shot.is_some() && !copying.contains_key(key) && crate::shot::might_leave(real, *first) {
                 leaving.push((copy.clone(), real, *first));
             }
             (real != *first)
@@ -8203,7 +8203,9 @@ impl HostList {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 #[cfg(feature = "diagnostics")]
-                let shot_span = if shot_begins.is_some() { crate::shot::span_begin(list) } else { u32::MAX };
+                if let Some(shot) = &mut shot {
+                    shot.begin(list, !leaving.is_empty());
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -8211,8 +8213,11 @@ impl HostList {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 #[cfg(feature = "diagnostics")]
-                for (copy, real, first) in &leaving {
-                    crate::shot::leaves(list, std::ptr::from_ref(self) as usize, None, shot_begins, copy, *real, *first);
+                if let Some(shot) = &mut shot {
+                    for (copy, real, first) in &leaving {
+                        crate::shot::leaves(list, self, Some(shot), copy, *real, *first);
+                    }
+                    shot.end_readbacks(list);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -8230,15 +8235,15 @@ impl HostList {
                     }
                 }
                 #[cfg(feature = "diagnostics")]
-                crate::shot::span_end(list, shot_span, std::ptr::from_ref(self) as usize, || {
-                    format!(
+                if let Some(shot) = &shot {
+                    shot.end(list, std::ptr::from_ref(self) as usize, || format!(
                         "PRELUDE of the recording that begins at line {}: {} moves of textures, {} copies between a depth texture and its twin, {} sets of gathered draw records clamped",
-                        shot_begins.unwrap_or(0),
+                        shot.begins,
                         barriers.len() + to_copy.len(),
                         syncs.len(),
                         gather.sets.iter().filter(|s| s.records() > 0).count()
-                    )
-                });
+                    ));
+                }
                 list.Close()
             })
         };

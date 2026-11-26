@@ -33,6 +33,12 @@
 //!    before each one (`HostList::prelude`). `snaps.txt` lists them;
 //!  * `info.txt`, and `done` when everything is written.
 //!
+//! A `PRELUDE` event times the entire prelude. Its optional
+//! `SHOT READBACK` event times the picture copies and their state
+//! transitions on the same list. For either event the elapsed ticks are
+//! `ticks[slot + 1] - ticks[slot]`. Subtract the readback interval from the
+//! full interval to measure the remaining prelude work.
+//!
 //! **Pictures come in parts.** With the title running the PC has one to
 //! four gigabytes free (run 269: 3.6 GB in the opening cutscene, 0.9 GB in
 //! the first room), and a frame's targets are more than that. A place
@@ -287,6 +293,18 @@ unsafe impl Sync for Clock {}
 
 static CLOCK: OnceLock<Option<Clock>> = OnceLock::new();
 
+impl Clock {
+    fn stamp(&self, cmd: &ID3D12GraphicsCommandList, slot: u32) {
+        // SAFETY: the list is open and the caller reserved this slot.
+        unsafe { cmd.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+    }
+
+    fn resolve(&self, cmd: &ID3D12GraphicsCommandList, base: u32, count: u32) {
+        // SAFETY: each slot in this range was stamped in this open list.
+        unsafe { cmd.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, base, count, &self.back, u64::from(base) * 8) };
+    }
+}
+
 fn make_clock() -> Option<Clock> {
     if std::env::var_os("VICTORY_SHOT_TIMES").is_some_and(|v| v == "0") {
         return None;
@@ -355,9 +373,7 @@ fn take_block() -> Option<u32> {
 
 /// Resolves `count` timestamps from `base` in `list` and notes the range.
 fn resolve(list: &ID3D12GraphicsCommandList, clock: &Clock, id: u32, base: u32, count: u32) {
-    // SAFETY: an open list, our heap and our read-back buffer; the places
-    // are the block's own, and each was ended in this list before.
-    unsafe { list.ResolveQueryData(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, base, count, &clock.back, u64::from(base) * 8) };
+    clock.resolve(list, base, count);
     let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = shot.as_mut().filter(|s| s.id == id) {
         s.resolved.push((base, count));
@@ -394,10 +410,7 @@ pub(crate) fn stamp(list: &crate::host::HostList) {
     };
     let mut block = list.shot_block.lock().unwrap_or_else(|e| e.into_inner());
     let (base, used, of) = *block;
-    let end = |slot: u32| {
-        // SAFETY: an open list and a place of our heap.
-        unsafe { list.list.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
-    };
+    let end = |slot| clock.stamp(&list.list, slot);
     let slot = if used == 0 || of != id {
         let Some(base) = take_block() else { return };
         *block = (base, 1, id);
@@ -431,17 +444,12 @@ pub(crate) fn close(list: &crate::host::HostList) {
     let Some(Some(clock)) = CLOCK.get() else {
         return;
     };
-    // SAFETY: an open list and a place of our heap (a block always keeps
-    // its last place for this).
-    unsafe { list.list.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, base + used) };
+    clock.stamp(&list.list, base + used);
     resolve(&list.list, clock, of, base, used + 1);
 }
 
-/// A list of the layer's own (the one that runs before a title list, the
-/// one that sends changed bytes to the card and hashes them, the one that
-/// compares) begins in `cmd`, while a shot's first frame records: the
-/// card's clock, for [`span_end`]. The title's commands are a part of the
-/// card's frame; these are the rest of it.
+/// Start timing a list that uploads and hashes changed bytes, or compares
+/// them, during the first frame of a shot. Paired with [`span_end`].
 pub(crate) fn span_begin(cmd: &ID3D12GraphicsCommandList) -> u32 {
     if !keeping_lines() {
         return u32::MAX;
@@ -453,8 +461,7 @@ pub(crate) fn span_begin(cmd: &ID3D12GraphicsCommandList) -> u32 {
     if slot > SLOTS - 2 {
         return u32::MAX;
     }
-    // SAFETY: an open list and a place of our heap.
-    unsafe { cmd.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+    clock.stamp(cmd, slot);
     slot
 }
 
@@ -467,12 +474,8 @@ pub(crate) fn span_end(cmd: &ID3D12GraphicsCommandList, slot: u32, list: usize, 
     let Some(Some(clock)) = CLOCK.get() else {
         return;
     };
-    // SAFETY: an open list, our heap and read-back buffer, the two places
-    // `span_begin` took.
-    unsafe {
-        cmd.EndQuery(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot + 1);
-        cmd.ResolveQueryData(&clock.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot, 2, &clock.back, u64::from(slot) * 8);
-    }
+    clock.stamp(cmd, slot + 1);
+    clock.resolve(cmd, slot, 2);
     let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = shot.as_mut() else { return };
     if s.carry.parts != 0 || s.events.len() >= MAX_EVENTS {
@@ -519,16 +522,82 @@ pub(crate) fn known(copy: usize, title: usize) {
     }
 }
 
-/// Whether `list` was recorded in the frame of the shot being taken, and
-/// if so the line its recording began at: for the list that runs before it
-/// at submission ([`leaves`] there), which may be made after the frame's
-/// present.
-pub(crate) fn of_the_frame(list: &crate::host::HostList) -> Option<u32> {
+/// The shot that owns a title list, including when submission records its
+/// prelude after the frame's present.
+pub(crate) struct Prelude {
+    id: u32,
+    pub(crate) begins: u32,
+    times: Option<(&'static Clock, u32)>,
+    readbacks: bool,
+}
+
+pub(crate) fn of_the_frame(list: &crate::host::HostList) -> Option<Prelude> {
     if !matches!(PHASE.load(Relaxed), RECORDING | PENDING) {
         return None;
     }
     let mark = *list.shot_mark.lock().unwrap_or_else(|e| e.into_inner());
-    (mark.0 != 0 && mark.0 == SHOT_ID.load(Relaxed)).then_some(mark.1)
+    (mark.0 != 0 && mark.0 == SHOT_ID.load(Relaxed)).then_some(Prelude {
+        id: mark.0,
+        begins: mark.1,
+        times: None,
+        readbacks: false,
+    })
+}
+
+impl Prelude {
+    pub(crate) fn begin(&mut self, cmd: &ID3D12GraphicsCommandList, may_copy: bool) {
+        if !LINES.load(Relaxed) || self.id != SHOT_ID.load(Relaxed) {
+            return;
+        }
+        let Some(Some(clock)) = CLOCK.get() else { return };
+        // Reserve both pairs together so a full heap cannot leave a timed
+        // prelude with unaccounted picture copies.
+        let count = if may_copy { 4 } else { 2 };
+        let base = NEXT.fetch_add(count, Relaxed);
+        if base <= SLOTS - count {
+            self.times = Some((clock, base));
+            clock.stamp(cmd, base);
+        }
+    }
+
+    fn begin_readbacks(&mut self, cmd: &ID3D12GraphicsCommandList) {
+        if !self.readbacks
+            && let Some((clock, base)) = self.times
+        {
+            clock.stamp(cmd, base + 2);
+            self.readbacks = true;
+        }
+    }
+
+    pub(crate) fn end_readbacks(&self, cmd: &ID3D12GraphicsCommandList) {
+        if self.readbacks
+            && let Some((clock, base)) = self.times
+        {
+            clock.stamp(cmd, base + 3);
+        }
+    }
+
+    pub(crate) fn end(&self, cmd: &ID3D12GraphicsCommandList, list: usize, what: impl FnOnce() -> String) {
+        let Some((clock, base)) = self.times else { return };
+        clock.stamp(cmd, base + 1);
+        // Resolve after the outer interval closes. Skipped pictures leave
+        // the inner pair unwritten, so it must not be resolved.
+        let count = if self.readbacks { 4 } else { 2 };
+        clock.resolve(cmd, base, count);
+        let mut shot = SHOT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = shot.as_mut().filter(|s| s.id == self.id) else { return };
+        if s.events.len() + 1 + usize::from(self.readbacks) > MAX_EVENTS {
+            return;
+        }
+        s.resolved.push((base, count));
+        // SAFETY: a plain query.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        if self.readbacks {
+            let text = format!("SHOT READBACK of the recording that begins at line {}", self.begins);
+            s.events.push(Event { list, thread, stamp: base + 2, text });
+        }
+        s.events.push(Event { list, thread, stamp: base, text: what() });
+    }
 }
 
 /// Whether a move from host state `before` to `after` takes a texture out
@@ -540,9 +609,8 @@ pub(crate) fn might_leave(before: u32, after: u32) -> bool {
 }
 
 /// Host texture `copy` is about to be moved from state `before` to `after`
-/// by commands recorded into `cmd`: either the title's list `recording`
-/// itself, or (`begins`: the line that list's recording began at) the list
-/// that runs before it at submission. If the texture leaves a state
+/// by commands recorded into `cmd`, either in the title's list itself or
+/// in its `prelude` at submission. If the texture leaves a state
 /// shaders write in, this is a place for a picture: where one is taken,
 /// the texture is moved to the copy-source state, copied, and moved back
 /// to `before` here, so the caller's own move is recorded as in any
@@ -550,9 +618,8 @@ pub(crate) fn might_leave(before: u32, after: u32) -> bool {
 /// since": the alias copies of `crate::texture` do).
 pub(crate) fn leaves(
     cmd: &ID3D12GraphicsCommandList,
-    list: usize,
-    recording: Option<&crate::host::HostList>,
-    begins: Option<u32>,
+    owner: &crate::host::HostList,
+    mut prelude: Option<&mut Prelude>,
     copy: &std::sync::Arc<crate::resource::HostTexture>,
     before: u32,
     after: u32,
@@ -572,13 +639,17 @@ pub(crate) fn leaves(
     // In the title's own list the copy gets a timestamp of its own, so
     // its time is not the command's before it. (A list of the next frame
     // has no places.)
-    if let Some(recording) = recording {
-        stamp(recording);
+    let list = std::ptr::from_ref(owner) as usize;
+    let begins = prelude.as_ref().map(|p| p.begins);
+    let stamp = if prelude.is_none() {
+        stamp(owner);
         if NEXT_FRAME.replace(false) {
             return;
         }
-    }
-    let stamp = STAMP.replace(u32::MAX);
+        STAMP.replace(u32::MAX)
+    } else {
+        u32::MAX
+    };
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     // Which place this is: the texture's n-th in the frame.
@@ -647,6 +718,9 @@ pub(crate) fn leaves(
             say(s, "SNAP", "");
         }
         if !moved {
+            if let Some(p) = prelude.as_deref_mut() {
+                p.begin_readbacks(cmd);
+            }
             // SAFETY: an open list and a live texture in state `before`.
             unsafe {
                 cmd.ResourceBarrier(&[crate::host::transition(
@@ -1068,6 +1142,10 @@ fn finish(carry: &Carry, to: &std::path::Path, how: &str, missing: u32) {
         "frame shot saved"
     );
 }
+
+#[cfg(test)]
+#[path = "shot/tests.rs"]
+mod prelude_tests;
 
 #[cfg(test)]
 mod tests {
