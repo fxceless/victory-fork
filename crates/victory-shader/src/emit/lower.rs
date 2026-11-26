@@ -3658,19 +3658,45 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let group = self.s.threads.map_or(0, |t| t[0] * t[1] * t[2]);
+        let zero = self.s.m.i32(0);
+        if group <= 32 {
+            self.wave_base = Some(zero);
+            return Some(zero);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
-        let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
-        let ptr = self.s.m.element(e, lds, k);
-        let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = if !group.is_multiple_of(32) {
+            // A partial tail wave (< 32 active lanes) must not consume a 32-thread
+            // slot from the LDS counter: if it ran ahead of a full wave, it would
+            // leave console threads unexecuted and push a full wave's upper lanes
+            // past `group`. Only full 32-lane waves draw from the counter; the
+            // partial tail wave gets `(group / 32) * 32` directly.
+            let t = self.s.m.bool(true);
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+            let mask = self.s.m.extract(e, ballot, 0);
+            let all = self.s.m.i32(u32::MAX);
+            let full = self.s.m.cmp(e, pred::EQ, mask, all);
+            let take = self.s.m.bin(e, Bin::And, first, full);
+            let add = self.s.m.select(e, take, k32, zero);
+            let ptr = self.s.m.element(e, lds, k);
+            let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+            let old0 = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+            let tail = self.s.m.i32((group / 32) * 32);
+            self.s.m.select(e, full, old0, tail)
+        } else {
+            let add = self.s.m.select(e, first, k32, zero);
+            let ptr = self.s.m.element(e, lds, k);
+            let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+            self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old])
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)

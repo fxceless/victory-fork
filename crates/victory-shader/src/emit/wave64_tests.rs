@@ -530,3 +530,68 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Wave64 compute groups whose size is not a multiple of 32 (e.g. 48 = 32 + 16,
+/// and 16 < 32) lowered to 32-lane host waves: every console thread index
+/// `0..threads` must execute exactly once per group, with no skipped threads,
+/// duplicate wraps, or out-of-bounds indices.
+#[test]
+fn partial_group_wave64_on_wave32_assigns_every_thread_once() {
+    let words = [
+        // ds_swizzle_b32 v2, v0 offset:0x80E4 (triggers console_lanes -> halves)
+        (0x36 << 26) | (0x35 << 18) | 0x80E4,
+        2 << 24,
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0 (byte offset = thread_id.x * 4)
+        0x7E06_0281, // v_mov_b32 v3, 1
+        // buffer_atomic_add v3, v1, s[8:11], 0 offen
+        (0x38 << 26) | (0x32 << 18) | (1 << 12),
+        (0x80 << 24) | (2 << 16) | (3 << 8) | 1,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for threads in [16u32, 48u32] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("DXIL validation failed for {threads} threads: {e}"));
+        }
+        let Ok(host) = Host::new(false) else {
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            continue;
+        };
+        let groups = 64u32;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [groups, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed ({threads} threads): {e}"));
+        for slot in 0..threads as usize {
+            assert_eq!(
+                out[0][slot], groups,
+                "threads={threads}: slot {slot} got {} (expected {groups})",
+                out[0][slot]
+            );
+        }
+        for slot in threads as usize..64 {
+            assert_eq!(
+                out[0][slot], 0,
+                "threads={threads}: out-of-range slot {slot} was written ({})",
+                out[0][slot]
+            );
+        }
+    }
+}
