@@ -450,9 +450,11 @@ What did it, on top of the list below:
     flight); the copy-back thread's wait fell from about 125 to 7 ms a
     frame.
   - `VICTORY_INDIRECT_WINDOW=1`: see above.
-  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
-    the title remaps memory; the loading phase had 5 readings over a
-    second where it had 18.
+  - `VICTORY_TEXTURE_NO_WAIT=1` lets a texture keep its staged contents
+    while the title remaps memory. A fresh staging buffer waits for its
+    first sample, since a texture picked by heap index may upload only once.
+    The original no-wait run recorded 5 loading readings over a second, down
+    from 18.
   - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
     under flights' shader writes are joined over small gaps (NOT exact:
     read the comment at `merge_gap` before using it).
