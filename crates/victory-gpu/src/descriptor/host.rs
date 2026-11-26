@@ -2056,6 +2056,11 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    #[cfg(test)]
+    pub(crate) fn kept_texture(&self, index: usize) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap()[index].clone()
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {

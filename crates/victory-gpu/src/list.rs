@@ -724,13 +724,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                // A depth texture's unordered access is its colour twin's
-                // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
-                }
+                host(b.first)?
             },
             ..*b
         }),
@@ -748,6 +742,34 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+#[cfg(windows)]
+fn host_barriers(list: &crate::host::HostList, barriers: &[Barrier]) -> Vec<Barrier> {
+    use windows::core::Interface;
+
+    let mut mapped = Vec::with_capacity(barriers.len());
+    for b in barriers {
+        if b.kind == UAV_BARRIER.kind
+            && let Some(twin) = crate::resource::twin(b.first)
+        {
+            // One title depth-stencil resource can have a separate host UAV
+            // texture for each plane. Both need the title's resource barrier.
+            mapped.push(Barrier {
+                first: twin.colour.texture.as_raw().cast_const().cast(),
+                ..*b
+            });
+            if let Some(plane) = &twin.plane {
+                mapped.push(Barrier {
+                    first: plane.texture.as_raw().cast_const().cast(),
+                    ..*b
+                });
+            }
+        } else {
+            mapped.extend(host_barrier(list, b));
+        }
+    }
+    mapped
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -756,10 +778,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host = host_barriers(list, barriers);
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -2235,6 +2254,157 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_stencil_uav_barrier_names_both_twins() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::Interface;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let null = std::ptr::null();
+        let iid = ID3D12Resource::IID;
+        let make_resource = |desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&heap).cast(),
+                    0,
+                    std::ptr::from_ref(desc).cast(),
+                    state.0 as u32,
+                    null.cast(),
+                    std::ptr::from_ref(&iid).cast(),
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        let depth = make_resource(&desc, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        let Some(twin) = crate::resource::twin(depth) else {
+            release(depth);
+            return; // depth twins are turned off or the host cannot make one
+        };
+        let Some(plane) = &twin.plane else {
+            release(depth);
+            return; // depth-plane twins are turned off or unavailable
+        };
+        let colour = make_resource(
+            &D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..desc
+            },
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let views = crate::descriptor::host::HostHeap::new(false, 2).unwrap();
+        for (index, format, plane_slice) in [
+            (0, DXGI_FORMAT_X24_TYPELESS_G8_UINT, 1),
+            (1, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, 0),
+        ] {
+            let mut words = [0; 10];
+            words[..4].copy_from_slice(&[
+                format.0 as u32,
+                D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+                0,
+                plane_slice,
+            ]);
+            let mut descriptor = [0u32; 8];
+            let handle = descriptor.as_mut_ptr() as u64;
+            crate::descriptor::create_uav(null, depth, null, &words, handle);
+            views.mirror(index, handle, false).unwrap();
+        }
+        let stencil_view = views.kept_texture(0).unwrap();
+        let depth_view = views.kept_texture(1).unwrap();
+        assert_eq!(stencil_view, twin.colour.texture);
+        assert_eq!(depth_view, plane.texture);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut command_list = null;
+        assert_eq!(
+            create_list(
+                null,
+                0,
+                0,
+                allocator,
+                null,
+                &LIST_IIDS[1],
+                &mut command_list
+            ),
+            S_OK
+        );
+        let list = host_list(command_list).unwrap();
+        let resource_barrier = |resource| Barrier {
+            first: resource,
+            ..UAV_BARRIER
+        };
+        let requested = [
+            UAV_BARRIER,
+            resource_barrier(colour),
+            resource_barrier(depth),
+        ];
+        let barriers = host_barriers(list, &requested);
+        let targets: Vec<_> = barriers.iter().map(|b| (b.kind, b.first.cast())).collect();
+        assert_eq!(
+            targets,
+            [
+                (UAV_BARRIER.kind, null.cast()),
+                (
+                    UAV_BARRIER.kind,
+                    crate::resource::host_resource(colour)
+                        .unwrap()
+                        .as_raw()
+                        .cast_const()
+                ),
+                (UAV_BARRIER.kind, stencil_view.as_raw().cast_const()),
+                (UAV_BARRIER.kind, depth_view.as_raw().cast_const()),
+            ]
+        );
+        let resource_barriers =
+            slot::<extern "system" fn(This, u32, *const Barrier) -> u32>(command_list, 0xd0);
+        assert_eq!(
+            resource_barriers(command_list, requested.len() as u32, requested.as_ptr()),
+            0
+        );
+        assert_eq!(close(command_list), S_OK);
+        assert_eq!(release(command_list), 0);
+        assert_eq!(release(allocator), 0);
+        eprintln!("verified global, ordinary and both depth-stencil UAV barrier targets");
+        assert_eq!(release(colour), 0);
+        assert_eq!(release(depth), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
