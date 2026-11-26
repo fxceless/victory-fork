@@ -609,6 +609,37 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Why [`Host::card_steps`] left submissions to the wait, and how many
+/// times, since the last frame-rate line (`VICTORY_CARD_STEPS_WHY=0`: not
+/// kept). Without the diagnostics build the reason was dropped: run
+/// v8-220247 had 0.9 submissions a frame refused, each followed by a wait
+/// of 38-49 ms for the flights ("title memory read ... a fill of upload
+/// memory"), and nothing said which check refused them.
+static REFUSED_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn why_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_WHY").is_none_or(|v| v != "0"))
+}
+
+fn note_refused(why: &'static str) {
+    if !why_kept() {
+        return;
+    }
+    let mut all = REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|(w, _)| std::ptr::eq(*w, why) || *w == why) {
+        Some((_, n)) => *n += 1,
+        None => all.push((why, 1)),
+    }
+}
+
+/// [`REFUSED_WHY`], taken, most first.
+fn take_refused() -> Vec<(&'static str, u64)> {
+    let mut all = std::mem::take(&mut *REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner()));
+    all.sort_by(|a, b| b.1.cmp(&a.1));
+    all
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -675,6 +706,7 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                note_refused(why);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
                 let _ = why;
@@ -910,6 +942,14 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let why = take_refused();
+    if !why.is_empty() {
+        let text: Vec<String> = why.iter().map(|(w, n)| format!("{:.2} {w}", *n as f64 / frames)).collect();
+        tracing::info!(
+            "submissions not done on the card per frame, by why (VICTORY_CARD_STEPS_WHY=0: not kept): {}",
+            text.join("; ")
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1125,6 +1165,21 @@ mod tests {
 
     /// What cannot be done on the card refuses the lot, where it stands in
     /// the way.
+    #[test]
+    fn refusals_are_counted_by_why() {
+        let _ = take_refused();
+        note_refused("a texture reads it");
+        note_refused("a texture reads it");
+        note_refused("too much at once");
+        let why = take_refused();
+        if why_kept() {
+            assert_eq!(why, vec![("a texture reads it", 2), ("too much at once", 1)]);
+        } else {
+            assert!(why.is_empty());
+        }
+        assert!(take_refused().is_empty());
+    }
+
     #[test]
     fn steps_in_the_way_are_refused() {
         let taken = copy(1000, 5000, 100, true);
