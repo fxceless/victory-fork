@@ -22,6 +22,9 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
@@ -127,8 +130,16 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
     let man = bits & 0x7f_ffff;
+    if raw_exp == 0xff {
+        if man != 0 {
+            // Preserve NaN as a quiet half NaN rather than turning it into infinity.
+            return sign | 0x7e00 | ((man >> 13) as u16);
+        }
+        return sign | 0x7c00;
+    }
+    let exp = raw_exp as i32 - 127 + 15;
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +158,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
+    // Rounded to nearest-even: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let round = 0x0fff + ((man >> 13) & 1);
+    sign | (half + ((man + round) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -233,5 +245,25 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn half_preserves_nan_uses_rne_for_normals_and_zero_stride_is_safe() {
+        // NaN (quiet, signaling with tiny payload, negative) stays NaN, never Inf.
+        for bits in [0x7fc0_0000u32, 0x7f80_0001, 0xff80_0001] {
+            let h = f32_to_half(f32::from_bits(bits));
+            assert_eq!(h & 0x7c00, 0x7c00);
+            assert_ne!(h & 0x03ff, 0, "NaN must not collapse to infinity: {bits:#x} -> {h:#x}");
+            assert!(half_to_f32(h).is_nan());
+        }
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+        // Normal ties round to even: 1.0 + 2^-11 -> 0x3c00 (even), 1.0 + 3*2^-11 -> 0x3c02 (even).
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        // Zero stride must be a no-op instead of panicking in `chunks_exact(0)`.
+        let mut dst = [0xAAu8; 8];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 41)]);
+        assert_eq!(dst, [0xAAu8; 8]);
     }
 }

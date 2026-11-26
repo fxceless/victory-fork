@@ -47,18 +47,24 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
+        let address = |m: u32| {
+            // D3D12_TEXTURE_ADDRESS_MODE valid values are 1 (WRAP) through 5 (MIRROR_ONCE).
+            let valid = if (1..=5).contains(&m) { m } else { 1 };
+            D3D12_TEXTURE_ADDRESS_MODE(valid as i32)
+        };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE(self.address[2] as i32),
+            AddressU: address(self.address[0]),
+            AddressV: address(self.address[1]),
+            AddressW: address(self.address[2]),
             MipLODBias: self.bias,
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
                 1
             },
-            ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
+            // D3D12_COMPARISON_FUNC valid values are 1 (NEVER) through 8 (ALWAYS).
+            ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.clamp(1, 8) as i32),
             BorderColor: self.border,
             MinLOD: self.min_lod,
             // Without a mip filter the console samples mip 0 only.
@@ -115,5 +121,29 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    #[test]
+    fn invalid_address_modes_and_comparison_funcs_are_sanitized() {
+        let mut w = [0u32; 27];
+        // Zeroed and out-of-range address modes fall back to WRAP (1), and
+        // comparison funcs clamp into D3D12's valid 1..=8 range.
+        w[6] = 0;
+        w[7] = 6;
+        w[8] = u32::MAX;
+        w[16] = 99;
+        let d = console(&w);
+        assert_eq!(d.AddressU, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        assert_eq!(d.AddressV, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_ALWAYS);
+        // Valid modes 1..=5 pass through unchanged.
+        w[6..9].copy_from_slice(&[1, 2, 5]);
+        w[16] = 8;
+        let d = console(&w);
+        assert_eq!(d.AddressU, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        assert_eq!(d.AddressV, D3D12_TEXTURE_ADDRESS_MODE_MIRROR);
+        assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_ALWAYS);
     }
 }
