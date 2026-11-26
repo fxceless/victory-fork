@@ -1936,38 +1936,25 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        // A view's range has to lie inside the buffer: the driver refuses one
-        // that runs past it, and a refused creation leaves the slot holding
-        // whatever was there before, which a shader then reads as a
-        // description of another resource. The declared length is clamped to
-        // what the buffer holds, so reads past it still return zeros.
-        // SAFETY: a live buffer.
-        let size = unsafe { buffer.GetDesc() }.Width;
-        let words = size / 4;
-        let first = (offset / 4).min(words).min(u64::from(u32::MAX));
-        let elements = (len / 4).min(words - first).min(u64::from(u32::MAX));
-        if elements == 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    index,
-                    offset,
-                    len,
-                    size,
-                    "a raw buffer view of no bytes inside the buffer: reads nothing"
-                )
-            });
+        // A view's range has to lie inside the buffer: a description that runs
+        // past it is not a valid call, and what a refused creation leaves in
+        // the slot is undefined, so a shader may read another resource through
+        // it. The range is clamped to what the buffer holds, which is also
+        // where reads past a view return zeros.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
             self.null_raw_at(index);
             return;
-        }
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: first,
-                    NumElements: elements as u32,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -1994,36 +1981,23 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        // As `raw_at`: the range inside the buffer, or nothing at all. A UAV
-        // the driver refused would leave another resource's description in
-        // the slot, and a compute shader writing through it removes the
-        // device rather than doing nothing.
-        // SAFETY: a live buffer.
-        let size = unsafe { buffer.GetDesc() }.Width;
-        let words = size / 4;
-        let first = (offset / 4).min(words).min(u64::from(u32::MAX));
-        let elements = (len / 4).min(words - first).min(u64::from(u32::MAX));
-        if elements == 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    index,
-                    offset,
-                    len,
-                    size,
-                    "a raw unordered access view of no bytes inside the buffer: writes nowhere"
-                )
-            });
+        // As `raw_at`: the range inside the buffer, or nothing at all. What a
+        // refused description leaves in the slot is undefined, and a compute
+        // shader writing through such a slot removes the device rather than
+        // doing nothing.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
             self.null_raw_uav_at(index);
             return;
-        }
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: first,
-                    NumElements: elements as u32,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -3425,6 +3399,81 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         _ => {}
     }
     desc
+}
+
+/// Where a raw buffer view of `len` bytes from `offset` starts and how many
+/// dwords it covers, both kept inside `buffer`: `None` when none of the range
+/// lies in it.
+///
+/// `FirstElement` is 64-bit and `NumElements` is 32-bit, so only the length is
+/// cut at `u32::MAX`; the start keeps its own value and is never narrowed.
+/// Callers pass `offset` on 16 bytes (`draw.rs` biases by `offset & 15`), which
+/// a raw view needs; a start clamped to the buffer's end is put back on that
+/// boundary, where nothing is left to view anyway.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+fn raw_range(buffer: &ID3D12Resource, offset: u64, len: u64) -> Option<RawRange> {
+    if offset % 16 != 0 {
+        static ODD: std::sync::Once = std::sync::Once::new();
+        ODD.call_once(|| {
+            tracing::warn!(
+                offset,
+                "a raw buffer view asked for at an address that is not on 16 bytes"
+            )
+        });
+    }
+    // SAFETY: a live buffer.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let words = size / 4;
+    let asked = offset / 4;
+    let mut first = asked.min(words);
+    if first != asked {
+        first -= first & 3;
+    }
+    let elements = (len / 4).min(words - first).min(u64::from(u32::MAX));
+    (elements != 0).then_some(RawRange {
+        first,
+        elements: elements as u32,
+    })
+}
+
+/// Counts the ranges [`raw_range`] cut or emptied, and says so now and then: no
+/// run could otherwise tell whether the clamp applied at all. Counters are here
+/// rather than in the callers so that both the SRV and the UAV path are counted.
+fn raw_range_count(offset: u64, len: u64, range: Option<RawRange>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLAMPED: AtomicU64 = AtomicU64::new(0);
+    static EMPTY: AtomicU64 = AtomicU64::new(0);
+    let Some(range) = range else {
+        let n = EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            tracing::warn!(
+                offset,
+                len,
+                empty = n,
+                "a raw buffer view of no bytes inside the buffer: reads nothing"
+            );
+        }
+        return;
+    };
+    if range.first != offset / 4 || u64::from(range.elements) != len / 4 {
+        let n = CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 4096 == 0 {
+            tracing::info!(
+                offset,
+                len,
+                first = range.first,
+                elements = range.elements,
+                clamped = n,
+                empty = EMPTY.load(Ordering::Relaxed),
+                "a raw buffer view cut to the buffer's size"
+            );
+        }
+    }
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
