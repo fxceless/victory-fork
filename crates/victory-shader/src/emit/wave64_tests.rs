@@ -530,3 +530,213 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Runs a 64-thread shader on the hardware device and returns all 64 output UAV dwords.
+fn on_the_card_64(shader: &HostShader, constants: [u32; 2]) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return None;
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = constants[d as usize];
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// Lowers `native` for a 32-lane host and returns both the host shader and
+/// `(wave_size, half_exchanges)` diagnostics.
+fn lowered_with_stats(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+) -> Result<(HostShader, Option<u32>, u32), ShaderError> {
+    let st = structure::structure_wide(p, wide).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered?;
+    let stats = (lowered.wave_size, lowered.half_exchanges);
+    Ok((
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        },
+        stats.0,
+        stats.1,
+    ))
+}
+
+/// A 64-lane console wave whose only cross-lane instruction is `v_readfirstlane_b32`:
+/// on a 32-lane host, it must still set up half-wave exchange so lanes 32..63 read
+/// the console wave's first active lane (not lane 32's half).
+#[test]
+fn wave64_readfirstlane_exchanges_across_halves_on_32_lane_host() {
+    let words = [
+        // v5 = 100 + v0 (literal 100)
+        0x4A0A_00FF,
+        100, // v_add_nc_u32 v5, 100, v0
+        0x7D86_0000, // v_cmp_le_u32 vcc, s0, v0 (active iff v0 >= s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E0C_0207, // v_mov_b32 v6, s7
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (shader, wave_size, exchanges) =
+        lowered_with_stats(&native, &p, &HashSet::new()).expect("lower");
+    assert_eq!(wave_size, Some(32), "expected 32-lane split wave size");
+    assert!(
+        exchanges >= 2,
+        "expected guarded wave64 v_readfirstlane_b32 to emit half-wave exchanges, got {exchanges}",
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // s0 = 0 -> lane 0 (100); s0 = 17 -> lane 17 in lower half (117);
+    // s0 = 40 -> lane 40 in upper half (140); s0 = 64 -> no active lane -> lane 0 (100).
+    for (first, expected) in [(0u32, 100u32), (17, 117), (40, 140), (64, 100)] {
+        let Some(got) = on_the_card_64(&shader, [first, 0]) else {
+            return;
+        };
+        assert!(
+            got.iter().all(|&x| x == expected),
+            "first={first}: expected all 64 lanes to read {expected}, got lane0={} lane32={} lane63={}",
+            got[0],
+            got[32],
+            got[63],
+        );
+    }
+}
+
+/// Implicit VGPR/VCC reads (`v_fmac_f32` accumulator and VOP2 `v_cndmask_b32` VCC)
+/// must prevent `lane_uniform` from marking a per-lane result uniform across a
+/// split 64-lane wave.
+#[test]
+fn wave64_implicit_reads_are_not_marked_lane_uniform() {
+    // Case 1: v5 = float(v0); v6 = 2.0 (uniform); v_fmac_f32 v5, 1.0, v6 (uniform
+    // explicit sources, per-lane implicit accumulator v5); v_readfirstlane_b32 s7, v5.
+    let fmac_words = [
+        0x7E0A_0D00, // v_cvt_f32_u32 v5, v0
+        0x7E0C_02F4, // v_mov_b32 v6, 2.0 (inline const 244)
+        0x560A_0CF2, // v_fmac_f32 v5, 1.0 (inline const 242), v6
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7E0C_0207, // v_mov_b32 v6, s7
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ];
+    // Case 2: v6 = 20 (uniform); vcc = (32 <= v0); v_cndmask_b32 v5, 10, v6, vcc
+    // (uniform explicit sources, per-lane implicit VCC); v_readfirstlane_b32 s7, v5.
+    let cndmask_words = [
+        0x7E0C_0294, // v_mov_b32 v6, 20 (0x80 + 20)
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32 (0x80 + 32), v0
+        0x020A_0C8A, // v_cndmask_b32 v5, 10 (0x80 + 10), v6, vcc
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7E0C_0207, // v_mov_b32 v6, s7
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ];
+    // Control case: truly uniform `v_mov_b32 v5, 42` still skips half-wave exchange.
+    let uniform_words = [
+        0x7E0A_02AA, // v_mov_b32 v5, 42 (0x80 + 42)
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7E0C_0207, // v_mov_b32 v6, s7
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ];
+    let u_native = native(&uniform_words);
+    let u_p = ir::build(&u_native.code, u_native.wave64, u_native.vgprs).expect("ir::build");
+    let (u_shader, u_wave, u_exchanges) =
+        lowered_with_stats(&u_native, &u_p, &HashSet::new()).expect("lower");
+    assert_eq!(u_wave, Some(32));
+    assert_eq!(
+        u_exchanges, 0,
+        "truly uniform v_readfirstlane_b32 should not emit half-wave exchange",
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = u_shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, words, expected) in [
+        ("v_fmac_f32", &fmac_words[..], 2.0f32.to_bits()),
+        ("v_cndmask_b32", &cndmask_words[..], 10u32),
+    ] {
+        let native = native(words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let (shader, wave_size, exchanges) =
+            lowered_with_stats(&native, &p, &HashSet::new()).expect("lower");
+        assert_eq!(wave_size, Some(32), "{label}: expected 32-lane split wave size");
+        assert!(
+            exchanges >= 1,
+            "{label}: expected half-wave exchange (must not be marked lane_uniform), got {exchanges}",
+        );
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(got) = on_the_card_64(&shader, [0, 0]) else {
+            return;
+        };
+        assert!(
+            got.iter().all(|&x| x == expected),
+            "{label}: expected all 64 lanes to read {expected:#x}, got lane0={:#x} lane32={:#x} lane63={:#x}",
+            got[0],
+            got[32],
+            got[63],
+        );
+    }
+}
