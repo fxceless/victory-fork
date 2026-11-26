@@ -28,12 +28,13 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 00:00 UTC)
+## Status of this fork (2026-11-26, 02:15 UTC)
 
-**Playable for half an hour at a time, slowly: about 9 to 12 frames per second (the console runs
+**Playable for half an hour at a time, slowly: about 7 to 12 frames per second (the console runs
 30). The tester has played from the opening through the prologue and past the first boat mission.
-Then the graphics card is lost (three times in sessions of 6, 49 and 31 minutes; cause not known
-yet). Shadowed areas are still black.**
+Then the graphics card is lost: four times, in sessions of 6, 49, 31 and 38 minutes, the last three
+on the way to the same place in the story, before the title's next save point. Cause not known
+yet. Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -49,7 +50,27 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 00:00 UTC)
+### Newest (2026-11-26, 02:15 UTC)
+
+- **Measured: `VICTORY_LOOKUP_CACHE=1` (pull request #1237) is worth about 14 ms a frame** on the
+  test machine (run 293, the switch in turn, a fit at equal draw counts: 84 ms + 13.6 ms per 1,000
+  draws, minus 14 with it, plus or minus about 7; the recording threads together 57 ms less). About
+  540,000 asks for a buffer's host copy a frame, 89 % of them answered without the lock.
+- **Measured at nothing:** `VICTORY_HEAP_SYNC_CUT` (run 286: 37 fewer heap pages read a frame, the
+  pass's time unchanged). Left off.
+- **Fixed from Direct3D's debug layer's own words** (runs 283 and 289): a pipeline that blends into
+  an integer render target; a draw whose pipeline declares another render target format than the
+  one bound (a pipeline for the bound format is made, `VICTORY_TARGET_VARIANTS=0` turns that off).
+- **Pull request #1241** (a view of a card-written texture copied even after an upload of the same
+  view) is in. It did not change the black in shadowed areas (run 291).
+- **Still open:** the card is lost 30 to 50 minutes into a session (the memory figures at two
+  losses: 1.3 and 2.0 GB of the PC's 32 free, the process at its largest; another tester reports
+  the same signature with "Kernel memory failure" under the debug layer; not shown to be the cause
+  here). Shadowed areas are black. In a heavy outdoor scene (7,000 to 9,000 draws) the frame is
+  157 to 195 ms.
+- Every run's log goes to `diagnostics/` as soon as the run ends.
+
+### Before that (2026-11-26, 00:00 UTC)
 
 **Written and unit-tested, not yet measured in a game. Every switch here is off by default; the
 numbers are estimates until a run carries them.**
@@ -77,9 +98,16 @@ numbers are estimates until a run carries them.**
   card's memory at that moment and the card's peak use since the last line (the memory line was
   one look in five seconds); a line a second with the peak (`VICTORY_VIDEO_LOOK=0`: none); and
   what Present answers, which was thrown away.
+- **The fourth loss (38 minutes in, with `VICTORY_D3D12_DRED=faults`)**: removal reason 0x887A0005
+  again, and the runtime reported no page fault address, so it was not the card reading freed or
+  unmapped memory. The three long sessions all ended on the way to the same place in the story,
+  so the trigger looks tied to what is drawn or made there, not to the time played. Nothing in the
+  last seconds of the three logs is found only there (pipelines made, textures made). The tracing
+  cost nothing measurable up to 4,000 draws a frame.
 - **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
   the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
   with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
+- VICTORY_BVH_NO_HIT=1 runs ray-traced passes without building their structures. Each node test answers no hit. Its FPS and lighting effects remain unverified. VICTORY_WAVE_WIDE=last is also available as an opt-in.
 - [timing-run-295s-2026-11-25.txt](https://github.com/fxceless/victory-fork/blob/dc4c0fcd71bdb1233cca5b55befb77e4f8c2a344/diagnostics/timing-run-295s-2026-11-25.txt): a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
