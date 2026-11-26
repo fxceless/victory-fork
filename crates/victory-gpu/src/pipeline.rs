@@ -512,6 +512,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Names the host pipelines a worker has held for a minute or more
+/// ([`make::note_slow`]).
+#[cfg(windows)]
+pub(crate) fn note_slow_makes() {
+    make::note_slow();
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
