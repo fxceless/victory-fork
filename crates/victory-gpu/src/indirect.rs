@@ -259,6 +259,10 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    // FXC under Wine refuses this source; DXC builds it as `cs_6_0`.
+    if let Ok(bytes) = crate::host::compile_dxc(source, s!("main"), s!("cs_5_1")) {
+        return build(device, &bytes);
+    }
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -291,10 +295,14 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) };
+    build(device, bytes)
+}
+
+fn build(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
+    // SAFETY: the root signature is inside the shader.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),

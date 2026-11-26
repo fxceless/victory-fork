@@ -16,6 +16,7 @@
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
+mod dxc;
 mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
