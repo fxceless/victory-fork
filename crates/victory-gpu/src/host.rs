@@ -2325,6 +2325,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Filled root CBV scratch by source address and size since the last
+    /// title-memory write recorded on this list.
+    filled_root_cbvs: std::collections::HashMap<(usize, u64), (u64, usize)>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -7362,6 +7365,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled_root_cbvs.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7370,6 +7374,26 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// Records a submission-time fill for a misaligned root CBV. Copies and
+    /// arbitrary title-memory work invalidate reuse; a list reset drops all
+    /// entries with the scratch allocation they belong to.
+    pub(crate) fn fill_root_cbv(&self, src: *const u8, len: u64, reuse: bool) -> Option<(u64, *mut u8)> {
+        let key = (src as usize, len);
+        if reuse && let Some(&(gpu, to)) = self.deferred().filled_root_cbvs.get(&key) {
+            return Some((gpu, to as *mut u8));
+        }
+        let (gpu, to) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Fill(to as usize, src as usize, len as usize));
+        if reuse {
+            // Unique ranges are normally few. Keep the cache bounded.
+            if deferred.filled_root_cbvs.len() < 256 {
+                deferred.filled_root_cbvs.insert(key, (gpu, to as usize));
+            }
+        }
+        Some((gpu, to))
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7682,8 +7706,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.filled_root_cbvs.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -9979,5 +10005,73 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod root_cbv_fill_tests {
+    use super::*;
+
+    #[test]
+    fn root_cbv_fill_reuses_until_copy_or_deferred_write_and_resets() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut input = vec![0x11u8; 512];
+        let source = input.as_mut_ptr();
+        let fresh = vec![0x22u8; 512];
+        let a = list.fill_root_cbv(source, 512, true).unwrap();
+        assert_eq!(list.fill_root_cbv(source, 512, true).unwrap(), a);
+        assert_ne!(list.fill_root_cbv(source, 256, true).unwrap().0, a.0);
+        list.defer_copy(source, fresh.as_ptr().cast_mut(), 512);
+        let b = list.fill_root_cbv(source, 512, true).unwrap();
+        assert_ne!(b.0, a.0);
+        let addr = source as usize;
+        list.defer(move || {
+            // SAFETY: input remains mutably owned and live until execution finishes.
+            unsafe { (addr as *mut u8).write_bytes(0x33, 512) };
+        });
+        let c = list.fill_root_cbv(source, 512, true).unwrap();
+        assert_ne!(c.0, b.0);
+        list.close();
+        host.execute(&[&list]);
+        for ((_, ptr), value) in [(a, 0x11), (b, 0x22), (c, 0x33)] {
+            // SAFETY: the corresponding scratch allocations remain alive until reset.
+            assert!(unsafe { std::slice::from_raw_parts(ptr, 512) }.iter().all(|&b| b == value));
+        }
+        list.reset();
+        assert!(list.deferred().filled_root_cbvs.is_empty());
+    }
+
+    #[test]
+    #[ignore = "native submission A/B timing; run alone"]
+    fn root_cbv_fill_native_benchmark() {
+        let host = host().expect("native D3D12 host");
+        let list = host.new_list().unwrap();
+        let input = vec![0x7bu8; 16 * 1024 + 16];
+        for count in [1, 128, 2048] {
+            let mut samples = [Vec::new(), Vec::new()];
+            for pair in 0..23 {
+                for mode in [pair % 2, (pair + 1) % 2] {
+                    let started = std::time::Instant::now();
+                    let mut last = std::ptr::null_mut();
+                    for _ in 0..count {
+                        // SAFETY: the extra 16 bytes keep the whole source in the allocation.
+                        (_, last) = list.fill_root_cbv(unsafe { input.as_ptr().add(16) }, 16 * 1024, mode != 0).unwrap();
+                    }
+                    list.close();
+                    host.execute(&[&list]);
+                    let ns = started.elapsed().as_nanos();
+                    assert_eq!(unsafe { last.read() }, 0x7b);
+                    assert_eq!(list.deferred().copies.iter().filter(|s| matches!(s, Step::Fill(..))).count(),
+                        if mode == 0 { count } else { 1 });
+                    list.reset();
+                    if pair >= 3 { samples[mode].push(ns); }
+                }
+            }
+            for (v, times) in samples.iter_mut().enumerate() {
+                times.sort_unstable();
+                println!("ROOT_CBV_AB,{count},{v},{:.4}", (times[9] + times[10]) as f64 / 2e6);
+            }
+        }
     }
 }

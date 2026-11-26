@@ -640,9 +640,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    // Optional until repeated unaligned bindings are measured in a title.
+    static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reuse = *REUSE.get_or_init(|| {
+        std::env::var_os("VICTORY_REUSE_ROOT_CBV").is_some_and(|value| value == "1")
+    });
+    list.fill_root_cbv(address as *const u8, len, reuse).map(|(gpu, _)| gpu)
 }
 
 macro_rules! once {
