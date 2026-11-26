@@ -2,18 +2,99 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//! `VICTORY_CAPTURE_AT=3,10,25.5`: seconds since the first presented frame,
+//! saved as `frame-at-<seconds>.png` (one decimal), in the current directory
+//! unless `VICTORY_CAPTURE` specifies a folder. No image buffers are reserved.
 
 use std::path::PathBuf;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct TimedCapture {
+    times: Vec<std::time::Duration>,
+    start: Option<std::time::Instant>,
+    frame: Option<u64>,
+    due: std::ops::Range<usize>,
+}
+
+impl TimedCapture {
+    fn wanted(&mut self, frame: u64, now: std::time::Instant) -> bool {
+        // The presenter asks twice: keep the same decision for both calls.
+        if self.frame != Some(frame) {
+            let elapsed = now.saturating_duration_since(*self.start.get_or_insert(now));
+            self.due = self.due.end..self.times.partition_point(|&t| t <= elapsed);
+            self.frame = Some(frame);
+        }
+        !self.due.is_empty()
+    }
+}
+
+fn parse_times(value: &str) -> Option<Vec<std::time::Duration>> {
+    let mut times = Vec::new();
+    for part in value.split(',') {
+        let seconds: f64 = part.trim().parse().ok()?;
+        times.push(std::time::Duration::try_from_secs_f64(seconds).ok()?);
+    }
+    times.sort_unstable();
+    times.dedup();
+    Some(times)
+}
+
+fn timed() -> Option<&'static std::sync::Mutex<TimedCapture>> {
+    static AT: std::sync::OnceLock<Option<std::sync::Mutex<TimedCapture>>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_CAPTURE_AT")?;
+        let Some(times) = value.to_str().and_then(parse_times) else {
+            tracing::warn!("ignoring VICTORY_CAPTURE_AT: expected comma-separated finite, nonnegative seconds in Duration range");
+            return None;
+        };
+        Some(std::sync::Mutex::new(TimedCapture { times, start: None, frame: None, due: 0..0 }))
+    }).as_ref()
+}
+
+fn explicit_folder() -> Option<&'static PathBuf> {
+    static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOLDER.get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from)).as_ref()
+}
+
+/// Largest single capture buffer we are willing to allocate: 512 MiB.
+const CAPTURE_LIMIT: u64 = 536_870_912;
+
+/// Whether a frame of this layout may be captured, without side effects.
+///
+/// `estimated_bytes` is `None` when the layout arithmetic overflowed, which
+/// is what a nonsense width or height produces. Testing this separately from
+/// [`within_limit`] keeps the decision readable and testable: the wrapper only
+/// adds the warn-once and the sticky disable.
+fn frame_fits(estimated_bytes: Option<u64>, valid: bool) -> bool {
+    valid && estimated_bytes.is_some_and(|n| n > 0 && n <= CAPTURE_LIMIT)
+}
+
+// Called only after capture is enabled. Bound each allocation to 512 MiB.
+fn within_limit(width: u64, height: u64, estimated_bytes: Option<u64>, valid: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if DISABLED.load(Relaxed) { return false; }
+    if frame_fits(estimated_bytes, valid) {
+        return true;
+    }
+    if !DISABLED.swap(true, Relaxed) {
+        tracing::warn!(width, height, ?estimated_bytes, "capture disabled: invalid layout, overflow or size limit");
+    }
+    false
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
-        .as_ref()
+    let folder = FOLDER
+        .get_or_init(|| explicit_folder().cloned().or_else(|| timed().map(|_| PathBuf::from("."))))
+        .as_ref()?;
+    // The unset path returns above, without even loading the new state.
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    Some(folder)
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -172,6 +253,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if folder().is_none() { return false; }
+    let at = timed().is_some_and(|at| {
+        at.lock().unwrap_or_else(|e| e.into_inner()).wanted(n, std::time::Instant::now())
+    });
+    at || numbered(n)
+}
+
+fn numbered(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -180,18 +269,37 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    (explicit_folder().is_some() && n.is_power_of_two()) || listed(n) || before_world || in_world
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if numbered(n) {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
+    if let Some(at) = timed() {
+        let at = at.lock().unwrap_or_else(|e| e.into_inner());
+        if at.frame == Some(n) {
+            for time in &at.times[at.due.clone()] {
+                save_as(&format!("frame-at-{:.1}", time.as_secs_f64()), width, height, pitch, bgra, rows);
+            }
+        }
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    let (width64, height64) = (u64::from(width), u64::from(height));
+    let input = height64.checked_sub(1).and_then(|h| h.checked_mul(pitch as u64))
+        .and_then(|n| width64.checked_mul(4).and_then(|row| n.checked_add(row)));
+    if !within_limit(width64, height64, input,
+        width > 0 && u64::from(width) * 4 <= pitch as u64
+            && input.is_some_and(|n| n <= rows.len() as u64)) { return; }
+    let raw_bytes = u64::from(w).checked_mul(3).and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(u64::from(h)));
+    if !within_limit(width64, height64, raw_bytes, true) { return; }
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
@@ -212,9 +320,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let bound = zlib_rs::compress_bound(raw.len());
+    if !within_limit(width64, height64, (bound as u64).checked_add(57), true) { return; }
+    let mut compressed = vec![0u8; bound];
     let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
-    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    if !within_limit(width64, height64, raw_bytes, rc == zlib_rs::ReturnCode::Ok) { return; }
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
@@ -280,6 +390,7 @@ pub(crate) fn read_back_of(
     texture: &ID3D12Resource,
     sub: u32,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    folder()?;
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -296,6 +407,18 @@ pub(crate) fn read_back_of(
             Some(&mut total),
         );
     }
+    let f = footprint.Footprint;
+    let (width, height) = (u64::from(f.Width), u64::from(f.Height));
+    let padded = u64::from(f.RowPitch).checked_mul(height).map(|n| n.max(total));
+    if !within_limit(width, height, padded,
+        width > 0 && height > 0 && f.RowPitch > 0 && total > 0
+            && f.Depth == 1 && footprint.Offset == 0) { return None; }
+    // Target conversion may keep three f32 channels per pixel.
+    if !within_limit(width, height, width.checked_mul(height).and_then(|n| n.checked_mul(12)), true) {
+        return None;
+    }
+    // The mapping below spans full padded rows, including the final row.
+    total = padded?;
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
@@ -392,7 +515,9 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on()
+        || DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -873,6 +998,35 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn capture_times_reject_the_entire_invalid_list() {
+        for value in ["", "5,", "5,no", "-1", "NaN", "inf", "1e300"] {
+            assert!(super::parse_times(value).is_none(), "{value}");
+        }
+        let times = super::parse_times(" 12, 5, 5, 25.5, 0 ").unwrap();
+        assert_eq!(times.iter().map(|t| t.as_secs_f64()).collect::<Vec<_>>(), [0.0, 5.0, 12.0, 25.5]);
+    }
+
+    #[test]
+    fn capture_times_use_elapsed_time_and_keep_each_frames_decision() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut at = super::TimedCapture {
+            times: super::parse_times("5,12,25.5").unwrap(),
+            start: None, frame: None, due: 0..0,
+        };
+        assert!(!at.wanted(1, start));
+        assert!(!at.wanted(1000, start + Duration::from_secs(4)));
+        assert!(!at.wanted(1000, start + Duration::from_secs(5)));
+        assert!(at.wanted(1001, start + Duration::from_secs(5)));
+        assert_eq!(at.due, 0..1);
+        assert!(at.wanted(1001, start + Duration::from_secs(6)));
+        assert!(!at.wanted(1002, start + Duration::from_secs(6)));
+        assert!(at.wanted(1003, start + Duration::from_secs(26)));
+        assert_eq!(at.due, 1..3);
+        assert!(!at.wanted(1004, start + Duration::from_secs(27)));
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
@@ -889,5 +1043,44 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::{frame_fits, CAPTURE_LIMIT};
+
+    fn bytes(width: u64, height: u64, per_pixel: u64) -> Option<u64> {
+        width.checked_mul(height).and_then(|n| n.checked_mul(per_pixel))
+    }
+
+    #[test]
+    fn ordinary_frames_fit() {
+        assert!(frame_fits(bytes(1920, 1080, 4), true));
+        assert!(frame_fits(bytes(3840, 2160, 4), true));
+        assert_eq!(bytes(1920, 1080, 4), Some(8_294_400));
+        assert_eq!(bytes(3840, 2160, 4), Some(33_177_600));
+    }
+
+    #[test]
+    fn the_ceiling_is_inclusive() {
+        assert!(frame_fits(Some(CAPTURE_LIMIT), true));
+        assert!(!frame_fits(Some(CAPTURE_LIMIT + 1), true));
+    }
+
+    #[test]
+    fn overflow_and_nonsense_do_not_fit() {
+        // 64K by 64K at four bytes per pixel is sixteen gigabytes.
+        assert!(!frame_fits(bytes(65_536, 65_536, 4), true));
+        // The arithmetic that produced 7.7 TB in the field: it overflows u64.
+        assert_eq!(bytes(u64::from(u32::MAX), u64::from(u32::MAX), 4), None);
+        assert!(!frame_fits(bytes(u64::from(u32::MAX), u64::from(u32::MAX), 4), true));
+    }
+
+    #[test]
+    fn zero_and_invalid_layouts_do_not_fit() {
+        assert!(!frame_fits(Some(0), true));
+        assert!(!frame_fits(None, true));
+        assert!(!frame_fits(Some(1024), false));
     }
 }
