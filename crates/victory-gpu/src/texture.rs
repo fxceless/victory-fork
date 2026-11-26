@@ -59,6 +59,11 @@ pub(crate) struct Staging {
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
+    /// For such a texture: whether [`Staging::detile`] has produced a held
+    /// level mask in [`Staging::detiled`] (false before the first detiling,
+    /// e.g. when a partly-mapped read was all zero or `refresh_unlocked`
+    /// failed).
+    has_detiled: std::sync::atomic::AtomicBool,
     /// For such a texture: the levels that were the title's at the last
     /// detiling (a bit a level; the staging buffer holds zeros for the
     /// others), and what that was judged by ([`Staging::judgement`]).
@@ -820,7 +825,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        let Some(held) = staging.detiled_levels() else {
+            return;
+        };
+        let waiting = on_demand.uploaded(held, staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -965,6 +973,21 @@ impl Staging {
     fn judged(&self) -> [u64; 2] {
         use std::sync::atomic::Ordering::Relaxed;
         [self.judged[0].load(Relaxed), self.judged[1].load(Relaxed)]
+    }
+
+    fn record_judged(&self, judged: [u64; 2]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.judged[0].store(judged[0], Relaxed);
+        self.judged[1].store(judged[1], Relaxed);
+    }
+
+    /// Held level mask from the last [`Staging::detile`], or `None` if
+    /// `detile()` has not yet run on this staging buffer.
+    fn detiled_levels(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        self.has_detiled
+            .load(Acquire)
+            .then(|| self.detiled.load(Relaxed))
     }
 
     /// Levels on demand: the levels that are the title's now, a bit a
@@ -1117,6 +1140,9 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
+                    if self.on_demand {
+                        self.record_judged(self.judgement());
+                    }
                     return false;
                 }
                 self.detile(read);
@@ -1215,6 +1241,7 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            self.dirty.store(true, Relaxed);
             0
         }
     }
@@ -1226,12 +1253,12 @@ impl Staging {
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
+            use std::sync::atomic::Ordering::{Relaxed, Release};
             let judged = self.judgement();
-            self.judged[0].store(judged[0], Relaxed);
-            self.judged[1].store(judged[1], Relaxed);
+            self.record_judged(judged);
             let held = self.held_levels(judged);
             self.detiled.store(held, Relaxed);
+            self.has_detiled.store(true, Release);
             held
         } else {
             u32::MAX
@@ -1572,6 +1599,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
+        has_detiled: std::sync::atomic::AtomicBool::new(false),
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
@@ -1689,5 +1717,102 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn on_demand_skipped_detile_preserves_none_and_updates_judged() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let rdesc: [u32; 14] = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).unwrap() as usize;
+        // SAFETY: private reservation with only the first 64 KiB committed (all zeros).
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) }.cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: committing the head block of our own reservation.
+        let committed = unsafe { VirtualAlloc(base.cast(), 65536, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+
+        let placed = crate::resource::texture_at(base as u64, &rdesc).unwrap();
+        let tex = crate::resource::host_resource(placed).expect("host texture");
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(rdesc) };
+        let layout = crate::resource::texture_layout(&desc)
+            .expect("layout")
+            .planes[0]
+            .layout
+            .clone();
+        // Build a synthetic on_demand Staging pointing at our partly-mapped reservation.
+        // SAFETY: live D3D12 texture descriptor query.
+        let d = unsafe { tex.GetDesc() };
+        let count = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+        let mut footprints = vec![Default::default(); count as usize];
+        let mut rows = vec![0u32; count as usize];
+        let mut size = 0u64;
+        // SAFETY: querying footprints of a valid texture desc.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut size),
+            );
+        }
+        let (buffer, data) = host.upload_buffer(size).expect("upload buffer");
+        let staging = super::Staging {
+            buffer,
+            #[cfg(feature = "diagnostics")]
+            size,
+            data,
+            footprints,
+            rows,
+            layout,
+            mips: u32::from(d.MipLevels),
+            bytes: size,
+            memory: base,
+            last: std::sync::Mutex::default(),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            uploaded: std::sync::atomic::AtomicBool::new(false),
+            used: std::sync::atomic::AtomicU64::new(0),
+            on_demand: true,
+            has_detiled: std::sync::atomic::AtomicBool::new(false),
+            detiled: std::sync::atomic::AtomicU32::new(0),
+            judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+            waiting: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Fresh Staging has not detiled yet -> must not report `Some(0)` to Tiled::uploaded.
+        assert_eq!(staging.detiled_levels(), None);
+
+        // 1) Failed `refresh_unlocked` on partly-mapped memory keeps `detiled_levels() == None`
+        //    and sets `dirty = true` so the next draw retries.
+        let mut last = staging.last.lock().unwrap();
+        assert_eq!(staging.refresh_unlocked(&mut last, total), 0);
+        drop(last);
+        assert_eq!(staging.detiled_levels(), None);
+        assert!(staging.dirty.load(Relaxed));
+
+        // 2) Partly-mapped all-zero `refresh_timed` skips `detile()` yet updates `judged`
+        //    so subsequent draws do not trigger an infinite forget/upload storm.
+        staging.dirty.store(false, Relaxed);
+        staging.refresh_timed();
+        assert_eq!(staging.detiled_levels(), None);
+        assert_eq!(staging.judgement(), staging.judged());
+
+        // 3) Once non-zero data is present, `detile()` runs and publishes held levels.
+        // SAFETY: writing into our committed first page.
+        unsafe { base.write(0x5a) };
+        staging.forget();
+        staging.refresh_timed();
+        assert!(staging.detiled_levels().is_some());
+        assert_eq!(staging.judgement(), staging.judged());
+
+        // SAFETY: freeing our private reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }
