@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(test, windows))]
+mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]
