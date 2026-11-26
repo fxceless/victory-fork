@@ -5915,13 +5915,14 @@ mod spare_tests {
 
     #[test]
     fn the_oldest_spares_go_for_room_and_big_ones_are_not_kept() {
-        let mut s = Spares::new(8 << 10);
-        assert!(s.give(4 << 10, 0, 1).is_empty());
-        assert!(s.give(1 << 10, 0, 2).is_empty());
-        assert_eq!(s.give(4 << 10, 0, 3), vec![1]);
-        assert_eq!(s.give(2 << 10, 0, 4), vec![4], "over an eighth of the most");
-        assert_eq!(s.len(), 2);
-        assert_eq!(s.bytes, 5 << 10);
+        let mut s = Spares::new(16 << 10);
+        for i in 0..8 {
+            assert!(s.give(2 << 10, 0, i).is_empty());
+        }
+        assert_eq!(s.give(1 << 10, 0, 8), vec![0], "the oldest goes for room");
+        assert_eq!(s.give(4 << 10, 0, 9), vec![9], "over an eighth of the most");
+        assert_eq!(s.len(), 8);
+        assert_eq!(s.bytes, 15 << 10);
     }
 }
 
