@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod check;
 mod inspect;
 mod run;
 mod shader;
@@ -27,6 +28,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check GTA VI archive availability in the configured game directory.
+    Check,
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -137,6 +140,10 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
+        Command::Check => {
+            let cfg = victory_core::Config::load()?;
+            std::process::exit(check::scan(cfg.require_game_dir()?, false));
+        }
         Command::Inspect {
             file,
             imports,
