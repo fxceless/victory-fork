@@ -1503,7 +1503,42 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
+    alias_lookup(this, true).map(Held)
+}
+
+/// Whether [`alias_of`] finds a texture for `this`, without holding it.
+#[cfg(windows)]
+pub(crate) fn has_alias(this: This) -> bool {
+    alias_lookup(this, false).is_some()
+}
+
+/// A title texture held alive while an alias copy uses it ([`alias_of`]).
+/// The title may drop its last reference between the lookup and the copy
+/// (its recording threads release textures once their last use is
+/// recorded): the hold keeps it (fxceless/victory-fork #1336).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// [`alias_of`]'s lookup; with `pin`, a reference is added under the
+/// table's lock (`None` if the texture is being released).
+#[cfg(windows)]
+fn alias_lookup(this: This, pin: bool) -> Option<This> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1564,7 +1599,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || (pin && !object::add_ref_alive(other)) {
+        return None;
+    }
+    Some(other)
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1667,7 +1707,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         let mut prefill = None;
-        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && !has_alias(this) {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
