@@ -1120,10 +1120,11 @@ impl HostHeap {
             let fitted = if count + extra <= null {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                let mirrored = null - extra;
+                tracing::warn!(count, mirrored, unmirrored = count - mirrored,
+                    dynamic_start = mirrored, null_slot = null,
+                    "host view heap capped at {size} for {count} requested title slots");
+                mirrored
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -2713,6 +2714,17 @@ impl HostHeap {
         }
         Some(text)
     }
+
+    /// The frame listing has resolved this number to a title slot. Describe
+    /// the static mirror independently of any table rebuilt for the draw.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn describe_title_slot(&self, index: u32) -> String {
+        if index >= self.count {
+            format!("outside static mirror ({} slots)", self.count)
+        } else {
+            self.describe_slot(index).unwrap_or_else(|| "none".into())
+        }
+    }
 }
 
 /// Logs `what` the first time it happens.
@@ -3915,6 +3927,31 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn frame_listing_distinguishes_unmirrored_title_slots_from_null_mirrors() {
+        if host().is_none() {
+            eprintln!("skipping frame listing test: no D3D12 device");
+            return;
+        }
+        probe_view_limit();
+        let null = victory_shader::emit::view_heap_limit();
+        let requested = 1_245_184.max(null + 2);
+        let heap = HostHeap::new(false, requested).unwrap();
+        let mirrored = heap.count();
+        eprintln!("requested {requested}, mirrored {mirrored}, null slot {null}");
+        assert_eq!(mirrored, null - DYNAMIC);
+        assert_eq!(heap.describe_title_slot(mirrored - 1), "null");
+        let first_dynamic = heap.dynamic(1).unwrap();
+        assert_eq!(first_dynamic, mirrored);
+        let outside = format!("outside static mirror ({mirrored} slots)");
+        for index in [first_dynamic, null, requested - 1] {
+            assert_eq!(heap.describe_title_slot(index), outside);
+            // Arbitrary root words do not get an in-mirror annotation here.
+            assert!(heap.describe_slot(index).is_none());
+        }
+    }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA).

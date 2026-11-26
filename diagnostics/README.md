@@ -1,5 +1,21 @@
 # Diagnostic logs
 
+## Inspect a material's texture slots
+
+For a diagnostics frame shot, set `VICTORY_LIST_SLOTS` to a comma-separated list of shader hash
+prefixes from the draw of interest. In `events.txt`, the matching draw's `~slot` lines show the
+candidate slot's source, title view, static host mirror and texture queue state. For example,
+`VICTORY_LIST_SLOTS=b37565055f2f7d3b` selects the pixel shader reported in issue #279.
+
+The heap creation warning gives the requested title count, the number mirrored starting at slot
+zero, and the number left out. In a `~slot` line, `host=[outside static mirror (... slots)]`
+identifies a title slot beyond that mirror. An in-range `null` means the mirror has no recorded
+view there. Tables can be rebuilt in dynamic slots for an individual draw.
+
+The short `uN=... [heap ...]` annotations try user-data words as indices. A scalar constant can
+match a heap slot by coincidence. A texture view found in a material record identifies a candidate.
+Establishing that a shader sampled it requires separate evidence.
+
 Logs of short diagnostics runs on the test machine (Windows 11, Intel i7-14700KF, NVIDIA RTX 4070
 12 GB, 32 GB RAM), for people who want to suggest changes from real numbers.
 

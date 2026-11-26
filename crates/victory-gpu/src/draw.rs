@@ -3572,14 +3572,14 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn slot_line(heap: &crate::descriptor::Heap, from: &str, at: usize, index: u32) -> String {
         let title = heap.handle(index).and_then(crate::descriptor::view);
-        let host: String = heap
-            .host()
-            .and_then(|h| h.describe_slot(index))
-            .unwrap_or_else(|| "none".into())
+        let mirror = heap.host();
+        let host: String = mirror
+            .map(|h| h.describe_title_slot(index))
+            .unwrap_or_else(|| "no host heap".into())
             .chars()
             .take(90)
             .collect();
-        let queue = match heap.host() {
+        let queue = match mirror {
             Some(h) => h.texture_slot_state(index, crate::frame::current()),
             None => "no host heap".into(),
         };
