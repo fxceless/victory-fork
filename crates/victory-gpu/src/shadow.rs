@@ -1995,6 +1995,20 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Changed runs for a card copy, using the same compare switch as the exact
+/// walk. With a 64-byte gap the wide compare can join within each mask.
+fn changed_runs_over(now: &[u8], was: &[u8], gap: usize) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if gap == 64 {
+        return if changed_runs_wide_on() {
+            wide_runs::<true>(now, was)
+        } else {
+            joined_over(changed_runs_bytes(now, was), gap)
+        };
+    }
+    joined_over(changed_runs(now, was), gap)
+}
+
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
 /// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
@@ -2166,12 +2180,40 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// than the walk in the last two, by a fifth: it never ran in a game.)
 #[cfg(target_arch = "x86_64")]
 fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    wide_runs::<false>(now, was)
+}
+
+/// Set bits in one 64-byte mask have at most 62 equal bytes between
+/// them. With a gap of 64 the whole mask therefore contributes at most
+/// one run, which can also join the last run of an earlier mask.
+#[cfg(target_arch = "x86_64")]
+fn join_mask(runs: &mut Vec<(usize, usize)>, open: &mut Option<usize>, last_end: &mut usize, base: usize, mask: u64) {
+    if mask == 0 {
+        return;
+    }
+    let start = base + mask.trailing_zeros() as usize;
+    let end = base + 64 - mask.leading_zeros() as usize;
+    if let Some(first) = *open {
+        if start - *last_end > 64 {
+            runs.push((first, *last_end - first));
+            *open = Some(start);
+        }
+    } else {
+        runs.reserve(64);
+        *open = Some(start);
+    }
+    *last_end = end;
+}
+
+#[cfg(target_arch = "x86_64")]
+fn wide_runs<const JOIN_64: bool>(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let n = now.len().min(was.len());
     let (now, was) = (&now[..n], &was[..n]);
-    let mut runs = Vec::with_capacity(64);
+    let mut runs = if JOIN_64 { Vec::new() } else { Vec::with_capacity(64) };
     // The first byte of a run not yet ended.
     let mut open: Option<usize> = None;
+    let mut last_end = 0;
     let mut base = 0;
     while base + 64 <= n {
         // Bit `k`: byte `base + k` differs.
@@ -2187,7 +2229,9 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             };
             differ |= u64::from(!equal & 0xffff) << (16 * part);
         }
-        if differ == 0 {
+        if JOIN_64 {
+            join_mask(&mut runs, &mut open, &mut last_end, base, differ);
+        } else if differ == 0 {
             if let Some(first) = open.take() {
                 runs.push((first, base - first));
             }
@@ -2218,6 +2262,17 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             }
         }
         base += 64;
+    }
+    if JOIN_64 {
+        let mut tail = 0u64;
+        for i in base..n {
+            tail |= u64::from(now[i] != was[i]) << (i - base);
+        }
+        join_mask(&mut runs, &mut open, &mut last_end, base, tail);
+        if let Some(first) = open {
+            runs.push((first, last_end - first));
+        }
+        return runs;
     }
     for i in base..n {
         match (open, now[i] != was[i]) {
@@ -2404,6 +2459,8 @@ mod merge_tests {
             // (A byte may also keep a zero difference inside a stretch.)
             assert_eq!(changed_runs_wide(&now, &was), by_bytes(&now, &was), "case {case}, {n} bytes");
             assert_eq!(changed_runs_bytes(&now, &was), by_bytes(&now, &was), "case {case}, {n} bytes (byte by byte)");
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(super::wide_runs::<true>(&now, &was), super::joined_over(by_bytes(&now, &was), 64), "case {case} with gap 64");
         }
         // Runs that begin, end and go on at the edges of the 64-byte steps.
         for n in [63usize, 64, 65, 127, 128, 129, 191, 192, 193, 256] {
@@ -2422,6 +2479,93 @@ mod merge_tests {
         // Slices of unlike lengths: the shorter one's bytes.
         assert_eq!(changed_runs_wide(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
         assert_eq!(changed_runs_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
+    }
+
+    #[test]
+    fn joined_page_runs_match_exact_runs_across_masks_and_tails() {
+        let was = [0u8; 259];
+        for first in [0, 1, 61, 62, 63, 64, 127, 128] {
+            for equal_bytes in [0, 1, 31, 61, 62, 63, 64, 65, 66, 127] {
+                let mut now = was;
+                let second = first + equal_bytes + 1;
+                now[first] = 1;
+                now[second] = 1;
+                for gap in 0..=64 {
+                    // Include unlike lengths and partial final masks.
+                    for (a, b) in [(&now[1..], &was[..second]), (&now[..=second], &was[..])] {
+                        let expected = super::joined_over(changed_runs_bytes(a, b), gap);
+                        assert_eq!(super::changed_runs_over(a, b, gap), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compare the old two-pass path and the fused masks on the pages
+    /// `merge_under_writes` examines:
+    /// `cargo test --release -p victory-gpu joined_page_runs_bench -- --ignored --nocapture`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "benchmark"]
+    fn joined_page_runs_bench() {
+        use super::PAGE;
+        use std::hint::black_box;
+        use std::time::Instant;
+        const SIZE: usize = 4 << 20;
+        let was = vec![0u8; SIZE];
+        type Pattern = fn(usize, u32) -> bool;
+        let patterns: &[(&str, Pattern)] = &[
+            ("unchanged", |_, _| false),
+            ("one in 256", |i, _| i.is_multiple_of(256)),
+            ("one in 64", |i, _| i.is_multiple_of(64)),
+            ("12 in 16", |i, _| i % 16 < 12),
+            ("0.6% random", |_, r| r < u32::MAX / 167),
+            ("380 clustered changes", |i, _| i < 380 * 8 && i.is_multiple_of(8)),
+            ("10% random", |_, r| r < u32::MAX / 10),
+            ("all changed", |_, _| true),
+        ];
+        for &(name, changed) in patterns {
+            let mut seed = 0x1b87_3593u32;
+            let now: Vec<u8> = (0..SIZE).map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                u8::from(changed(i % PAGE, seed))
+            }).collect();
+            for (a, b) in now.chunks_exact(PAGE).zip(was.chunks_exact(PAGE)) {
+                assert_eq!(super::wide_runs::<true>(a, b), super::joined_over(changed_runs_wide(a, b), 64));
+            }
+            let measure = |fused| {
+                let start = Instant::now();
+                for _ in 0..8 {
+                    for (a, b) in now.chunks_exact(PAGE).zip(was.chunks_exact(PAGE)) {
+                        let (a, b) = (black_box(a), black_box(b));
+                        let runs = if fused {
+                            super::wide_runs::<true>(a, b)
+                        } else {
+                            super::joined_over(changed_runs_wide(a, b), 64)
+                        };
+                        black_box(runs);
+                    }
+                }
+                start.elapsed() / 8
+            };
+            measure(false);
+            measure(true);
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            for pair in 0..15 {
+                if pair % 2 == 0 {
+                    old.push(measure(false));
+                    new.push(measure(true));
+                } else {
+                    new.push(measure(true));
+                    old.push(measure(false));
+                }
+            }
+            old.sort_unstable();
+            new.sort_unstable();
+            println!("{name}: before {:?}, after {:?} (median per 4 MiB)", old[7], new[7]);
+        }
     }
 
     /// The runs hold exactly the bytes that differ: putting them into the
@@ -3518,7 +3662,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    let runs = changed_runs_over(title, held, merge_gap());
                     if runs.len() > *runs_left {
                         MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                         return true;
