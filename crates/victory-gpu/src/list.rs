@@ -1915,6 +1915,13 @@ impl ValueWait {
         self.holds_for(u64::from_le_bytes(raw))
     }
 
+    /// For tests: a 64-bit wait for the value at `address` to equal
+    /// `reference`.
+    #[cfg(test)]
+    pub(crate) fn equal(address: u64, reference: u64) -> Self {
+        Self { address, comparison: 3, reference, wide: true }
+    }
+
     /// Where the value waited for is: address and bytes.
     #[cfg(windows)]
     pub(crate) fn place(&self) -> (usize, usize) {
