@@ -5365,6 +5365,33 @@ impl<'a> Lower<'a> {
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
             }
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                (self.s.m.select(c, neg, n, d), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low half of the first operand (its high half for hh)
+                // under the second's low half (ll) or high half (lh, hh).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let k16 = self.s.m.i32(16);
+                let low = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    let mask = self.s.m.i32(0xffff);
+                    self.s.m.bin(c, Bin::And, a, mask)
+                };
+                let high = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let mask = self.s.m.i32(0xffff_0000);
+                    self.s.m.bin(c, Bin::And, b, mask)
+                };
+                (self.s.m.bin(c, Bin::Or, low, high), None)
+            }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
                 let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
@@ -8637,6 +8664,19 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
                 self.s.m.bin(c, Bin::Mul, a, b)
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                // Bits 47:32 of the product of the operands' low 24 bits
+                // (signed: sign-extended from bit 23), as the 64-bit
+                // product of the operands widened to 32 bits has them.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_mul_hi_i32_i24";
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);

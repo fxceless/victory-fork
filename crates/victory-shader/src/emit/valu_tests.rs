@@ -1019,6 +1019,119 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
+/// SOPC `op ssrc0, ssrc1`.
+const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// SOPK `op sdst, imm16`.
+const fn sopk(op: u8, sdst: u8, imm: u16) -> u32 {
+    0xB000_0000 | (op as u32) << 23 | (sdst as u32) << 16 | imm as u32
+}
+
+/// `s_cselect_b32 s6, 1, 0` (SCC to a dword), then `v_mov_b32 v0, s6`.
+fn scc_to_v0() -> [u32; 2] {
+    [sop2(0x0a, 6, 129, 128), vop1(0x001, 0, sgpr(6))]
+}
+
+#[test]
+fn scalar_compares_set_scc_as_the_rdna2_document_defines() {
+    // SOPC compares of s0 with s1, the bit tests, and SOPK compares of s0
+    // with a 16-bit immediate (sign-extended for the signed forms,
+    // zero-extended for the unsigned ones).
+    #[allow(clippy::type_complexity)]
+    let conditions: &[(&str, u8, fn(u32, u32) -> bool)] = &[
+        ("s_cmp_eq_i32", 0x00, |a, b| a == b),
+        ("s_cmp_lg_i32", 0x01, |a, b| a != b),
+        ("s_cmp_gt_i32", 0x02, |a, b| (a as i32) > (b as i32)),
+        ("s_cmp_ge_i32", 0x03, |a, b| (a as i32) >= (b as i32)),
+        ("s_cmp_lt_i32", 0x04, |a, b| (a as i32) < (b as i32)),
+        ("s_cmp_le_i32", 0x05, |a, b| (a as i32) <= (b as i32)),
+        ("s_cmp_eq_u32", 0x06, |a, b| a == b),
+        ("s_cmp_lg_u32", 0x07, |a, b| a != b),
+        ("s_cmp_gt_u32", 0x08, |a, b| a > b),
+        ("s_cmp_ge_u32", 0x09, |a, b| a >= b),
+        ("s_cmp_lt_u32", 0x0a, |a, b| a < b),
+        ("s_cmp_le_u32", 0x0b, |a, b| a <= b),
+        // Bit (s1 & 31) of s0 is clear / set.
+        ("s_bitcmp0_b32", 0x0c, |a, b| a >> (b & 31) & 1 == 0),
+        ("s_bitcmp1_b32", 0x0d, |a, b| a >> (b & 31) & 1 == 1),
+    ];
+    let values = [
+        0u32,
+        1,
+        2,
+        31,
+        32,
+        0x7fff_fffe,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0xffff_fffe,
+        0xffff_ffff,
+    ];
+    let pairs: Vec<[u32; 4]> = values
+        .iter()
+        .flat_map(|&a| values.iter().map(move |&b| [a, b, 0, 0]))
+        .collect();
+    let mut failures = Vec::new();
+    for &(name, op, reference) in conditions {
+        let [c, m] = scc_to_v0();
+        let shader = build_valu_cs(&[sopc(op, 0, 1), c, m]);
+        run_cases(&shader, &pairs, |backend, _, inp, got| {
+            let want = u32::from(reference(inp[0], inp[1]));
+            if got != want && failures.len() < 40 {
+                failures.push(format!(
+                    "{backend}: {name}({:#x}, {:#x}) = {got}, want {want}",
+                    inp[0], inp[1]
+                ));
+            }
+        });
+    }
+    #[allow(clippy::type_complexity)]
+    let immediates: &[(&str, u8, fn(u32, u16) -> bool)] = &[
+        ("s_cmpk_eq_i32", 0x03, |a, k| {
+            a as i32 == i32::from(k as i16)
+        }),
+        ("s_cmpk_lg_i32", 0x04, |a, k| {
+            a as i32 != i32::from(k as i16)
+        }),
+        ("s_cmpk_gt_i32", 0x05, |a, k| a as i32 > i32::from(k as i16)),
+        ("s_cmpk_ge_i32", 0x06, |a, k| {
+            a as i32 >= i32::from(k as i16)
+        }),
+        ("s_cmpk_lt_i32", 0x07, |a, k| {
+            (a as i32) < i32::from(k as i16)
+        }),
+        ("s_cmpk_le_i32", 0x08, |a, k| {
+            a as i32 <= i32::from(k as i16)
+        }),
+        ("s_cmpk_eq_u32", 0x09, |a, k| a == u32::from(k)),
+        ("s_cmpk_lg_u32", 0x0a, |a, k| a != u32::from(k)),
+        ("s_cmpk_gt_u32", 0x0b, |a, k| a > u32::from(k)),
+        ("s_cmpk_ge_u32", 0x0c, |a, k| a >= u32::from(k)),
+        ("s_cmpk_lt_u32", 0x0d, |a, k| a < u32::from(k)),
+        ("s_cmpk_le_u32", 0x0e, |a, k| a <= u32::from(k)),
+    ];
+    let singles: Vec<[u32; 4]> = values.iter().map(|&a| [a, 0, 0, 0]).collect();
+    for &(name, op, reference) in immediates {
+        for k in [0u16, 1, 0x7fff, 0x8000, 0xffff] {
+            let [c, m] = scc_to_v0();
+            let shader = build_valu_cs(&[sopk(op, 0, k), c, m]);
+            run_cases(&shader, &singles, |backend, _, inp, got| {
+                let want = u32::from(reference(inp[0], k));
+                if got != want && failures.len() < 40 {
+                    failures.push(format!(
+                        "{backend}: {name}({:#x}, {k:#x}) = {got}, want {want}",
+                        inp[0]
+                    ));
+                }
+            });
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn f16_omod_applies_before_clamp() {
     // VOP3 v_add_f16 (0x132 = 0x100 + VOP2 0x32): v0 = (v1 + v2) * omod [clamp]
@@ -1621,4 +1734,400 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
+
+/// The integer VALU operations whose result is a pure function of up to three
+/// dwords, each with the RDNA2 instruction set document's definition written
+/// out in Rust: (name, VOP3 opcode, reference).
+#[allow(clippy::type_complexity)]
+const INTEGER_OPS: &[(&str, u16, fn([u32; 3]) -> u32)] = &[
+    ("v_bfi_b32", 0x14a, |[a, b, c]| a & b | !a & c),
+    ("v_alignbit_b32", 0x14e, |[a, b, c]| {
+        ((u64::from(a) << 32 | u64::from(b)) >> (c & 31)) as u32
+    }),
+    ("v_alignbyte_b32", 0x14f, |[a, b, c]| {
+        ((u64::from(a) << 32 | u64::from(b)) >> (8 * (c & 3))) as u32
+    }),
+    ("v_bfm_b32", 0x363, |[a, b, _]| {
+        (1u32 << (a & 31)).wrapping_sub(1) << (b & 31)
+    }),
+    ("v_bcnt_u32_b32", 0x364, |[a, b, _]| {
+        a.count_ones().wrapping_add(b)
+    }),
+    ("v_bfrev_b32", 0x1b8, |[a, _, _]| a.reverse_bits()),
+    ("v_not_b32", 0x1b7, |[a, _, _]| !a),
+    ("v_xnor_b32", 0x11e, |[a, b, _]| !(a ^ b)),
+    ("v_xor3_b32", 0x178, |[a, b, c]| a ^ b ^ c),
+    ("v_or3_b32", 0x372, |[a, b, c]| a | b | c),
+    ("v_and_or_b32", 0x371, |[a, b, c]| a & b | c),
+    ("v_xad_u32", 0x345, |[a, b, c]| (a ^ b).wrapping_add(c)),
+    ("v_add3_u32", 0x36d, |[a, b, c]| {
+        a.wrapping_add(b).wrapping_add(c)
+    }),
+    ("v_lshl_add_u32", 0x346, |[a, b, c]| {
+        (a << (b & 31)).wrapping_add(c)
+    }),
+    ("v_add_lshl_u32", 0x347, |[a, b, c]| {
+        a.wrapping_add(b) << (c & 31)
+    }),
+    ("v_lshl_or_b32", 0x36f, |[a, b, c]| a << (b & 31) | c),
+    ("v_lshrrev_b32", 0x116, |[a, b, _]| b >> (a & 31)),
+    ("v_lshlrev_b32", 0x11a, |[a, b, _]| b << (a & 31)),
+    ("v_ashrrev_i32", 0x118, |[a, b, _]| {
+        ((b as i32) >> (a & 31)) as u32
+    }),
+    ("v_mul_lo_u32", 0x169, |[a, b, _]| a.wrapping_mul(b)),
+    ("v_mul_hi_u32", 0x16a, |[a, b, _]| {
+        ((u64::from(a) * u64::from(b)) >> 32) as u32
+    }),
+    ("v_mul_hi_i32", 0x16c, |[a, b, _]| {
+        ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+    }),
+    ("v_mul_u32_u24", 0x10b, |[a, b, _]| {
+        (a & 0xff_ffff).wrapping_mul(b & 0xff_ffff)
+    }),
+    ("v_mul_hi_u32_u24", 0x10c, |[a, b, _]| {
+        ((u64::from(a & 0xff_ffff) * u64::from(b & 0xff_ffff)) >> 32) as u32
+    }),
+    ("v_mul_i32_i24", 0x109, |[a, b, _]| {
+        (sext24(a) * sext24(b)) as u32
+    }),
+    ("v_mul_hi_i32_i24", 0x10a, |[a, b, _]| {
+        ((sext24(a) * sext24(b)) >> 32) as u32
+    }),
+    ("v_mad_u32_u24", 0x143, |[a, b, c]| {
+        (a & 0xff_ffff).wrapping_mul(b & 0xff_ffff).wrapping_add(c)
+    }),
+    ("v_mad_i32_i24", 0x142, |[a, b, c]| {
+        (sext24(a) * sext24(b)).wrapping_add(i64::from(c)) as u32
+    }),
+    ("v_min3_i32", 0x152, |[a, b, c]| {
+        (a as i32).min(b as i32).min(c as i32) as u32
+    }),
+    ("v_min3_u32", 0x153, |[a, b, c]| a.min(b).min(c)),
+    ("v_max3_i32", 0x155, |[a, b, c]| {
+        (a as i32).max(b as i32).max(c as i32) as u32
+    }),
+    ("v_max3_u32", 0x156, |[a, b, c]| a.max(b).max(c)),
+    ("v_med3_i32", 0x158, |[a, b, c]| {
+        let mut v = [a as i32, b as i32, c as i32];
+        v.sort_unstable();
+        v[1] as u32
+    }),
+    ("v_med3_u32", 0x159, |[a, b, c]| {
+        let mut v = [a, b, c];
+        v.sort_unstable();
+        v[1]
+    }),
+    // {S0, S1} as eight bytes, S1 below: selectors 8-11 replicate the sign
+    // bit of bytes 1, 3, 5 and 7, 12 is zero, above it 0xff.
+    ("v_perm_b32", 0x344, |[a, b, c]| {
+        let bytes = u64::from(a) << 32 | u64::from(b);
+        (0..4).fold(0u32, |out, i| {
+            let sel = c >> (8 * i) & 0xff;
+            let byte = match sel {
+                0..=7 => (bytes >> (8 * sel)) as u8,
+                8..=11 => {
+                    if bytes >> (8 * (2 * (sel - 8) + 1) + 7) & 1 != 0 {
+                        0xff
+                    } else {
+                        0
+                    }
+                }
+                12 => 0,
+                _ => 0xff,
+            };
+            out | u32::from(byte) << (8 * i)
+        })
+    }),
+    ("v_ffbl_b32", 0x1ba, |[a, _, _]| {
+        if a == 0 { u32::MAX } else { a.trailing_zeros() }
+    }),
+    ("v_ffbh_u32", 0x1b9, |[a, _, _]| {
+        if a == 0 { u32::MAX } else { a.leading_zeros() }
+    }),
+    ("v_ffbh_i32", 0x1bb, |[a, _, _]| {
+        if a == 0 || a == u32::MAX {
+            u32::MAX
+        } else if a >> 31 != 0 {
+            (!a).leading_zeros()
+        } else {
+            a.leading_zeros()
+        }
+    }),
+];
+
+fn sext24(x: u32) -> i64 {
+    i64::from((x << 8) as i32 >> 8)
+}
+
+/// Dwords that sit on the edges of the operations above: shifts and field
+/// widths around 0, 31 and 32, the 24-bit and sign boundaries, runs of ones.
+const INTEGER_EDGES: &[u32] = &[
+    0,
+    1,
+    2,
+    3,
+    4,
+    7,
+    8,
+    12,
+    13,
+    31,
+    32,
+    33,
+    0xff,
+    0x100,
+    0xffff,
+    0x1_0000,
+    0x7f_ffff,
+    0x80_0000,
+    0xff_ffff,
+    0x100_0000,
+    0x7fff_ffff,
+    0x8000_0000,
+    0x8000_0001,
+    0xffff_fffe,
+    0xffff_ffff,
+    0xdead_beef,
+    0x1234_5678,
+    0x8765_4321,
+    0xff00_ff00,
+    0x00ff_00ff,
+    0x0f0f_0f0f,
+    0x0302_0100,
+];
+
+#[test]
+fn integer_operations_match_the_rdna2_definitions() {
+    // Every edge as each operand with the others varied, then a spread of
+    // pairs and triples from a fixed sequence.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        INTEGER_EDGES[(seed >> 33) as usize % INTEGER_EDGES.len()]
+    };
+    let mut cases: Vec<[u32; 4]> = Vec::new();
+    for &e in INTEGER_EDGES {
+        cases.push([e, next(), next(), 0]);
+        cases.push([next(), e, next(), 0]);
+        cases.push([next(), next(), e, 0]);
+    }
+    for _ in 0..32 {
+        cases.push([next(), next(), next(), 0]);
+    }
+    let mut failures = Vec::new();
+    for &(name, opcode, reference) in INTEGER_OPS {
+        let shader = build_valu_cs(&vop3(opcode, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = reference([inp[0], inp[1], inp[2]]);
+            if got != want && failures.len() < 40 {
+                failures.push(format!(
+                    "{backend}: {name}({:#x}, {:#x}, {:#x}) = {got:#x}, want {want:#x}",
+                    inp[0], inp[1], inp[2]
+                ));
+            }
+        });
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn mbcnt_of_the_first_lane_counts_no_lane_below_it() {
+    // The one thread is lane 0 of a wave, so no lane is below it and the
+    // result is the addend. The shaders ask for a 32-lane wave: not run on
+    // WARP, whose waves are narrower (and `VICTORY_WARP=1` makes the
+    // "hardware" adapter WARP).
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("the hardware adapter is WARP; skipped");
+        return;
+    }
+    for (name, opcode) in [("v_mbcnt_lo_u32_b32", 0x365), ("v_mbcnt_hi_u32_b32", 0x366)] {
+        let shader = build_valu_cs(&vop3(opcode, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let cases = [
+            [u32::MAX, 0, 0, 0],
+            [u32::MAX, 5, 0, 0],
+            [0x8000_0001, 0xffff_fff0, 0, 0],
+        ];
+        run_cases_on(
+            &shader,
+            &cases,
+            &[("hardware", false)],
+            |backend, _, inp, got| {
+                assert_eq!(
+                    got, inp[1],
+                    "{backend}: {name}({:#x}, {:#x})",
+                    inp[0], inp[1]
+                );
+            },
+        );
+    }
+}
+
+/// The scalar integer operations on one or two dwords, as the RDNA2
+/// instruction set document defines them: (name, encoding, reference); the
+/// encoding is `Sop1(opcode)` or `Sop2(opcode)`. The bit-field extracts take
+/// their operand pair as the instruction does (offset in bits 4:0, width in
+/// 22:16) and are tested on widths of up to 32.
+#[allow(clippy::type_complexity)]
+const SCALAR_OPS: &[(&str, ScalarOp, fn([u32; 2]) -> u32)] = &[
+    ("s_add_u32", Sop2(0x00), |[a, b]| a.wrapping_add(b)),
+    ("s_sub_u32", Sop2(0x01), |[a, b]| a.wrapping_sub(b)),
+    ("s_add_i32", Sop2(0x02), |[a, b]| a.wrapping_add(b)),
+    ("s_sub_i32", Sop2(0x03), |[a, b]| a.wrapping_sub(b)),
+    ("s_min_i32", Sop2(0x06), |[a, b]| {
+        (a as i32).min(b as i32) as u32
+    }),
+    ("s_min_u32", Sop2(0x07), |[a, b]| a.min(b)),
+    ("s_max_i32", Sop2(0x08), |[a, b]| {
+        (a as i32).max(b as i32) as u32
+    }),
+    ("s_max_u32", Sop2(0x09), |[a, b]| a.max(b)),
+    ("s_and_b32", Sop2(0x0e), |[a, b]| a & b),
+    ("s_or_b32", Sop2(0x10), |[a, b]| a | b),
+    ("s_xor_b32", Sop2(0x12), |[a, b]| a ^ b),
+    ("s_andn2_b32", Sop2(0x14), |[a, b]| a & !b),
+    ("s_orn2_b32", Sop2(0x16), |[a, b]| a | !b),
+    ("s_nand_b32", Sop2(0x18), |[a, b]| !(a & b)),
+    ("s_nor_b32", Sop2(0x1a), |[a, b]| !(a | b)),
+    ("s_xnor_b32", Sop2(0x1c), |[a, b]| !(a ^ b)),
+    ("s_lshl_b32", Sop2(0x1e), |[a, b]| a << (b & 31)),
+    ("s_lshr_b32", Sop2(0x20), |[a, b]| a >> (b & 31)),
+    ("s_ashr_i32", Sop2(0x22), |[a, b]| {
+        ((a as i32) >> (b & 31)) as u32
+    }),
+    ("s_bfm_b32", Sop2(0x24), |[a, b]| {
+        (1u32 << (a & 31)).wrapping_sub(1) << (b & 31)
+    }),
+    ("s_mul_i32", Sop2(0x26), |[a, b]| a.wrapping_mul(b)),
+    ("s_bfe_u32", Sop2(0x27), |[a, b]| bfe(a, b, false)),
+    ("s_bfe_i32", Sop2(0x28), |[a, b]| bfe(a, b, true)),
+    ("s_absdiff_i32", Sop2(0x2c), |[a, b]| {
+        (a as i32).wrapping_sub(b as i32).unsigned_abs()
+    }),
+    ("s_lshl1_add_u32", Sop2(0x2e), |[a, b]| {
+        (a << 1).wrapping_add(b)
+    }),
+    ("s_lshl2_add_u32", Sop2(0x2f), |[a, b]| {
+        (a << 2).wrapping_add(b)
+    }),
+    ("s_lshl3_add_u32", Sop2(0x30), |[a, b]| {
+        (a << 3).wrapping_add(b)
+    }),
+    ("s_lshl4_add_u32", Sop2(0x31), |[a, b]| {
+        (a << 4).wrapping_add(b)
+    }),
+    ("s_pack_ll_b32_b16", Sop2(0x32), |[a, b]| {
+        a & 0xffff | b << 16
+    }),
+    ("s_pack_lh_b32_b16", Sop2(0x33), |[a, b]| {
+        a & 0xffff | b & 0xffff_0000
+    }),
+    ("s_pack_hh_b32_b16", Sop2(0x34), |[a, b]| {
+        a >> 16 | b & 0xffff_0000
+    }),
+    ("s_mul_hi_u32", Sop2(0x35), |[a, b]| {
+        ((u64::from(a) * u64::from(b)) >> 32) as u32
+    }),
+    ("s_mul_hi_i32", Sop2(0x36), |[a, b]| {
+        ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+    }),
+    ("s_not_b32", Sop1(0x07), |[a, _]| !a),
+    ("s_brev_b32", Sop1(0x0b), |[a, _]| a.reverse_bits()),
+    ("s_bcnt1_i32_b32", Sop1(0x0f), |[a, _]| a.count_ones()),
+    ("s_ff1_i32_b32", Sop1(0x13), |[a, _]| {
+        if a == 0 { u32::MAX } else { a.trailing_zeros() }
+    }),
+    ("s_flbit_i32_b32", Sop1(0x15), |[a, _]| {
+        if a == 0 { u32::MAX } else { a.leading_zeros() }
+    }),
+    ("s_flbit_i32", Sop1(0x17), |[a, _]| {
+        if a == 0 || a == u32::MAX {
+            u32::MAX
+        } else if a >> 31 != 0 {
+            (!a).leading_zeros()
+        } else {
+            a.leading_zeros()
+        }
+    }),
+    ("s_abs_i32", Sop1(0x34), |[a, _]| (a as i32).unsigned_abs()),
+];
+
+#[derive(Clone, Copy)]
+enum ScalarOp {
+    Sop1(u8),
+    Sop2(u8),
+}
+use ScalarOp::{Sop1, Sop2};
+
+/// `s_bfe_u32` / `s_bfe_i32` of `a` by the field `field` (offset in bits 4:0,
+/// width in 22:16): zero for a width of 0; a field reaching past bit 31 is
+/// what is left of `a` shifted down, sign-extended from bit 31 when signed.
+fn bfe(a: u32, field: u32, signed: bool) -> u32 {
+    let (offset, width) = (field & 31, field >> 16 & 0x7f);
+    if width == 0 {
+        return 0;
+    }
+    let shifted = if signed {
+        ((a as i32) >> offset) as u32
+    } else {
+        a >> offset
+    };
+    if width >= 32 - offset {
+        return shifted;
+    }
+    let kept = shifted & ((1u32 << width) - 1);
+    if signed && kept >> (width - 1) != 0 {
+        kept | !((1u32 << width) - 1)
+    } else {
+        kept
+    }
+}
+
+#[test]
+fn scalar_integer_operations_match_the_rdna2_definitions() {
+    let edges: Vec<u32> = INTEGER_EDGES.to_vec();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        edges[(seed >> 33) as usize % edges.len()]
+    };
+    let mut cases: Vec<[u32; 4]> = Vec::new();
+    for &e in INTEGER_EDGES {
+        cases.push([e, next(), 0, 0]);
+        cases.push([next(), e, 0, 0]);
+    }
+    for _ in 0..32 {
+        cases.push([next(), next(), 0, 0]);
+    }
+    let mut failures = Vec::new();
+    for &(name, op, reference) in SCALAR_OPS {
+        // `op s6, s0, s1`, then v_mov_b32 v0, s6.
+        let first = match op {
+            Sop2(code) => sop2(code, 6, 0, 1),
+            Sop1(code) => 0xBE80_0000 | 6 << 16 | u32::from(code) << 8,
+        };
+        let shader = build_valu_cs(&[first, vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = reference([inp[0], inp[1]]);
+            if got != want && failures.len() < 40 {
+                failures.push(format!(
+                    "{backend}: {name}({:#x}, {:#x}) = {got:#x}, want {want:#x}",
+                    inp[0], inp[1]
+                ));
+            }
+        });
+    }
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.join(
+            "
+"
+        )
+    );
 }
