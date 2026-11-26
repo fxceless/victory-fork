@@ -4648,7 +4648,6 @@ impl<'a> Lower<'a> {
             .strip_prefix("ds_")
             .map(|n| n.replace("_rtn", ""))
             .ok_or("an LDS operation")?;
-        use super::bitcode::Rmw;
         let rmw = match op.as_str() {
             "add_u32" => Some(Rmw::Add),
             "sub_u32" => Some(Rmw::Sub),
@@ -4660,7 +4659,8 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" | "max_f32" | "min_f32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" | "rsub_u32" | "mskor_b32"
+            | "inc_u32" | "dec_u32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -4687,6 +4687,49 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        if matches!(
+            op.as_str(),
+            "add_f32" | "rsub_u32" | "mskor_b32" | "inc_u32" | "dec_u32"
+        ) {
+            let mask_value = if op == "mskor_b32" {
+                Some(v1.ok_or("an LDS masked OR")?)
+            } else {
+                None
+            };
+            let at = self.begin_guarded(guard);
+            let r = self.lds_update(p, |l, old| {
+                let c = l.cur;
+                let zero = l.s.m.i32(0);
+                let one = l.s.m.i32(1);
+                match op.as_str() {
+                    "inc_u32" => {
+                        let wrap = l.s.m.cmp(c, pred::IUGE, old, v0);
+                        let next = l.s.m.bin(c, Bin::Add, old, one);
+                        l.s.m.select(c, wrap, zero, next)
+                    }
+                    "dec_u32" => {
+                        let empty = l.s.m.cmp(c, pred::EQ, old, zero);
+                        let above = l.s.m.cmp(c, pred::IUGT, old, v0);
+                        let wrap = l.s.m.bin(c, Bin::Or, empty, above);
+                        let next = l.s.m.bin(c, Bin::Sub, old, one);
+                        l.s.m.select(c, wrap, v0, next)
+                    }
+                    "rsub_u32" => l.s.m.bin(c, Bin::Sub, v0, old),
+                    "mskor_b32" => {
+                        let ones = l.s.m.i32(u32::MAX);
+                        let clear = l.s.m.bin(c, Bin::Xor, v0, ones);
+                        let keep = l.s.m.bin(c, Bin::And, old, clear);
+                        l.s.m.bin(c, Bin::Or, keep, mask_value.unwrap())
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let r = self.end_guarded(at, &[(r, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
@@ -4703,17 +4746,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `ds_max_f32` (`max`) or `ds_min_f32` on the LDS dword at `p` with
-    /// the float bits `data`; the old bits return.
-    ///
-    /// DXIL has no float atomics on group-shared memory, so this is a
-    /// compare-exchange loop around [`Lower::lds_float_pick`], which gives
-    /// what RDNA2 writes (measured on gfx1036, reported on the pull
-    /// request): an sNaN, data first, then memory, is written quieted;
-    /// otherwise a NaN loses to a number (two quiet NaNs give the data);
-    /// numbers compare as floats with -0 below +0.
-    // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as ±0 first (MODE is not modelled).
+    /// `ds_max_f32`/`ds_min_f32` on the LDS dword at `p`; old bits return.
+    /// DXIL has no float LDS atomics, so this is a compare-exchange loop
+    /// around [`Lower::lds_float_pick`], which gives what RDNA2 writes.
+    // shortcut: f32 denormals compare as kept; the console's MODE would flush
+    // them to Â±0 (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -4723,6 +4760,25 @@ impl<'a> Lower<'a> {
         let old = self.s.m.phi(lp, i32t);
         self.cur = lp;
         let new = self.lds_float_pick(old, data, max);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
+    /// Atomically update LDS, returning the value from the successful CAS.
+    fn lds_update(&mut self, p: V, update: impl FnOnce(&mut Self, V) -> V) -> V {
+        let pre = self.cur;
+        // An atomic zero-add supplies the first snapshot even under contention.
+        let zero = self.s.m.i32(0);
+        let init = self.s.m.atomic(pre, Rmw::Add, p, zero);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let old = self.s.m.phi(lp, self.s.t.i32);
+        self.cur = lp;
+        let new = update(self, old);
         let prev = self.s.m.cmpxchg(lp, p, old, new);
         let done = self.s.m.cmp(lp, pred::EQ, prev, old);
         self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
