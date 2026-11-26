@@ -9663,15 +9663,19 @@ impl<'a> Lower<'a> {
         let has_cl = name.ends_with("_cl");
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
-            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
-            "image_sample_b" | "image_sample_b_cl" => (61, true),
-            "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" | "image_sample_l_o" => {
+                (62, true)
+            }
+            "image_sample_b" | "image_sample_b_cl" | "image_sample_b_o" => (61, true),
+            "image_sample_c_lz" | "image_sample_c_lz_o" => (65, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_o" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_o" if self.s.pixel => (64, true),
             "image_sample_c_cl" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l" | "image_gather4_l_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -9726,7 +9730,7 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -9818,14 +9822,39 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
-            if offset_word && offsets > 0 {
-                let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
-                    let left = self.s.m.i32(at);
-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
-                    let k26 = self.s.m.i32(26);
-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+            if offset_word {
+                if offsets == 0 {
+                    return Err("a cube sample with a texel offset");
+                }
+                let w = addr_u32(self, 0)?;
+                // DXIL sample ops want immediate offsets in -8..=7; gathers
+                // accept programmable 2D offsets. Emit immediates whenever the
+                // offset word is a constant in range (including 3D Z), and
+                // fall back to runtime sign-extension otherwise.
+                let mut immediate = false;
+                if !matches!(op, 73 | 74)
+                    && let Some(val) = self.s.m.int_value(w)
+                {
+                    let val = val as u32;
+                    let field = |k: usize| {
+                        let x = (val >> (8 * k) & 0x3F) as i32;
+                        if x >= 32 { x - 64 } else { x }
+                    };
+                    if (0..offsets).all(|k| (-8..=7).contains(&field(k))) {
+                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                            *o = self.s.m.i32(field(k) as u32);
+                        }
+                        immediate = true;
+                    }
+                }
+                if !immediate {
+                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                        // Bits at..at+5 sign-extended: shift up, then down.
+                        let left = self.s.m.i32(at);
+                        let t = self.s.m.bin(c, Bin::Shl, w, left);
+                        let k26 = self.s.m.i32(26);
+                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                    }
                 }
             }
             let mut args = vec![h, sh];
@@ -9859,27 +9888,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     self.s
@@ -10000,7 +10008,7 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
+                    let lod = if matches!(name, "image_sample_l" | "image_sample_l_o") {
                         let x = addr_packed(self, coord_base, coords)?;
                         to_float(self, x)
                     } else {
@@ -10094,6 +10102,19 @@ impl<'a> Lower<'a> {
                         }
                         gathered = Some(g);
                         read.expect("four reads")
+                    } else if op == 74 {
+                        args.extend(&os[..2]);
+                        args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        let reference = addr_u32(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        self.s.op(
+                            c,
+                            "textureGatherCmp.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            74,
+                            &args,
+                        )
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
@@ -10137,7 +10158,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
