@@ -941,7 +941,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
             }
         }
-        return None;
+        if !super::loose_lds::on() {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -2116,7 +2118,9 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        // as `wave_reduce`: a host wave on its own keeps its own sum
+        let own = self.local || self.exchange.as_ref().is_some_and(|e| e.1);
+        if self.exchange.is_some() && !own {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -2467,7 +2471,22 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // bits 0-5 the group's waves, 6-11 this wave's index (Mesa's `tg_size`)
+            Input::GroupInfo => {
+                let StageIo::Cs(cs) = self.x.native.io else {
+                    return Val::Missing("the thread-group info SGPR");
+                };
+                let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
+                let threads = cs.threads.iter().product::<u32>();
+                let (e, i32t) = (self.s.entry, self.s.t.i32);
+                let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                let w = self.s.m.i32(wave.trailing_zeros());
+                let index = self.s.m.bin(e, Bin::LShr, flat, w);
+                let six = self.s.m.i32(6);
+                let index = self.s.m.bin(e, Bin::Shl, index, six);
+                let count = self.s.m.i32(threads.div_ceil(wave) & 0x3f);
+                return Val::I32(self.s.m.bin(e, Bin::Or, index, count));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -3969,7 +3988,15 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // `VICTORY_SCC_LOCAL_ANY=1` (opt-in): local waves with any mask, the host wave's own
+        // answer (5dc3/6f22 then run, with black blocks; #799).
+        let local_any = self.local
+            && self.local_any
+            && std::env::var_os("VICTORY_SCC_LOCAL_ANY").is_some_and(|v| v == "1");
+        if !self.console_lanes
+            || self.local && !local_any
+            || self.exchange.is_none() && self.halves.is_some()
+        {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -3985,7 +4012,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if local_any || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
@@ -5540,6 +5567,20 @@ impl<'a> Lower<'a> {
                     _ => Bin::AShr,
                 };
                 (self.s.m.bin(c, op, a, b), None)
+            }
+            // Low or high halves of two dwords packed: s0's in bits 0-15.
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xffff));
+                let a = if name == "s_pack_hh_b32_b16" { self.s.m.bin(c, Bin::LShr, a, k16) } else { a };
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let high = self.s.m.i32(0xffff_0000);
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -7708,7 +7749,10 @@ impl<'a> Lower<'a> {
                     None if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
                         // console lane numbers to pick the bits by.
-                        if self.local {
+                        // (approximate: lanes by the group's flat thread index, as in
+                        // compute and mesh groups)
+                        let threads = matches!(self.x.native.stage, HwStage::Cs | HwStage::Ms);
+                        if self.local && !(self.local_any && threads) {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
