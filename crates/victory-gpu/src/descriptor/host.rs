@@ -808,8 +808,8 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+/// Since the start: such ranges kept for a pass; full-queue rescans (a
+/// dropped queue used to lose notices); slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -830,24 +830,18 @@ const PAGE_WRITE_AFTER: u64 = 2;
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// (A world's first minutes note tens of thousands between two passes:
+    /// 131,072 were dropped in one run at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if record_remap(&mut ranges, start, end, MOST) {
+        PAGE_WRITES[1].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -864,7 +858,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// full-queue rescans; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -892,27 +886,41 @@ fn stale_rule() -> Rule {
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// (A world's first minutes note tens of thousands between two passes:
+    /// 131,072 were dropped in one run at the 32,768 there were.)
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
+    }
+}
+
+/// Keep the producer cheap while adjacent pages or repeated writes arrive.
+/// A full queue falls back to checking all tracked views once, so completed
+/// uploads are still invalidated when a remap arrives during a long pause.
+/// (DexNom/VIctory 921d8d3b: `record_remap`.)
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
     if let Some(last) = ranges.last_mut()
-        && last.1 == start
+        && last.0 <= end && start <= last.1
     {
-        last.1 = end;
-        return;
-    }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+    } else if ranges.len() >= limit {
         ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    } else {
+        ranges.push((start, end));
     }
-    ranges.push((start, end));
+    false
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -5272,6 +5280,23 @@ mod tests {
         assert_eq!(ranges, [(1, 1), (10, 20), (30, 61)]);
         join(&mut ranges);
         assert_eq!(ranges.len(), 3);
+    }
+
+    /// DexNom/VIctory 921d8d3b: overlapping notices merge, and a full
+    /// queue becomes one rescan of every tracked view, not a drop.
+    #[test]
+    fn texture_remaps_visit_each_changed_region_once() {
+        let mut ranges = Vec::new();
+        for (from, to) in [(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)] {
+            assert!(!record_remap(&mut ranges, from, to, 3));
+        }
+        join(&mut ranges);
+        assert_eq!(ranges, [(10, 20), (30, 61)]);
+        // If no pass drains the queue, even the first and the overflowing
+        // notification must be seen by the next pass.
+        assert!(record_remap(&mut ranges, 90, 99, 2));
+        assert!(!record_remap(&mut ranges, 120, 160, 2));
+        assert_eq!(ranges, [(0, u64::MAX)]);
     }
 
     /// A view's title address goes after the strides, at two dwords per
