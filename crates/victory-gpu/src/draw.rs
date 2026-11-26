@@ -1756,7 +1756,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut overflow = Vec::new();
+                let values = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    overflow.resize(dwords as usize, 0);
+                    overflow.as_mut_slice()
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -3833,17 +3840,30 @@ impl State {
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh_mask: u64 = 0;
+        let mut fresh_extra: Vec<u8> = Vec::new();
+        let mark_fresh = |mask: &mut u64, extra: &mut Vec<u8>, slot: u8| {
+            if slot < 64 {
+                *mask |= 1u64 << slot;
+            } else if !extra.contains(&slot) {
+                extra.push(slot);
+            }
+        };
+        let is_fresh = |mask: u64, extra: &[u8], slot: u8| -> bool {
+            if slot < 64 {
+                (mask & (1u64 << slot)) != 0
+            } else {
+                extra.contains(&slot)
+            }
+        };
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
+        }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
         let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
-            if !half.contains(&(slot, at)) {
+            if half.is_empty() || !half.contains(&(slot, at)) {
                 return None;
             }
             let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
@@ -3859,9 +3879,7 @@ impl State {
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
-                if !fresh.contains(&slot) {
-                    fresh.push(slot);
-                }
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, slot);
             } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
                 once!(
                     format,
@@ -3873,7 +3891,7 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if is_fresh(fresh_mask, &fresh_extra, u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3887,26 +3905,38 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                mark_fresh(&mut fresh_mask, &mut fresh_extra, u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !is_fresh(fresh_mask, &fresh_extra, u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        if fresh_mask == 0 && fresh_extra.is_empty() {
+            return Vec::new();
+        }
+        fresh_extra.sort_unstable();
         let mut made = Vec::new();
-        for slot in fresh {
+        let mut entries: Vec<&UsedResource> = Vec::new();
+        let mut selected: Vec<u32> = Vec::new();
+        let mut iter_mask = fresh_mask;
+        let mut extra_idx = 0;
+        while iter_mask != 0 || extra_idx < fresh_extra.len() {
+            let slot = if iter_mask != 0 {
+                let s = iter_mask.trailing_zeros() as u8;
+                iter_mask &= iter_mask - 1;
+                s
+            } else {
+                let s = fresh_extra[extra_idx];
+                extra_idx += 1;
+                s
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            entries.clear();
+            entries.extend(used.iter().filter(tables).filter(|u| u.slot == slot));
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3916,20 +3946,22 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            selected.clear();
+            selected.extend(
+                indexed
+                    .iter()
+                    .filter(|index| index.table_slot == slot)
+                    .map(|index| {
+                        let constant = self.user_value(
+                            compute,
+                            index.constant_slot,
+                            RootType::Constants,
+                            index.constant_dword,
+                        );
+                        // The shader adds i32 byte offsets and shifts by 5.
+                        index.byte_offset.wrapping_add(constant << index.shift) / 32
+                    }),
+            );
             // The descriptors the shader moves halves through are made too,
             // and the table reaches them: they may lie past the range starts
             // the entries give (a range of several views names only its
@@ -4011,7 +4043,7 @@ impl State {
                         tally(18, 1);
                     }
                 }
-                for k in selected {
+                for &k in &selected {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
