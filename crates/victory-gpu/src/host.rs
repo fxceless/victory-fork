@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::frame_why::{self, Phase};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -4444,9 +4446,11 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    let relay = frame_why::span(Phase::WaitRelay);
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+    drop(relay);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -4476,6 +4480,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    frame_why::worker(frame_why::Worker::Relay);
     let Some(host) = host() else {
         return;
     };
@@ -4490,6 +4495,7 @@ fn relay_worker() {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
+                    let _idle = frame_why::span(Phase::Idle);
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -4527,6 +4533,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
+                        let _wait = frame_why::span(Phase::WaitFence);
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
@@ -5875,7 +5882,10 @@ impl Host {
                         copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
-                    second.down.wait(job, event)?;
+                    {
+                        let _wait = frame_why::span(Phase::WaitFence);
+                        second.down.wait(job, event)?;
+                    }
                     if beside {
                         // Whatever had started by now may have been
                         // writing these pieces while they came down
@@ -5905,6 +5915,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
+                let _wait = frame_why::span(Phase::WaitFence);
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
@@ -6110,6 +6121,7 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let _land = frame_why::span(Phase::Land);
         let landing = std::time::Instant::now();
         {
             let flights: Vec<&Flight> = items
@@ -6310,7 +6322,9 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
+                    let wait = frame_why::span(Phase::WaitFence);
                     WaitForSingleObject(self.event, INFINITE);
+                    drop(wait);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -6554,7 +6568,9 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
+                            let wait = frame_why::span(Phase::WaitFence);
                             WaitForSingleObject(self.event, INFINITE);
+                            drop(wait);
                             stood(waiting);
                             working(true);
                         }
@@ -6665,6 +6681,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let prepare = frame_why::span(Phase::Prepare);
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -6810,6 +6827,7 @@ impl Host {
             lists.push(Some(check));
         }
         prep_part(4, part);
+        drop(prepare);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6871,7 +6889,9 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
+                        let wait = frame_why::span(Phase::WaitFence);
                         WaitForSingleObject(self.event, INFINITE);
+                        drop(wait);
                         stood(started);
                         working(true);
                     }
