@@ -1750,6 +1750,8 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::indirect_stats::STATS.title_call(max);
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;

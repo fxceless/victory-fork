@@ -9810,7 +9810,9 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                let timing_frames = std::mem::take(&mut self.copy_stats_frames);
+                crate::copystat::log(timing_frames as f64);
+                crate::indirect_stats::log(timing_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
