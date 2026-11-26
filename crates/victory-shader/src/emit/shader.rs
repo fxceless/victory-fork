@@ -144,10 +144,9 @@ pub(crate) struct Shader {
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
-    /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
-    pub samplers: u32,
-    /// Bit n: immediate sampler n is a comparison sampler.
-    pub cmp_samplers: u64,
+    /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`]; entry `n` is
+    /// `true` when sampler `n` is a comparison sampler.
+    pub sampler_cmp: Vec<bool>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -206,8 +205,7 @@ impl Shader {
             mesh: None,
             geometry: None,
             user_data: 0,
-            samplers: 0,
-            cmp_samplers: 0,
+            sampler_cmp: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -352,8 +350,8 @@ impl Shader {
         h
     }
 
-    /// The handle of immediate sampler `n` (a comparison sampler when its
-    /// bit in `cmp_samplers` is set).
+    /// The handle of immediate sampler `n` (a comparison sampler when
+    /// `self.sampler_cmp[n]` is `true`).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
         let bind = [
             self.m.i32(n),
@@ -371,7 +369,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
+        let cmp = if self.sampler_cmp.get(n as usize).copied().unwrap_or(false) {
             0x8000
         } else {
             0
@@ -474,7 +472,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
-            || self.samplers > 0
+            || !self.sampler_cmp.is_empty()
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
@@ -599,13 +597,14 @@ impl Shader {
                 uavs = Some(self.m.md_node(list));
             }
             let mut samplers = None;
-            if self.samplers > 0 {
+            if !self.sampler_cmp.is_empty() {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                for (idx, &is_cmp) in self.sampler_cmp.clone().iter().enumerate() {
+                    let n = idx as u32;
+                    let kind = u32::from(is_cmp);
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),

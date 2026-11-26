@@ -50,8 +50,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    /// Entry n: immediate sampler n is used for comparisons.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -2279,11 +2279,10 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
-        self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        let cmp_samplers = self.s.sampler_cmp.clone();
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -6368,18 +6367,23 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                let cmp = props.0 & 0x8000 != 0;
+                // Deduplicate by both descriptor words and comparison mode: on RDNA2
+                // comparison is per-instruction, whereas DXIL declares normal and
+                // comparison samplers as distinct bindings.
+                let n = match self
+                    .samplers
+                    .iter()
+                    .zip(&self.s.sampler_cmp)
+                    .position(|(w, &c)| *w == words && c == cmp)
+                {
                     Some(n) => n,
                     None => {
                         self.samplers.push(words);
+                        self.s.sampler_cmp.push(cmp);
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),

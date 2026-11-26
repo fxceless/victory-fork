@@ -707,18 +707,7 @@ fn emit_program(
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
+        static_samplers: static_samplers(&l.samplers, &l.cmp_samplers),
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
@@ -726,6 +715,25 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Decodes immediate console sampler words into D3D12 static sampler
+/// descriptions, setting the comparison filter reduction mode (`0x80`) on
+/// entries used for comparison sampling.
+fn static_samplers(samplers: &[[u32; 4]], cmp: &[bool]) -> Vec<StaticSampler> {
+    samplers
+        .iter()
+        .enumerate()
+        .map(|(n, &w)| {
+            let mut s = StaticSampler::from_words(w);
+            if cmp.get(n).copied().unwrap_or(false) {
+                // D3D12_FILTER_REDUCTION_TYPE occupies bits 7..=8 (0x180);
+                // replace any reduction mode with COMPARISON (0x80).
+                s.filter = (s.filter & !0x180) | 0x80;
+            }
+            s
+        })
+        .collect()
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1151,6 +1159,159 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    #[test]
+    fn comparison_static_sampler_replaces_min_max_reduction_bits() {
+        let standard = [0x3006, 0x00FF_F000, 0x1450_0000, 0x4000_0000];
+        let minimum = [0x2000_3003, 0x00FF_F000, 0x1850_0000, 0x8000_0000];
+        let maximum = [0x4000_3800, 0x00FF_F000, 0x18F0_0F00, 0x8000_0000];
+        let decoded = static_samplers(
+            &[standard, standard, minimum, minimum, maximum],
+            &[false, true, false, true, true],
+        );
+        assert_eq!(decoded[0].filter, 0x14);
+        assert_eq!(decoded[1].filter, 0x94);
+        assert_eq!(decoded[2].filter, 0x115);
+        // Comparison must clear the 2-bit reduction field (0x180) before
+        // setting COMPARISON (0x80), never turning MINIMUM (0x100) into
+        // MAXIMUM (0x180).
+        assert_eq!(decoded[3].filter, 0x95);
+        assert_eq!(decoded[4].filter, 0xD5);
+    }
+
+    /// Reusing the same 4-dword immediate sampler for both normal
+    /// (`image_sample`) and comparison (`image_sample_c`) sampling must emit
+    /// two distinct DXIL static-sampler bindings in either order, with the
+    /// comparison entry carrying a COMPARISON filter (0x80).
+    #[test]
+    fn immediate_sampler_used_for_normal_and_comparison_gets_two_bindings() {
+        use crate::native::RootParam;
+        use crate::{ResourceType, RootType, UsedResource};
+
+        // MINIMUM-reduction linear sampler so we also exercise filter bit masking.
+        let sampler = [0x2000_3003u32, 0x00FF_F000, 0x1850_0000, 0x8000_0000];
+        // image_sample (0x20), dim=2D (1), dmask=0x1, vdata=v4, vaddr=v0, rsrc=s[8:15], samp=s[4:7]
+        let sample = [0xF080_0108u32, 0x0022_0400];
+        // image_sample_c (0x28), dim=2D (1), dmask=0x1, vdata=v5, vaddr=v0, rsrc=s[8:15], samp=s[4:7]
+        let sample_c = [0xF0A0_0108u32, 0x0022_0500];
+
+        let run = |first: [u32; 2], second: [u32; 2]| -> HostShader {
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF40C_0200,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+                0xBE84_03FF,
+                sampler[0], // s_mov_b32 s4, sampler[0]
+                0xBE85_03FF,
+                sampler[1], // s_mov_b32 s5, sampler[1]
+                0xBE86_03FF,
+                sampler[2], // s_mov_b32 s6, sampler[2]
+                0xBE87_03FF,
+                sampler[3],  // s_mov_b32 s7, sampler[3]
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E04_02F0, // v_mov_b32 v2, 0.5
+                first[0],
+                first[1],
+                second[0],
+                second[1],
+                (3 << 25) | (6 << 17) | (5 << 9) | (256 + 4), // v_add_f32 v6, v4, v5
+                0xF800_180F,
+                0x0606_0606, // exp mrt0, v6, v6, v6, v6 done vm
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let target = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            out
+        };
+
+        let normal_then_cmp = run(sample, sample_c);
+        assert_eq!(normal_then_cmp.samplers, vec![sampler, sampler]);
+        assert_eq!(normal_then_cmp.static_samplers.len(), 2);
+        assert_eq!(normal_then_cmp.static_samplers[0].filter, 0x115);
+        assert_eq!(normal_then_cmp.static_samplers[1].filter, 0x95);
+
+        let cmp_then_normal = run(sample_c, sample);
+        assert_eq!(cmp_then_normal.samplers, vec![sampler, sampler]);
+        assert_eq!(cmp_then_normal.static_samplers.len(), 2);
+        assert_eq!(cmp_then_normal.static_samplers[0].filter, 0x95);
+        assert_eq!(cmp_then_normal.static_samplers[1].filter, 0x115);
+    }
+
+    #[test]
+    fn more_than_64_immediate_samplers_do_not_overflow() {
+        let mut s = Shader::new(true);
+        s.sampler_cmp = vec![false; 65];
+        s.sampler_cmp[64] = true;
+        let b = s.entry;
+        s.sampler_handle(b, 0);
+        s.sampler_handle(b, 64);
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let dxil = s.finish();
+        assert!(!dxil.is_empty());
+
+        let words = vec![[0x3006, 0x00FF_F000, 0x1450_0000, 0x4000_0000]; 65];
+        let mut cmp = vec![false; 65];
+        cmp[64] = true;
+        let decoded = static_samplers(&words, &cmp);
+        assert_eq!(decoded.len(), 65);
+        assert_eq!(decoded[0].filter, 0x14);
+        assert_eq!(decoded[64].filter, 0x94);
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
