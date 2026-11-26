@@ -47,7 +47,103 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || TIMED.load(std::sync::atomic::Ordering::Relaxed) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// With `VICTORY_CAPTURE_SECONDS=<s>`: the frame begun after the first
+/// present at or after `<s>` seconds since the process started, saved as a
+/// frame [`listed`] in `VICTORY_CAPTURE_FRAMES` is (its targets too with
+/// `VICTORY_DUMP_TARGETS`), under its own number. A test run waits for a
+/// time instead of a frame number: the world's frames come at 4 or 5 a
+/// second, and the menus before it at 30, so a frame number deep enough in
+/// the world is minutes after the world is steady.
+static TIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `VICTORY_CAPTURE_SECONDS`, if set to a number of seconds.
+fn capture_seconds() -> Option<f64> {
+    static AFTER: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| seconds_of(std::env::var("VICTORY_CAPTURE_SECONDS").ok().as_deref()))
+}
+
+/// A number of seconds, not negative.
+fn seconds_of(value: Option<&str>) -> Option<f64> {
+    value?.trim().parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0)
+}
+
+/// At the present of frame `presenting`, before it is counted: with
+/// `VICTORY_CAPTURE_SECONDS`, once the time has come, the next frame is
+/// the one captured (picked before anything of it is recorded, so all the
+/// targets it writes are noted).
+pub(crate) fn at_present(presenting: u64) {
+    let Some(after) = capture_seconds() else {
+        return;
+    };
+    if TIMED.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX {
+        return;
+    }
+    let seconds = since_start();
+    if let Some(frame) = pick(&TIMED, after, seconds, presenting) {
+        tracing::info!(
+            frame,
+            "VICTORY_CAPTURE_SECONDS={after}: frame {frame} is captured, the first begun {seconds:.1} s after the process started"
+        );
+    }
+}
+
+/// Picks the frame after `presenting` into `slot` once `elapsed` reaches
+/// `after` seconds, if none was picked yet.
+fn pick(slot: &std::sync::atomic::AtomicU64, after: f64, elapsed: f64, presenting: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let next = presenting + 1;
+    (elapsed >= after && slot.compare_exchange(u64::MAX, next, Relaxed, Relaxed).is_ok()).then_some(next)
+}
+
+/// Seconds since the process was made (the log's first line is as old).
+fn since_start() -> f64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // FILETIME counts 100 ns from 1601; the Unix epoch is this many later.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let first = *FIRST.get_or_init(std::time::Instant::now);
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: our own process and four valid out pointers.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    let created = u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| (d.as_nanos() / 100) as u64)
+        + UNIX_EPOCH_TICKS;
+    if !ok || created == 0 || created > now {
+        // Without the process's age: counted from the first present.
+        return first.elapsed().as_secs_f64();
+    }
+    (now - created) as f64 / 1e7
+}
+
+/// At the end of the present of `frame`: for a frame [`listed`], once its
+/// picture and targets are saved, logs that and writes `dumped-<frame>.txt`
+/// (written last), so a test run stops when the dump is complete instead of
+/// when its files stop coming: a slow frame's dump has gaps.
+pub(crate) fn frame_done(frame: u64) {
+    let Some(folder) = folder() else { return };
+    if !listed(frame) {
+        return;
+    }
+    let (noted, saved) = match *DUMPED.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((f, noted, saved)) if f == frame => (noted, saved),
+        _ => (0, 0),
+    };
+    let seconds = since_start();
+    tracing::info!(frame, noted, saved, "the listed frame's capture is complete ({seconds:.1} s after the process started)");
+    let text = format!("frame {frame}: {saved} of {noted} targets saved, {seconds:.1} s after the process started\n");
+    let path = folder.join(format!("dumped-{frame}.txt"));
+    if let Err(e) = std::fs::write(&path, text) {
+        tracing::warn!(error = %e, path = %path.display(), "capture marker not written");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -185,12 +281,13 @@ pub(crate) fn wanted(n: u64) -> bool {
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    let _ = save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size; whether
+/// the file was written.
+fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) -> bool {
+    let Some(folder) = folder() else { return false };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -219,8 +316,14 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "frame saved");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "frame not saved");
+            false
+        }
     }
 }
 
@@ -408,18 +511,32 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    let (mut saved, mut shapes) = (0, 0);
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            shapes += 1;
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        saved += usize::from(dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d));
     }
+    let noted = targets.len();
+    tracing::info!(
+        frame,
+        noted,
+        saved,
+        "render targets of the frame dumped: {saved} of the {noted} it wrote saved, {shapes} multisampled or not 2D,          {} not read back or of a format not shown",
+        noted - saved - shapes
+    );
+    *DUMPED.lock().unwrap_or_else(|e| e.into_inner()) = Some((frame, noted, saved));
 }
+
+/// The last [`dump_targets`]: the frame, its targets noted and saved.
+static DUMPED: std::sync::Mutex<Option<(u64, usize, usize)>> = std::sync::Mutex::new(None);
 
 fn dump_one(
     host: &crate::host::Host,
@@ -429,8 +546,8 @@ fn dump_one(
     i: usize,
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
-) {
-    let Ok(list) = host.new_list() else { return };
+) -> bool {
+    let Ok(list) = host.new_list() else { return false };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -461,13 +578,16 @@ fn dump_one(
     if let Some((buffer, footprint)) = stencil {
         stencil_values(&buffer, &footprint, frame, resource);
     }
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint)) = read else {
+        tracing::info!(?resource, "target not dumped: no readback buffer");
+        return false;
+    };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
+            return false;
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
@@ -491,16 +611,18 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let saved = if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba)
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
-        }
+            false
+        };
         buffer.Unmap(0, None);
+        saved
     }
 }
 
@@ -889,5 +1011,32 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// `VICTORY_CAPTURE_SECONDS` takes whole or fractional seconds, nothing
+    /// negative or unreadable.
+    #[test]
+    fn capture_seconds_parse_as_plain_seconds() {
+        assert_eq!(super::seconds_of(Some("240")), Some(240.0));
+        assert_eq!(super::seconds_of(Some(" 12.5 ")), Some(12.5));
+        assert_eq!(super::seconds_of(Some("0")), Some(0.0));
+        assert_eq!(super::seconds_of(Some("-3")), None);
+        assert_eq!(super::seconds_of(Some("4m")), None);
+        assert_eq!(super::seconds_of(Some("inf")), None);
+        assert_eq!(super::seconds_of(Some("")), None);
+        assert_eq!(super::seconds_of(None), None);
+    }
+
+    /// The frame after the first present at or after the time is picked,
+    /// once: later presents keep it.
+    #[test]
+    fn the_timed_frame_is_the_one_after_the_first_present_in_time() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let slot = AtomicU64::new(u64::MAX);
+        assert_eq!(super::pick(&slot, 240.0, 239.9, 1500), None);
+        assert_eq!(slot.load(Relaxed), u64::MAX);
+        assert_eq!(super::pick(&slot, 240.0, 240.0, 1501), Some(1502));
+        assert_eq!(super::pick(&slot, 240.0, 241.0, 1502), None);
+        assert_eq!(slot.load(Relaxed), 1502);
     }
 }

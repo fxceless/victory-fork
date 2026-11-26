@@ -1354,6 +1354,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
+    // `VICTORY_CAPTURE_SECONDS`: the next frame is picked before it begins.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::at_present(FRAMES.load(Ordering::Relaxed) + 1);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
@@ -1422,6 +1425,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
+    // A listed frame's pictures are all saved by now.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::frame_done(frame);
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
