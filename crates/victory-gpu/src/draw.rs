@@ -95,6 +95,97 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+/// `VICTORY_TEXTURE_STAGE_MB`: its default, and the least and most taken.
+/// 0 staged nothing at all, with nothing to say so (`VICTORY_HEAP_TEXTURES=0`
+/// is the switch that turns the pass off); a value past the most could
+/// overflow the bytes of a backlog.
+const STAGE_MB: (u64, u64, u64) = (192, 1, 4096);
+/// `VICTORY_TEXTURE_STAGE_MS`: its default, and the least and most taken.
+const STAGE_MS: (u64, u64, u64) = (250, 1, 5000);
+/// Due slots from which a pass is a backlog's, and what its budget is
+/// multiplied by then (`VICTORY_TEXTURE_CATCHUP`).
+const CATCHUP_SLOTS: usize = 1024;
+const CATCHUP_TIMES: u64 = 3;
+
+/// The texture pass's own budget per frame (`State::heap_textures`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageBudget {
+    /// Bytes of texture memory staged per frame.
+    bytes: u64,
+    /// Milliseconds one pass may take: the pass runs on a thread that
+    /// records the frame (making and staging 192 MB of textures took
+    /// 1.6-2.2 s of each of the world's first twenty frames, run 20).
+    ms: u64,
+    /// A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of
+    /// black surfaces at 192 MB a frame) gets [`CATCHUP_TIMES`] the bytes and
+    /// the time until it drains.
+    catchup: bool,
+}
+
+/// What a setting says within `(default, least, most)`, and whether that is
+/// not what was written (not a number, or out of bounds). None: unset.
+fn stage_setting(value: Option<&str>, (default, least, most): (u64, u64, u64)) -> (u64, bool) {
+    match value.map(|v| v.trim().parse::<u64>()) {
+        None => (default, false),
+        Some(Ok(n)) => (n.clamp(least, most), !(least..=most).contains(&n)),
+        Some(Err(_)) => (default, true),
+    }
+}
+
+impl StageBudget {
+    /// From the settings' values (None: unset), and which of the bytes and
+    /// the time were not taken as written.
+    fn from_values(mb: Option<&str>, ms: Option<&str>, catchup: Option<&str>) -> (Self, [bool; 2]) {
+        let (mb, mb_changed) = stage_setting(mb, STAGE_MB);
+        let (ms, ms_changed) = stage_setting(ms, STAGE_MS);
+        let catchup = catchup.is_none_or(|v| v != "0");
+        (StageBudget { bytes: mb << 20, ms, catchup }, [mb_changed, ms_changed])
+    }
+
+    /// The bytes and the time of a pass that finds `due` slots due.
+    fn for_due(self, due: usize) -> (u64, std::time::Duration) {
+        let times = if self.catchup && due >= CATCHUP_SLOTS { CATCHUP_TIMES } else { 1 };
+        (self.bytes * times, std::time::Duration::from_millis(self.ms * times))
+    }
+}
+
+/// [`StageBudget`] from `VICTORY_TEXTURE_STAGE_MB` (192), `VICTORY_TEXTURE_STAGE_MS`
+/// (250) and `VICTORY_TEXTURE_CATCHUP` (0: never more for a backlog). Read
+/// once, and said once in the log, so that a run's log tells which budget
+/// it had.
+fn stage_budget() -> StageBudget {
+    static BUDGET: std::sync::OnceLock<StageBudget> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        let (budget, changed) = StageBudget::from_values(
+            var("VICTORY_TEXTURE_STAGE_MB").as_deref(),
+            var("VICTORY_TEXTURE_STAGE_MS").as_deref(),
+            var("VICTORY_TEXTURE_CATCHUP").as_deref(),
+        );
+        let settings = [("VICTORY_TEXTURE_STAGE_MB", STAGE_MB), ("VICTORY_TEXTURE_STAGE_MS", STAGE_MS)];
+        for ((name, (default, least, most)), changed) in settings.into_iter().zip(changed) {
+            if changed {
+                tracing::warn!(
+                    value = %var(name).unwrap_or_default(),
+                    default,
+                    least,
+                    most,
+                    "{name}: not a number from {least} to {most}; the nearest of those (or the default) is used"
+                );
+            }
+        }
+        tracing::info!(
+            mb = budget.bytes >> 20,
+            ms = budget.ms,
+            catchup = budget.catchup,
+            catchup_from_slots = CATCHUP_SLOTS,
+            catchup_times = CATCHUP_TIMES,
+            "budget of the pass that uploads textures picked by index, per frame"
+        );
+        budget
+    })
+}
+
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
@@ -2389,13 +2480,9 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
-        // textures (a scene's first minutes) then drains in fewer frames.
-        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
-        }) << 20;
+        // Bytes of texture memory staged per frame, and the time a pass may
+        // take: [`stage_budget`] (`VICTORY_TEXTURE_STAGE_MB`, `_MS`, `_CATCHUP`).
+        let budget = stage_budget();
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -2472,16 +2559,8 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
-        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // (A backlog gets more of both: [`StageBudget::for_due`].)
+        let (per_frame, span) = budget.for_due(due.len());
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -4451,5 +4530,47 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    #[test]
+    fn the_texture_pass_budget_is_as_before_when_nothing_is_set() {
+        let (budget, changed) = StageBudget::from_values(None, None, None);
+        assert_eq!(budget, StageBudget { bytes: 192 << 20, ms: 250, catchup: true });
+        assert_eq!(changed, [false, false]);
+        let ms = std::time::Duration::from_millis;
+        // A backlog from 1,024 due slots: three times both.
+        assert_eq!(budget.for_due(1023), (192 << 20, ms(250)));
+        assert_eq!(budget.for_due(1024), (576 << 20, ms(750)));
+        assert_eq!(budget.for_due(4096), (576 << 20, ms(750)));
+        // Catch-up off: the plain budget, backlog or not.
+        let (off, _) = StageBudget::from_values(None, None, Some("0"));
+        assert!(!off.catchup);
+        assert_eq!(off.for_due(4096), (192 << 20, ms(250)));
+        // Any other value of it, as before: on.
+        assert!(StageBudget::from_values(None, None, Some("1")).0.catchup);
+    }
+
+    #[test]
+    fn the_texture_pass_budget_takes_values_within_bounds() {
+        // The sweep's values, as written (spaces around them as before).
+        for mb in [192u64, 384, 768] {
+            let written = format!(" {mb} ");
+            let (budget, changed) = StageBudget::from_values(Some(written.as_str()), Some("500"), None);
+            assert_eq!((budget.bytes, budget.ms), (mb << 20, 500));
+            assert_eq!(changed, [false, false]);
+        }
+        // 0 staged nothing at all: the least is taken, and it is said.
+        let (zero, changed) = StageBudget::from_values(Some("0"), Some("0"), None);
+        assert_eq!((zero.bytes, zero.ms), (1 << 20, 1));
+        assert_eq!(changed, [true, true]);
+        // Past the most: the most, and a backlog's budget does not overflow.
+        let (huge, changed) = StageBudget::from_values(Some("18446744073709551615"), Some("99999999"), None);
+        assert_eq!((huge.bytes, huge.ms), (4096 << 20, 5000));
+        assert_eq!(changed, [true, true]);
+        assert_eq!(huge.for_due(4096), (3 * (4096 << 20), std::time::Duration::from_millis(15_000)));
+        // Not a number: the default, and it is said.
+        let (bad, changed) = StageBudget::from_values(Some("lots"), Some("-5"), None);
+        assert_eq!((bad.bytes, bad.ms), (192 << 20, 250));
+        assert_eq!(changed, [true, true]);
     }
 }
