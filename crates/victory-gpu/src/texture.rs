@@ -168,11 +168,12 @@ fn spare_most() -> u64 {
     })
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after.
+/// What a texture's staging buffer holds: the 128-bit content hash of the
+/// memory detiled (memory not watched), or the write-watch asking it was
+/// detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -1111,7 +1112,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1131,7 +1132,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1147,7 +1148,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1182,7 +1183,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.hash = Some(blake3::hash(read));
+            last.hash = Some(content_hash(read));
             self.detile(read);
             last.asked = now;
             last.ahead = Some(crate::frame::current());
@@ -1573,7 +1574,7 @@ fn refresh_unlocked_with(
     use std::sync::atomic::Ordering::Relaxed;
     let read = with_read(size, |read| {
         if crate::host::read_into(memory, read) {
-            let hash = blake3::hash(read);
+            let hash = content_hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 detile(read);
@@ -1586,7 +1587,7 @@ fn refresh_unlocked_with(
         if last.hash.is_none() {
             crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
             if read.iter().any(|&b| b != 0) {
-                last.hash = Some(blake3::hash(read));
+                last.hash = Some(content_hash(read));
                 last.partial = Some(crate::frame::current());
                 detile(read);
                 return true;
@@ -1602,6 +1603,144 @@ fn refresh_unlocked_with(
         last.asked = 0;
         0
     }
+}
+
+/// Fast non-cryptographic 128-bit content hash for detecting whether a
+/// texture's bytes changed since the previous check. Uses 4-way AVX2
+/// `vpmuludq` lanes when available, with a 4-way scalar fallback.
+fn content_hash(bytes: &[u8]) -> [u64; 2] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HAS_AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2")) {
+            // SAFETY: `is_x86_feature_detected!("avx2")` just confirmed AVX2.
+            return unsafe { content_hash_avx2(bytes) };
+        }
+    }
+    content_hash_scalar(bytes)
+}
+
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn content_hash_scalar(bytes: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K1: u64 = 0xc2b2_ae3d_27d4_eb4f;
+    const K2: u64 = 0x1656_67b1_9e37_79f9;
+    const K3: u64 = 0x85eb_ca77_c2b2_ae63;
+    let mut s0 = K0 ^ (bytes.len() as u64);
+    let mut s1 = K1;
+    let mut s2 = K2;
+    let mut s3 = K3;
+
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in &mut chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        s0 = (s0 ^ w0).wrapping_mul(K1).rotate_left(27);
+        s1 = (s1 ^ w1).wrapping_mul(K2).rotate_left(31);
+        s2 = (s2 ^ w2).wrapping_mul(K3).rotate_left(29);
+        s3 = (s3 ^ w3).wrapping_mul(K0).rotate_left(33);
+    }
+
+    let mut rem = chunks.remainder();
+    while rem.len() >= 8 {
+        let w = u64::from_le_bytes(rem[..8].try_into().unwrap());
+        s0 = (s0 ^ w).wrapping_mul(K2).rotate_left(29);
+        rem = &rem[8..];
+    }
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        s1 = (s1 ^ u64::from_le_bytes(tail)).wrapping_mul(K3).rotate_left(31);
+    }
+
+    let a = mix64(s0 ^ s2 ^ (bytes.len() as u64));
+    let b = mix64(s1 ^ s3 ^ a.rotate_left(17));
+    [a ^ b.rotate_left(32), mix64(b ^ a)]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn content_hash_avx2(bytes: &[u8]) -> [u64; 2] {
+    use std::arch::x86_64::*;
+    const K0: i64 = 0x9e37_79b9_7f4a_7c15u64 as i64;
+    const K1: i64 = 0xc2b2_ae3d_27d4_eb4fu64 as i64;
+    const K2: i64 = 0x1656_67b1_9e37_79f9u64 as i64;
+    const K3: i64 = 0x85eb_ca77_c2b2_ae63u64 as i64;
+    const M0: i32 = 0x9e37_79b1u32 as i32;
+    const M1: i32 = 0x85eb_ca77u32 as i32;
+
+    let mut a0 = _mm256_set_epi64x(K0, K1, K2, K3);
+    let mut a1 = _mm256_set_epi64x(K1, K2, K3, K0);
+    let mut a2 = _mm256_set_epi64x(K2, K3, K0, K1);
+    let mut a3 = _mm256_set_epi64x(K3, K0, K1, K2);
+    let mul0 = _mm256_set1_epi32(M0);
+    let mul1 = _mm256_set1_epi32(M1);
+
+    let mut ptr = bytes.as_ptr();
+    let mut left = bytes.len();
+    while left >= 128 {
+        // SAFETY: `left >= 128` guarantees 128 readable bytes at `ptr`.
+        unsafe {
+            let v0 = _mm256_loadu_si256(ptr.cast());
+            let v1 = _mm256_loadu_si256(ptr.add(32).cast());
+            let v2 = _mm256_loadu_si256(ptr.add(64).cast());
+            let v3 = _mm256_loadu_si256(ptr.add(96).cast());
+
+            let x0 = _mm256_xor_si256(a0, v0);
+            let x1 = _mm256_xor_si256(a1, v1);
+            let x2 = _mm256_xor_si256(a2, v2);
+            let x3 = _mm256_xor_si256(a3, v3);
+
+            let p0 = _mm256_mul_epu32(x0, mul0);
+            let p1 = _mm256_mul_epu32(x1, mul1);
+            let p2 = _mm256_mul_epu32(x2, mul0);
+            let p3 = _mm256_mul_epu32(x3, mul1);
+
+            let s0 = _mm256_srli_epi64(x0, 32);
+            let s1 = _mm256_srli_epi64(x1, 32);
+            let s2 = _mm256_srli_epi64(x2, 32);
+            let s3 = _mm256_srli_epi64(x3, 32);
+
+            a0 = _mm256_add_epi64(p0, _mm256_mul_epu32(s0, mul1));
+            a1 = _mm256_add_epi64(p1, _mm256_mul_epu32(s1, mul0));
+            a2 = _mm256_add_epi64(p2, _mm256_mul_epu32(s2, mul1));
+            a3 = _mm256_add_epi64(p3, _mm256_mul_epu32(s3, mul0));
+
+            ptr = ptr.add(128);
+            left -= 128;
+        }
+    }
+
+    let c0 = _mm256_xor_si256(a0, a2);
+    let c1 = _mm256_xor_si256(a1, a3);
+    let mut lanes = [0u64; 8];
+    // SAFETY: `lanes` is 64 bytes, matching two 256-bit stores.
+    unsafe {
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast(), c0);
+        _mm256_storeu_si256(lanes.as_mut_ptr().add(4).cast(), c1);
+    }
+
+    // Fold any trailing < 128 bytes with the scalar path and combine.
+    let tail = if left > 0 {
+        // SAFETY: `left` bytes remain at `ptr`.
+        content_hash_scalar(unsafe { std::slice::from_raw_parts(ptr, left) })
+    } else {
+        [0, 0]
+    };
+
+    let lo = mix64(lanes[0] ^ lanes[2] ^ lanes[4] ^ lanes[6] ^ tail[0] ^ (bytes.len() as u64));
+    let hi = mix64(lanes[1] ^ lanes[3] ^ lanes[5] ^ lanes[7] ^ tail[1] ^ lo.rotate_left(19));
+    [lo ^ hi.rotate_left(32), mix64(hi ^ lo)]
 }
 
 #[cfg(test)]
@@ -1750,5 +1889,53 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn content_hash_detects_single_bit_flips_and_length_changes() {
+        for len in [0usize, 1, 7, 31, 32, 64, 127, 128, 129, 255, 256, 513, 4096] {
+            let mut buf = vec![0u8; len];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i.wrapping_mul(37) ^ (i >> 3)) as u8;
+            }
+            let base = super::content_hash(&buf);
+            assert_eq!(base, super::content_hash(&buf));
+            if len > 0 {
+                // Flip 1 bit at start, middle, and end.
+                for pos in [0, len / 2, len - 1] {
+                    buf[pos] ^= 0x01;
+                    assert_ne!(super::content_hash(&buf), base, "len={len} pos={pos}");
+                    buf[pos] ^= 0x01;
+                }
+            }
+        }
+        // Zero-padded tail of different length must hash differently.
+        assert_ne!(super::content_hash(&[0u8; 64]), super::content_hash(&[0u8; 65]));
+        assert_ne!(super::content_hash(&[0u8; 128]), super::content_hash(&[0u8; 129]));
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-gpu content_hash_bench -- --ignored --nocapture"]
+    fn content_hash_bench() {
+        let buf = vec![0x5au8; 16 * 1024 * 1024];
+        let t0 = std::time::Instant::now();
+        let mut acc_fast = 0u64;
+        for _ in 0..32 {
+            acc_fast ^= super::content_hash(&buf)[0];
+        }
+        let dt_fast = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let mut acc_blake = 0u8;
+        for _ in 0..32 {
+            acc_blake ^= blake3::hash(&buf).as_bytes()[0];
+        }
+        let dt_blake = t1.elapsed();
+        println!(
+            "512 MB hashed: content_hash={:.2?} (acc={acc_fast:#x}), blake3={:.2?} (acc={acc_blake:#x}), speedup={:.2}x",
+            dt_fast,
+            dt_blake,
+            dt_blake.as_secs_f64() / dt_fast.as_secs_f64()
+        );
     }
 }
