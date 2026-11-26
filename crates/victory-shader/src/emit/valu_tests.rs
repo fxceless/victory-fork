@@ -1622,3 +1622,221 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], 0` (soffset = null).
+const fn s_load_dwordx8(dst: u8, base: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25,
+    ]
+}
+
+/// MIMG `image_store vdata, vaddr, s[srsrc:srsrc+7] dmask:dmask dim:2D unorm [d16]`.
+const fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) -> [u32; 2] {
+    let w0 = 0x3C << 26 | 0x08 << 18 | 1 << 12 | (dmask as u32 & 0xF) << 8 | 1 << 3;
+    let w1 = (d16 as u32) << 31
+        | ((srsrc as u32 >> 2) & 0x1F) << 16
+        | (vdata as u32) << 8
+        | (vaddr as u32);
+    [w0, w1]
+}
+
+fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::ShaderError> {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx8(8, 4));
+    // Data in v1..v4 from root constants s0..s3; 2D texel coordinate (0, 0) in v5..v6.
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
+    }
+    words.push(vop1(0x001, 5, 0x80)); // v5 = 0
+    words.push(vop1(0x001, 6, 0x80)); // v6 = 0
+    words.extend_from_slice(&image_store_2d(1, 5, 8, dmask, d16));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })?;
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    Ok(shader)
+}
+
+#[test]
+fn image_store_partial_dmask_writes_expected_channels() {
+    // (dmask, d16, input root constants, expected RGBA texel)
+    let cases: &[(u8, bool, [u32; 4], [f32; 4])] = &[
+        (0x0, false, [1.5f32.to_bits(), 0, 0, 0], [0.0, 0.0, 0.0, 0.0]),
+        (0x1, false, [1.5f32.to_bits(), 0, 0, 0], [1.5, 0.0, 0.0, 0.0]),
+        (
+            0x3,
+            false,
+            [1.5f32.to_bits(), (-2.25f32).to_bits(), 0, 0],
+            [1.5, -2.25, 0.0, 0.0],
+        ),
+        (
+            0x7,
+            false,
+            [
+                1.5f32.to_bits(),
+                (-2.25f32).to_bits(),
+                4.0f32.to_bits(),
+                0,
+            ],
+            [1.5, -2.25, 4.0, 0.0],
+        ),
+        // Sparse masks: RDNA2 packs enabled channels consecutively and zeros disabled ones.
+        (
+            0x5,
+            false,
+            [1.5f32.to_bits(), (-2.25f32).to_bits(), 0, 0],
+            [1.5, 0.0, -2.25, 0.0],
+        ),
+        (
+            0x9,
+            false,
+            [1.5f32.to_bits(), 4.0f32.to_bits(), 0, 0],
+            [1.5, 0.0, 0.0, 4.0],
+        ),
+        // d16: 1.5 (0x3E00) in low half, -2.0 (0xC000) in high half, 4.0 (0x4400) in next VGPR.
+        (0x1, true, [0x0000_3E00, 0, 0, 0], [1.5, 0.0, 0.0, 0.0]),
+        (0x3, true, [0xC000_3E00, 0, 0, 0], [1.5, -2.0, 0.0, 0.0]),
+        (
+            0x7,
+            true,
+            [0xC000_3E00, 0x0000_4400, 0, 0],
+            [1.5, -2.0, 4.0, 0.0],
+        ),
+        (
+            0xD,
+            true,
+            [0xC000_3E00, 0x0000_4400, 0, 0],
+            [1.5, 0.0, -2.0, 4.0],
+        ),
+    ];
+
+    let shaders: Vec<HostShader> = cases
+        .iter()
+        .map(|&(dmask, d16, ..)| {
+            try_build_image_store_cs(dmask, d16)
+                .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16}: {e}"))
+        })
+        .collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (&(dmask, d16, inputs, want), shader) in cases.iter().zip(&shaders) {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: dmask={dmask:#x} d16={d16}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::TextureUav(1, 1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let got: [f32; 4] = [
+                f32::from_bits(out[0][0]),
+                f32::from_bits(out[0][1]),
+                f32::from_bits(out[0][2]),
+                f32::from_bits(out[0][3]),
+            ];
+            assert_eq!(
+                got, want,
+                "{label}: image_store dmask={dmask:#x} d16={d16} wrote {got:?}, want {want:?}"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}
