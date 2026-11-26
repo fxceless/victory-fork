@@ -8979,6 +8979,20 @@ impl HostList {
     }
 }
 
+/// Text put after the frame figures in the window's caption (empty unless a
+/// debugging aid sets it: the title's own state, say), e.g.
+/// " | RAGE stream 722 tileheap 3881/3977 MB".
+static CAPTION_EXTRA: Mutex<String> = Mutex::new(String::new());
+
+/// Sets [`CAPTION_EXTRA`]; it shows from the next caption update on.
+pub fn set_caption_extra(text: String) {
+    *CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()) = text;
+}
+
+fn caption_extra() -> String {
+    CAPTION_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Whether a submission's refreshes of host copies run on several threads,
 /// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
 ///
@@ -10259,7 +10273,8 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let extra = caption_extra();
+        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{extra}");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

@@ -138,6 +138,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    rage_debug_info(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -181,6 +182,68 @@ fn watch(base: usize, size: usize) {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Debugging aid: `VICTORY_RAGE_DEBUGINFO=<seconds>` has the title write
+/// its own "DEBUG INFO" block (the one its crash handler attaches: frame,
+/// streaming requests, tile heap, memory, mission, camera, pools) every that
+/// many seconds, into our log. The builder is the title's routine at
+/// `VICTORY_RAGE_DEBUGINFO_RVA` (hex; 0x21b9a40 in 1.0.2.1), called with a
+/// writer of ours `{ buf, cap, used }`. Each section takes its cache's lock
+/// with a try-lock and skips it when busy, so the call never waits on the
+/// title; its formatting goes through one global buffer of the title's, so
+/// only this thread calls it.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn rage_debug_info(base: usize, size: usize) {
+    let Some(every) = std::env::var("VICTORY_RAGE_DEBUGINFO").ok().and_then(|v| v.trim().parse::<u64>().ok()) else {
+        return;
+    };
+    let rva = std::env::var("VICTORY_RAGE_DEBUGINFO_RVA")
+        .ok()
+        .and_then(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x21b9a40);
+    if rva >= size || every == 0 {
+        return;
+    }
+    #[repr(C)]
+    struct Writer {
+        buf: *mut u8,
+        cap: u64,
+        used: u64,
+    }
+    std::thread::spawn(move || {
+        // SAFETY: an address inside the title image; the title's routine of
+        // this type (one pointer argument, Windows x64 convention).
+        let build: extern "system" fn(*mut Writer) = unsafe { std::mem::transmute(base + rva) };
+        let mut buf = vec![0u8; 64 * 1024];
+        // Leave the title's start-up alone.
+        std::thread::sleep(std::time::Duration::from_secs(every.max(20)));
+        loop {
+            let mut w = Writer { buf: buf.as_mut_ptr(), cap: (buf.len() - 1) as u64, used: 0 };
+            build(&mut w);
+            let used = (w.used as usize).min(buf.len() - 1);
+            let text = String::from_utf8_lossy(&buf[..used]);
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                eprintln!("RAGE: {line}");
+            }
+            // The figures worth seeing while playing, in the window's caption.
+            let field = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.trim().strip_prefix(key))
+                    .map(|v| v.split(" [").next().unwrap_or("").trim().to_owned())
+                    .unwrap_or_default()
+            };
+            let tile = field("TileHeap:").replace("used (", "").replace("Mb) - total (", "/").replace("Mb)", " MB");
+            victory_hle::set_caption_extra(format!(
+                " | RAGE frame {} stream {} tileheap {} {}",
+                field("Frame:"),
+                field("Streaming Requests:"),
+                tile,
+                field("Game State:")
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(every));
         }
     });
 }
