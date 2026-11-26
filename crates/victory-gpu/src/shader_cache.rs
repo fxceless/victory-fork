@@ -45,6 +45,8 @@ pub(crate) fn counts() -> (u64, u64) {
 /// build used to translate the title's thousands of shaders again, which kept
 /// the first minutes of every test run short of pipelines).
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
+/// (Not the per-program switches: each program's decision is in its own
+/// key, [`program_key`].)
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
@@ -84,21 +86,63 @@ fn build() -> [u8; 32] {
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);
-    let translate = |c: &[u8]| {
+    // By its hash and under its own key, as at run time ([`host_shader`]).
+    let hash = program_hash(container);
+    let translate_now = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate(&hash, c)
     };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &key(&hash, container), container, translate_now).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let hash = program_hash(container);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        Some(cache) => cached(cache, &key(&hash, container), container, |c| translate(&hash, c)),
+        None => translate(&hash, container),
     }
+}
+
+/// The hash the log names a shader by (`pipeline.rs`), which the
+/// per-program switches take (`victory_shader::emit::for_program`).
+fn program_hash(container: &[u8]) -> String {
+    blake3::hash(container).to_hex()[..16].to_owned()
+}
+
+/// The translation of the container whose hash is `hash`.
+fn translate(hash: &str, container: &[u8]) -> Result<HostShader, String> {
+    use victory_shader::emit;
+    emit::for_program(hash, || emit::translate(container)).map_err(|e| e.to_string())
+}
+
+/// The key the translation of `container` is filed under: the build's
+/// ([`build`]), with this program's own decisions ([`program_key`]).
+fn key(hash: &str, container: &[u8]) -> [u8; 32] {
+    use victory_shader::emit;
+    // (`wave64_retried` second: it parses the container, and only a program
+    // a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0` any, gets there)
+    let deep_skips_off = !emit::deep_skips_allowed(Some(hash)) && emit::wave64_retried(container);
+    program_key(&build(), deep_skips_off)
+}
+
+/// The key of one program's entries: the build's, mixed with the
+/// per-program decision when the program is kept out of the wave64 form
+/// "without skips, scalars followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`,
+/// `_ONLY`: `victory_shader::emit::deep_skips_allowed`). Only for a wave64
+/// compute program on a host of 32-lane waves, the only ones it can change.
+/// So the lists are in no key: changing one translates again only the
+/// programs whose decision it changes, and a program allowed the form keeps
+/// the key it had without any list.
+fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
+    if !deep_skips_off {
+        return *build;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -404,6 +448,39 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(program_key(&build, false), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true);
+        assert_ne!(off, build);
+        assert_eq!(program_key(&build, true), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true), off, "and still the build's");
+
+        // So only the program whose decision changed is translated again.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let [a, b] = [b"program a".as_slice(), b"program b"];
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // a listed: a translated again, b from the cache
+        cached(&cache, &program_key(&build, true), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false), b, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        // the list emptied again: both from the cache
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 
     #[test]
