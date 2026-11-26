@@ -1194,15 +1194,16 @@ unsafe fn frame_fits(
     // part of, if the header says so.
     unsafe {
         let [begin, finish, mut data] = entry.read_unaligned();
-        let at = context
-            .Rip
-            .wrapping_sub(image)
-            .wrapping_sub(u64::from(begin));
+        if context.Rip < image + u64::from(begin) || context.Rip >= image + u64::from(finish) {
+            return false;
+        }
+        let at = context.Rip - (image + u64::from(begin));
         // The frame register the function itself names (its first part).
         let mut pointer = 0;
         // Bytes above the frame's base that unwinding may read: the
-        // return address, a machine frame's tail.
+        // return address, a machine frame's tail, and saved register slots.
         let mut reach = 64usize;
+        let mut save_reach = 0usize;
         // Bases other than the stack pointer: frame pointers set up.
         let mut bases = [0usize; 4];
         let mut based = 0;
@@ -1256,8 +1257,24 @@ unsafe fn frame_fits(
                     }
                     // Registers saved in the frame (near, far), an epilogue
                     // note and a spare code, vector registers saved.
-                    4 | 8 => 2,
-                    5 | 9 => 3,
+                    4 => {
+                        save_reach = save_reach.max(usize::from(slot(i + 1)) * 8 + 8);
+                        2
+                    }
+                    8 => {
+                        save_reach = save_reach.max(usize::from(slot(i + 1)) * 16 + 16);
+                        2
+                    }
+                    5 => {
+                        let off = usize::from(slot(i + 1)) | (usize::from(slot(i + 2)) << 16);
+                        save_reach = save_reach.max(off.saturating_add(8));
+                        3
+                    }
+                    9 => {
+                        let off = usize::from(slot(i + 1)) | (usize::from(slot(i + 2)) << 16);
+                        save_reach = save_reach.max(off.saturating_add(16));
+                        3
+                    }
                     6 => 1,
                     7 => 2,
                     // A machine frame.
@@ -1271,7 +1288,7 @@ unsafe fn frame_fits(
             if frame & 15 != 0 && (set || !found || part > 0 || chained) {
                 let register = gpr(context, frame & 15) as usize;
                 let back = usize::from(frame >> 4) * 16;
-                if register < start + back || register > end || based == bases.len() {
+                if register < start + back || register >= end || based == bases.len() {
                     return false;
                 }
                 bases[based] = register - back;
@@ -1280,11 +1297,12 @@ unsafe fn frame_fits(
             if !chained {
                 let rsp = context.Rsp as usize;
                 let code = image + u64::from(finish) - context.Rip;
+                let total = reach.max(save_reach);
                 return rsp >= start
                     && rsp < end
-                    && reach <= SLACK
-                    && rsp + reach <= limit
-                    && bases[..based].iter().all(|base| base + reach <= limit)
+                    && total <= SLACK
+                    && rsp + total <= limit
+                    && bases[..based].iter().all(|base| base + total <= limit)
                     && epilogue_fits(context, code as usize, pointer, start, end);
             }
             let parent = codes

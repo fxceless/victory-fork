@@ -1003,3 +1003,39 @@ fn what_looking_costs() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn frame_fits_rejects_out_of_bounds_save_nonvol_and_rip() {
+    #[repr(C, align(4))]
+    struct FakeImage {
+        code: [u8; 32],
+        // UNWIND_INFO: version=1, prolog=4, count=2, frame=0, then UWOP_SAVE_NONVOL(op=4, info=3=rbx), slot=offset/8.
+        unwind: [u8; 8],
+    }
+    let mut image = FakeImage {
+        code: [0x90; 32], // NOPs, no epilogue
+        unwind: [1, 4, 2, 0, 4, (3 << 4) | 4, 0, 0],
+    };
+    let base = std::ptr::from_ref(&image) as u64;
+    let entry: [u32; 3] = [0, 32, (std::mem::offset_of!(FakeImage, unwind)) as u32];
+    let mut stack = vec![0u8; 128];
+    let start = stack.as_mut_ptr() as usize;
+    let end = start + 64;
+    let limit = start + 128;
+
+    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.Rsp = start as u64;
+    ctx.Rip = base + 8;
+
+    // Offset = 16 * 8 = 128 => save_reach = 136 > limit - start (128): must be rejected.
+    image.unwind[6..8].copy_from_slice(&16u16.to_le_bytes());
+    assert!(!unsafe { frame_fits(base, &entry, &ctx, start, end, limit) });
+
+    // Offset = 8 * 8 = 64 => save_reach = 72 <= limit - start (128): fits.
+    image.unwind[6..8].copy_from_slice(&8u16.to_le_bytes());
+    assert!(unsafe { frame_fits(base, &entry, &ctx, start, end, limit) });
+
+    // Rip past function end must be rejected without underflow.
+    ctx.Rip = base + 40;
+    assert!(!unsafe { frame_fits(base, &entry, &ctx, start, end, limit) });
+}
