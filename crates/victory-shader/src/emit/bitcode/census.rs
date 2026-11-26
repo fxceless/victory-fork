@@ -51,6 +51,35 @@ thread_local! {
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// See [`barriers_of`]: whether the modules a thread writes are to have their group barriers
+    /// counted, and the counts so far.
+    static BARRIERS: RefCell<(bool, Barriers)> = const { RefCell::new((false, Barriers(Vec::new()))) };
+}
+
+/// The group barriers and the instructions of the modules written inside [`barriers_of`]: the
+/// length and a hash of each one's bitcode, with its (barriers, instructions).
+#[derive(Debug, Default)]
+pub(crate) struct Barriers(Vec<(usize, u64, (u32, u32))>);
+
+impl Barriers {
+    /// Of the last module written.
+    pub(crate) fn last(&self) -> Option<(u32, u32)> {
+        self.0.last().map(|w| w.2)
+    }
+
+    /// Of the module whose bitcode the container `dxil` holds.
+    #[cfg(test)]
+    pub(crate) fn of(&self, dxil: &[u8]) -> Option<(u32, u32)> {
+        let at = dxil.windows(4).position(|w| w == b"BC\xC0\xDE")?;
+        self.0
+            .iter()
+            .rev()
+            .find(|(len, hash, _)| dxil.get(at..at + len).is_some_and(|b| fnv(b) == *hash))
+            .map(|w| w.2)
+    }
+}
+
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -78,11 +107,41 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
-    if !enabled() {
+    let counting = BARRIERS.with(|b| b.borrow().0);
+    if !enabled() && !counting {
         return;
     }
     let c = m.census();
-    WRITTEN.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), c)));
+    if counting {
+        let at = KINDS.iter().position(|k| *k == "barrier").expect("kind");
+        BARRIERS.with(|b| {
+            b.borrow_mut()
+                .1
+                .0
+                .push((bitcode.len(), fnv(bitcode), (c.counts[at], c.counts[0])))
+        });
+    }
+    if enabled() {
+        WRITTEN.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), c)));
+    }
+}
+
+/// Runs `f`, and with it the group barriers and instructions of the modules it wrote: those [`Module::write`]
+/// writes, counted as the census counts them. The count is made only inside this call, so
+/// nothing else pays for it; inside another such call, the modules are that call's too.
+pub(crate) fn barriers_of<R>(f: impl FnOnce() -> R) -> (R, Barriers) {
+    let was =
+        BARRIERS.with(|b| std::mem::replace(&mut *b.borrow_mut(), (true, Barriers::default())));
+    let r = f();
+    let mine = BARRIERS.with(|b| {
+        let mine = std::mem::take(&mut b.borrow_mut().1);
+        *b.borrow_mut() = (was.0, was.1);
+        mine
+    });
+    if was.0 {
+        BARRIERS.with(|b| b.borrow_mut().1.0.extend(mine.0.iter().copied()));
+    }
+    (r, mine)
 }
 
 fn kind(name: &str) -> usize {

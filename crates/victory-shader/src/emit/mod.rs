@@ -425,11 +425,54 @@ pub fn emit(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // `VICTORY_WAVE_IDIOM_FIRST=1`: before one of those two forms is kept, the exact idiom
+        // forms the exact pass below would try are emitted too, and one that is done and has
+        // fewer group barriers, and no more instructions, is kept instead (the
+        // allocation-request program was kept in "without skips" with 33 of them, and its form
+        // without any was never looked at). Only then: a program that would not gain keeps the
+        // form it has today, byte for byte. Fewer barriers at the price of a longer program is
+        // not a clear win and was not measured (two programs of the title were such).
+        // Read as a switch by the build script, so it is part of the translation fingerprint.
+        let idiom_first = local_on && !exact_only && idiom_first_on();
+        let cheaper_idiom = |kept: &str, cost: Option<(u32, u32)>| -> Option<HostShader> {
+            let cost = cost?;
+            let mut tried = Vec::new();
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st)
+                {
+                    tried.push((format!("local waves (idiom), {name}"), p, st, io, res));
+                }
+            }
+            if idiom(p, st) {
+                tried.push(("local waves (idiom)".to_string(), p, st, io, res));
+            }
+            let mut found = Vec::new();
+            for (what, p, st, io, res) in tried {
+                let (local, n) = bitcode::census::barriers_of(|| lower::with_local_waves(|| emit_program(c, native, p, st, io, res)));
+                let n = n.last();
+                report(&format!("{what}, over {kept}"), &local);
+                if why {
+                    eprintln!("WAVE64-RETRY {what}: {n:?} (group barriers, instructions), {kept} has {cost:?}");
+                }
+                found.push((if done(&local) { n } else { None }, local));
+            }
+            let at = fewest_barriers(cost, &found.iter().map(|f| f.0).collect::<Vec<_>>())?;
+            found.swap_remove(at).1.ok().map(|(shader, _)| shader)
+        };
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
+                let (again, barriers) = if idiom_first {
+                    let (again, n) = bitcode::census::barriers_of(|| emit_program(c, native, p, st, io, res));
+                    (again, n.last())
+                } else {
+                    (emit_program(c, native, p, st, io, res), None)
+                };
                 report(name, &again);
                 if done(&again) {
+                    if idiom_first && let Some(shader) = cheaper_idiom(name, barriers) {
+                        return Ok(shader);
+                    }
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -638,6 +681,38 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// Whether `VICTORY_WAVE_IDIOM_FIRST=1`; a test sets it for its own thread
+/// ([`TEST_IDIOM_FIRST`]) instead of the process's environment.
+fn idiom_first_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_IDIOM_FIRST.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_IDIOM_FIRST").is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_IDIOM_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Which of the candidates' (group barriers, instructions) (`None`: not usable) has the fewest
+/// barriers, strictly under `kept`'s, with no more instructions than `kept`; the first of
+/// equals, so the order of the attempts decides ties.
+fn fewest_barriers(kept: (u32, u32), counts: &[Option<(u32, u32)>]) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    for (i, c) in counts.iter().enumerate() {
+        if let Some((n, total)) = *c
+            && n < kept.0
+            && total <= kept.1
+            && best.is_none_or(|(_, b)| n < b)
+        {
+            best = Some((i, n));
+        }
+    }
+    best.map(|b| b.0)
 }
 
 /// The translated program, and the wave size it requires of the host.

@@ -530,3 +530,163 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A wave64 allocation idiom the console writes: a ballot of a per-lane condition (lane t
+/// qualifies when `5 t mod 64` is below s0, so the qualifying lanes are not a prefix), the
+/// count, one lane's atomic add of it to dword 0, `v_readfirstlane` of the base, and each
+/// qualifying lane's store of `t + 1` at dword `1 + base + its rank`.
+fn allocation() -> NativeProgram {
+    native(&[
+        0x160C_0085, // v_mul_u32_u24 v6, 5, v0
+        0x360C_0CBF, // v_and_b32 v6, 63, v6
+        0x7D88_0C00, // v_cmp_gt_u32 vcc, s0, v6
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0017, // s_cbranch_execz to the restore of EXEC
+        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+        0xBE94_147E, // s_ff1_i32_b64 s20, exec (the first lane)
+        0xD765_0001, 0x0001_007E, // v_mbcnt_lo_u32_b32 v1, exec_lo, 0
+        0xD766_0001, 0x0002_027F, // v_mbcnt_hi_u32_b32 v1, exec_hi, v1
+        0xD765_0003, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0003, 0x0002_06C1, // v_mbcnt_hi_u32_b32 v3, -1, v3 (the lane's number)
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x7D84_0614, // v_cmp_eq_u32 vcc, s20, v3
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xE0C8_4000, 0x8002_0200, // buffer_atomic_add v2, off, s[8:11], 0 glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x7E0E_0502, // v_readfirstlane_b32 s7, v2
+        0x4A08_0207, // v_add_nc_u32 v4, s7, v1
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x4A0A_0081, // v_add_nc_u32 v5, 1, v0
+        0xE070_1000, 0x8402_0504, // buffer_store_dword v5, v4, s[8:11], 4 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ])
+}
+
+/// A container with no part: all `emit` needs of one besides the program itself.
+fn bare_container() -> Vec<u8> {
+    let mut b = b"DXBC".to_vec();
+    b.extend([0u8; 16]);
+    b.extend([1, 0, 0, 0]);
+    b.extend(32u32.to_le_bytes());
+    b.extend(0u32.to_le_bytes());
+    b
+}
+
+/// `emit` of `native` on a host of waves of 32, with `VICTORY_WAVE_IDIOM_FIRST` as `on` says,
+/// and the group barriers of the module it kept.
+fn emitted(native: &NativeProgram, on: bool) -> (HostShader, Option<u32>) {
+    let bytes = bare_container();
+    let c = crate::dxbc::Container::parse(&bytes).expect("container");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was_on = super::TEST_IDIOM_FIRST.replace(Some(on));
+    let (shader, counted) = super::bitcode::census::barriers_of(|| super::emit(&c, native, &p, &st, &io, &res));
+    super::TEST_IDIOM_FIRST.set(was_on);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    let barriers = counted.of(&shader.dxil).map(|c| c.0);
+    (shader, barriers)
+}
+
+/// Runs the allocation program with `s0 = below` and gives the 66 dwords of the UAV.
+fn allocated(shader: &HostShader, below: u32) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return None;
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = below;
+        }
+    }
+    let mut out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(66)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out.swap_remove(0))
+}
+
+/// `VICTORY_WAVE_IDIOM_FIRST=1`: the allocation idiom the ladder would keep with group
+/// barriers ("without skips" or "without early-outs") is emitted as the exact local-waves
+/// form when that has fewer, and the two are the same program on the card: the counter ends
+/// at the number of qualifying lanes and the slots hold the same lanes, one each.
+#[test]
+fn the_allocation_idiom_is_taken_without_barriers_when_the_ladder_would_keep_them() {
+    let native = allocation();
+    let (today, before) = emitted(&native, false);
+    let (idiom, after) = emitted(&native, true);
+    eprintln!("group barriers: {before:?} today, {after:?} with the idiom first");
+    let (before, after) = (before.expect("counted"), after.expect("counted"));
+    assert!(before > 0, "the program is no longer kept with barriers today: pick another one");
+    assert!(after < before, "{after} barriers, not fewer than {before}");
+    for shader in [&today, &idiom] {
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [64u32, 40, 33, 10, 1, 0] {
+        let Some(got) = allocated(&idiom, below) else { return };
+        let lanes: Vec<u32> = (0..64).filter(|t| (5 * t) % 64 < below).collect();
+        assert_eq!(got[0] as usize, lanes.len(), "{below}: the counter");
+        // (which lane gets which slot is the host's order, not asserted: the set is)
+        let mut slots = got[1..=lanes.len()].to_vec();
+        slots.sort_unstable();
+        let expected: Vec<u32> = lanes.iter().map(|t| t + 1).collect();
+        assert_eq!(slots, expected, "{below}: the slots written");
+        assert!(got[1 + lanes.len()..].iter().all(|&d| d == 0), "{below}: a slot past the count was written");
+    }
+    eprintln!("ran on the hardware device: the same slots and counter as 64 lanes");
+}
+
+/// The same program with the first lane found as the one whose rank is 0: not the idiom
+/// `lower::wave_local` knows, so it has no form to take over. With the switch on it is the
+/// program of today, byte for byte, barriers and all.
+#[test]
+fn a_program_without_the_idiom_form_is_left_as_it_is() {
+    let words = [
+        0x160C_0085u32, 0x360C_0CBF, 0x7D88_0C00, 0xBE8C_246A, 0xBF88_0012, 0xBE86_107E,
+        0xD765_0001, 0x0001_007E, 0xD766_0001, 0x0002_027F, 0x7E04_0206,
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1 (the first lane, by its rank)
+        0xBE8E_246A, 0xE0C8_4000, 0x8002_0200, 0xBF8C_3F70, 0xBEFE_040E, 0x7E0E_0502,
+        0x4A08_0207, 0x3408_0882, 0x4A0A_0081, 0xE070_1000, 0x8402_0504, 0xBEFE_040C,
+    ];
+    let native = native(&words);
+    let (today, before) = emitted(&native, false);
+    let (on, after) = emitted(&native, true);
+    assert!(before.is_some_and(|n| n > 0), "{before:?}: kept with barriers today");
+    assert_eq!(before, after);
+    assert_eq!(today.dxil, on.dxil);
+}
+
+#[test]
+fn the_fewest_barriers_are_taken_only_when_strictly_fewer_and_the_first_of_equals() {
+    use super::fewest_barriers as f;
+    let k = (7, 100);
+    assert_eq!(f(k, &[]), None);
+    assert_eq!(f(k, &[None, Some((7, 50)), Some((9, 50))]), None);
+    assert_eq!(f(k, &[Some((7, 50)), Some((3, 100))]), Some(1));
+    assert_eq!(f(k, &[Some((5, 90)), Some((2, 80)), Some((2, 70)), None]), Some(1));
+    // fewer barriers in a longer program: not taken
+    assert_eq!(f(k, &[Some((1, 101)), Some((6, 100))]), Some(1));
+    assert_eq!(f(k, &[Some((1, 101))]), None);
+    assert_eq!(f((0, 5), &[Some((0, 1))]), None);
+}
