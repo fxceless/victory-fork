@@ -87,7 +87,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     /// In [`KEPT_PIECES`] pieces, each behind its own lock.
+    #[cfg(not(feature = "diagnostics"))]
     kept: Vec<Mutex<Vec<Option<ID3D12Resource>>>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) kept: crate::draw_trace::Slots,
     /// Without [`heap_locks`]: the one line every `keep` stands in, as
     /// when `kept` was behind one lock.
     kept_one: Mutex<()>,
@@ -1172,9 +1175,12 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
+            #[cfg(not(feature = "diagnostics"))]
             kept: (0..KEPT_PIECES)
                 .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
                 .collect(),
+            #[cfg(feature = "diagnostics")]
+            kept: std::sync::Arc::new((0..KEPT_PIECES).map(|piece| Mutex::new(vec![None; (count + extra).saturating_sub(piece).div_ceil(KEPT_PIECES) as usize])).collect()),
             kept_one: Mutex::new(()),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
