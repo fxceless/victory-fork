@@ -574,6 +574,51 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds of [`State::bind`] since the last line of the threads that
+/// translate lists, on all threads: the whole of it, then its parts: the
+/// early texture pass, descriptor tables, title memory by address; and the
+/// binds counted (`VICTORY_BIND_SPLIT=0`: not timed). For the line of list
+/// calls by kind: DISPATCH and EXECUTE_INDIRECT took 40-60 us each (run
+/// v8-220247) and nothing said where.
+pub(crate) static BIND_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether [`BIND_NS`] is kept (`VICTORY_BIND_SPLIT`, on unless `0`).
+pub(crate) fn bind_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_SPLIT").is_none_or(|v| v != "0"))
+}
+
+/// Adds the time from its start to its drop to [`BIND_NS`]`[part]`.
+struct BindLap(Option<(usize, std::time::Instant)>);
+
+impl BindLap {
+    #[inline]
+    fn start(part: usize) -> Self {
+        BindLap(bind_split().then(|| (part, std::time::Instant::now())))
+    }
+}
+
+impl Drop for BindLap {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((part, began)) = self.0 {
+            BIND_NS[part].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if part == 0 {
+                BIND_NS[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// [`BIND_NS`] per frame, taken: ms of binds, early textures, tables,
+/// title memory by address, and binds; `None` when not timed or none.
+pub(crate) fn take_bind_split(frames: f64) -> Option<[f64; 5]> {
+    if !bind_split() {
+        return None;
+    }
+    let v: [u64; 5] = std::array::from_fn(|i| BIND_NS[i].swap(0, Ordering::Relaxed));
+    (v[4] > 0).then(|| std::array::from_fn(|i| if i == 4 { v[4] as f64 / frames } else { v[i] as f64 / 1e6 / frames }))
+}
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
 /// the spans and refreshes of their copies, the texture side.
 #[cfg(feature = "diagnostics")]
@@ -1538,9 +1583,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _whole = BindLap::start(0);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        {
+            let _lap = BindLap::start(1);
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1633,7 +1682,10 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = {
+                let _lap = BindLap::start(2);
+                self.tables(list, &t.tables, compute)
+            };
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1656,7 +1708,11 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
+                let ready = {
+                    let _lap = BindLap::start(3);
+                    self.memory_ready(list, t, compute, use_)
+                };
+                let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

@@ -368,6 +368,14 @@ pub(crate) fn line(frames: f64) {
             ops.iter().map(|(name, calls, ms, us)| format!("{name} {calls:.0} calls {ms:.1} ms ({us:.1} us each)")).collect();
         tracing::info!("list calls translated by kind per frame, heaviest first (VICTORY_THIN_OPS=0: not timed): {}", text.join(", "));
     }
+    if let Some([all, early, tables, memory, binds]) = crate::draw::take_bind_split(frames) {
+        tracing::info!(
+            "of those, binding draws and dispatches per frame (VICTORY_BIND_SPLIT=0: not timed): {binds:.0} binds {all:.1} ms \
+             (all threads), of them the early texture pass {early:.1} ms, descriptor tables {tables:.1} ms, title memory by \
+             address {memory:.1} ms, the rest (root views and their refreshes, the heap pass, state) {:.1} ms",
+            (all - early - tables - memory).max(0.0)
+        );
+    }
 }
 
 #[inline]
