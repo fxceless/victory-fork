@@ -664,9 +664,13 @@ impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
     }
 
     /// For a read back through a host buffer: this footprint at offset 0
@@ -723,23 +727,33 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         return None;
     }
     let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    let width = desc
+        .width
+        .checked_shr(mip)
+        .unwrap_or(0)
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block)?;
+    let height = u64::from(desc.height)
+        .checked_shr(mip)
+        .unwrap_or(0)
+        .max(1)
+        .checked_next_multiple_of(block)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size)
+            .checked_shr(mip)
+            .unwrap_or(0)
+            .max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
         format: desc.format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(PITCH)?).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
@@ -1208,10 +1222,29 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// one layer were found at first, and the programs behind the others read
 /// the title's unwritten memory - the sky light cache's second stage wrote
 /// all zeros from a first stage that held light (run 88).
+/// RAII COM reference to a live title `Resource` returned by [`alias_of`],
+/// preventing concurrent `Release` from freeing it while in use.
+#[cfg(windows)]
+pub(crate) struct ResourceRef(This);
+
+#[cfg(windows)]
+impl ResourceRef {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ResourceRef {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<ResourceRef> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1234,7 +1267,9 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
+    // Under the table's lock: a texture leaves it before it is freed. Retain
+    // a COM reference before dropping the lock so a concurrent `Release` cannot
+    // free `other` while the caller uses it.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
@@ -1248,7 +1283,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    (same && object::try_add_ref(other)).then_some(ResourceRef(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -4113,5 +4148,100 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn subresource_handles_large_mip_levels_and_overflow_without_panicking() {
+        let mut tex3d = ResourceDesc {
+            dimension: TEXTURE_3D,
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 16,
+            mip_levels: 40,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        // Previously panicked in debug (`u32 >> 35`) / wrapped shift in release.
+        let (fp, rows, row_size) = subresource(&tex3d, 35).expect("high 3D mip stays 1x1x1");
+        assert_eq!((fp.width, fp.height, fp.depth, rows, row_size), (1, 1, 1, 1, 4));
+
+        // 2D texture with mip >= 64: previously panicked (`u64 >> 65`).
+        tex3d.dimension = 3; // TEXTURE_2D
+        tex3d.depth_or_array_size = 1;
+        tex3d.mip_levels = 70;
+        let (fp, rows, row_size) = subresource(&tex3d, 65).expect("mip >= 64 clamps to 1x1");
+        assert_eq!((fp.width, fp.height, fp.depth, rows, row_size), (1, 1, 1, 1, 4));
+
+        // Huge width overflowing next_multiple_of returns None instead of panicking.
+        tex3d.width = u64::MAX;
+        tex3d.mip_levels = 1;
+        tex3d.format = 71; // BC1_UNORM (block = 4)
+        assert_eq!(subresource(&tex3d, 0), None);
+
+        // PlacedFootprint::bytes rejects multiplication overflow instead of panicking.
+        let huge = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: u32::MAX,
+            height: u32::MAX,
+            depth: u32::MAX,
+            row_pitch: u32::MAX,
+        };
+        assert_eq!(huge.bytes(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alias_of_retains_target_com_ref_across_concurrent_release() {
+        let null = std::ptr::null();
+        let h = heap(4 * KIB_64);
+        let target_desc = ResourceDesc {
+            dimension: 3, // TEXTURE_2D
+            alignment: 0,
+            width: 16,
+            height: 16,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET
+        };
+        let alias_desc = ResourceDesc {
+            format: 30, // R8G8B8A8_UINT (same 4-byte texel size)
+            flags: 0,
+            ..target_desc
+        };
+
+        let mut target = null;
+        assert_eq!(
+            create_placed(null, h, 0, &target_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut target),
+            S_OK
+        );
+        let mut alias = null;
+        assert_eq!(
+            create_placed(null, h, 0, &alias_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut alias),
+            S_OK
+        );
+        resource(alias)
+            .host
+            .placed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let guard = alias_of(alias).expect("placed SRV alias finds render target");
+        assert_eq!(guard.get(), target);
+        // Releasing the title's ref must NOT free `target` while `guard` lives.
+        assert_eq!(slot::<Release>(target, 0x10)(target), 1);
+        drop(guard);
+        // Dropping `guard` released the last reference and removed `target` from TARGETS_AT.
+        assert!(alias_of(alias).is_none());
+
+        assert_eq!(slot::<Release>(alias, 0x10)(alias), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 }
