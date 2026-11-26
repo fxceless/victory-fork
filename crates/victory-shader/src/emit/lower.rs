@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Functions declared in the emitted DXIL module.
+    #[cfg(test)]
+    pub funcs: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2307,6 +2310,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            funcs: self.s.m.func_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4385,6 +4390,36 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always. At a triangle's edge the quad's
+    /// other pixels are helpers (and so are discarded ones), which only quad
+    /// reads see: wave reads leave helper lanes out, so a derivative taken
+    /// by hand at a triangle's edge can misread or return zero there.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop serves helper lanes too. On the host, wave
+    /// operations leave helper lanes out: once only helper lanes are left
+    /// in such a loop, `WaveReadLaneFirst` reads no lane, no lane matches,
+    /// and the loop runs to `LOOP_LIMIT`. With its own value a helper
+    /// lane matches in the first pass and leaves; what a helper lane
+    /// computes only feeds derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -4505,7 +4540,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6869,7 +6904,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -7739,7 +7774,8 @@ impl<'a> Lower<'a> {
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
-                            return int(self, mine);
+                            let r = self.helper_reads_own(a, mine);
+                            return int(self, r);
                         }
                         need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
@@ -7768,6 +7804,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
