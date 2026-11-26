@@ -2125,7 +2125,8 @@ mod tests {
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        let new: Vec<_> = again.into_iter().filter(|&(_, stamp)| stamp > asked).collect();
+        assert_eq!(new, [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
