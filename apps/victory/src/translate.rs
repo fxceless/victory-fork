@@ -278,7 +278,7 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    crate::prebuild::worker(s, || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else { continue };
                             // As the title passes it: the container's own size

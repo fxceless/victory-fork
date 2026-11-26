@@ -43,6 +43,21 @@ enum Job {
     Graphics(usize),
     Compute(usize),
 }
+/// A pre-build worker: a scoped thread with the stack the run's pipeline
+/// workers get (16 MiB, `pipeline/make.rs`; VIctory#1528). Translating and
+/// making a deep shader can overflow the default 2 MiB (seen once under
+/// vkd3d-proton, pull request #1226).
+pub(crate) fn worker<'s, 'e, T: Send + 's>(
+    s: &'s std::thread::Scope<'s, 'e>,
+    f: impl FnOnce() -> T + Send + 's,
+) -> std::thread::ScopedJoinHandle<'s, T> {
+    std::thread::Builder::new()
+        .name("victory-prebuild".into())
+        .stack_size(16 << 20)
+        .spawn_scoped(s, f)
+        .expect("a pre-build worker thread")
+}
+
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
@@ -78,7 +93,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let next = AtomicUsize::new(0);
         std::thread::scope(|s| {
             for _ in 0..threads.min(list.len()) {
-                s.spawn(|| {
+                worker(s, || {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(source) = list.get(i) else { break };
@@ -207,7 +222,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     };
     std::thread::scope(|s| {
         for _ in 0..threads.min(todo.len()) {
-            s.spawn(|| {
+            worker(s, || {
                 while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
                     if let Err(why) = prepare(job).and_then(|p| p.make()) {
                         skip(why);
@@ -253,7 +268,7 @@ fn each(jobs: &[Job], threads: usize, f: impl Fn(Job) + Sync) {
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads.min(jobs.len()) {
-            s.spawn(|| {
+            worker(s, || {
                 while let Some(&job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                     f(job);
                 }
