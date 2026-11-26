@@ -4455,7 +4455,8 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let batching = crate::indirect::ordered_batches();
+        let windowed = !batching && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -4468,7 +4469,7 @@ impl State {
         }
         // An indirect dispatch's own record may take a gathered slot as a draw's does
         // (`crate::indirect::gather_dispatches`); the dispatch ends the gathering right after that, below.
-        let joins = kind == DISPATCH
+        let joins = !batching && kind == DISPATCH
             && max == 1
             && count.is_none()
             && !is_spread
@@ -4629,7 +4630,8 @@ impl State {
                 let mut window_at = None;
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
-                } else if let Some((dst, at, opened)) = (crate::indirect::clamp_window()
+                } else if let Some((dst, at, opened)) = ((crate::indirect::clamp_window() || batching)
+                    && (!batching || crate::indirect::ordered_batch_eligible(kind, max, count.is_some(), is_spread))
                     && count_arg.is_none()
                     && !is_spread
                     && kind != DISPATCH
