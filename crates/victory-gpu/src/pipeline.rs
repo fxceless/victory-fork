@@ -132,6 +132,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute shader's group size (`numthreads`); `[0; 3]` for other
+    /// stages. A `DispatchX` that counts threads is made groups with it.
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -190,17 +193,18 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, stores, threads })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -384,6 +388,9 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        for p in b.pipelines.iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -618,6 +625,9 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        // Named once each (gfx41): which programs are the builder's, to
+        // match against the refused and untranslated ones.
+        tracing::info!(n = b.pipelines.len(), ?shaders, "a pipeline of the ray-tracing structure builder");
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
