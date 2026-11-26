@@ -75,6 +75,10 @@ pub const DEFAULT: u32 = ALL & !WIDE;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A wave operation outside the opt-in broadcast/vote allowlist.
+    pub unsafe_wave32: bool,
+    /// Any barrier, including a fence without group sync.
+    pub barrier: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -85,6 +89,15 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+}
+
+/// Whether the remaining builtin names permit the default wave32 rescue.
+/// Callers must also exclude indirect exits and require an original wave64.
+pub(crate) fn allows_default_wave32<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
+    names.into_iter().all(|name| {
+        let name = name.strip_prefix("dx.op.").unwrap_or(name);
+        !name.starts_with("wave") && !name.starts_with("quad") && !name.starts_with("barrier")
+    })
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1012,10 +1025,21 @@ impl Module {
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
-                let name = self.funcs[*f as usize].name.as_str();
-                let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if name.starts_with("wave") || name.starts_with("quad") {
-                    u.wave_ops = true;
+                let builtin = self.funcs[*f as usize].name.as_str();
+                let name = builtin.strip_prefix("dx.op.").unwrap_or(builtin);
+                if !allows_default_wave32([builtin]) {
+                    if name.starts_with("barrier") {
+                        u.barrier = true;
+                    } else {
+                        u.wave_ops = true;
+                        u.unsafe_wave32 |= !matches!(
+                            name.split('.').next().unwrap_or(name),
+                            "waveReadLaneFirst"
+                                | "waveAnyTrue"
+                                | "waveAllTrue"
+                                | "waveActiveAllEqual"
+                        );
+                    }
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,

@@ -5,6 +5,202 @@
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
+#[cfg(test)]
+mod wave32_tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    #[test]
+    fn default_rescue_builtin_names() {
+        use super::super::bitcode::opt::allows_default_wave32;
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["dx.op.waveGetLaneIndex"], false),
+            (&["dx.op.barrier"], false),
+            (&["dx.op.quadReadLaneAt"], false),
+            (&[], true),
+            (&["dx.op.threadId.i32"], true),
+            (&["dx.op.threadId.i32", "dx.op.waveGetLaneIndex"], false),
+            (&["dx.op.barrier", "dx.op.threadId.i32"], false),
+            (&["quadReadLaneAt.i32"], false),
+            (&["dx.op.waveFutureOp"], false),
+            (&["dx.op.barrierByMemoryType"], false),
+        ];
+        for &(names, allowed) in cases {
+            assert_eq!(
+                allows_default_wave32(names.iter().copied()),
+                allowed,
+                "{names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rescue_wave_size_and_psv() {
+        // Keep return values live so optimisation cannot erase the tested call.
+        for (name, opcode, expected) in [
+            (Some("waveGetLaneIndex"), 111, 64),
+            (Some("barrier"), 80, 64),
+            (Some("quadReadLaneAt.i32"), 122, 64),
+            (None, 0, 32),
+            (Some("threadId.i32"), 93, 32),
+        ] {
+            let mut s = shader(None, false);
+            let zero = s.m.i32(0);
+            match name {
+                Some("barrier") => {
+                    let mode = s.m.i32(9);
+                    s.op(
+                        s.entry,
+                        "barrier",
+                        Attr::NoDuplicate,
+                        s.t.void,
+                        opcode,
+                        &[mode],
+                    );
+                }
+                Some(name) => {
+                    let args: &[_] = match opcode {
+                        122 => &[zero, zero],
+                        93 => &[zero],
+                        _ => &[],
+                    };
+                    let v = s.op(s.entry, name, Attr::ReadNone, s.t.i32, opcode, args);
+                    let sink = s.m.global("sink", s.t.i32, 3);
+                    s.m.store(s.entry, sink, v);
+                    if expected == 64 {
+                        s.flags |= flags::WAVE_OPS;
+                    }
+                }
+                None => {}
+            }
+            let (dxil, wave, reason) = s.finish_wave(false, false);
+            assert_eq!(wave, Some(expected), "{name:?}");
+            assert_eq!(
+                reason,
+                (expected == 32).then_some("no-wave-intrinsic"),
+                "{name:?}"
+            );
+            let c = crate::dxbc::Container::parse(&dxil).unwrap();
+            let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+            for offset in [20, 24] {
+                assert_eq!(
+                    crate::dxbc::u32_at(psv, offset).unwrap(),
+                    expected,
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
+    fn shader(call: Option<&str>, live: bool) -> Shader {
+        let mut s = Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        s.wave_size = Some(64);
+        if let Some(name) = call {
+            let v = s.op(s.entry, name, Attr::ReadNone, s.t.i32, 118, &[]);
+            s.flags |= flags::WAVE_OPS;
+            if live {
+                let sink = s.m.global("sink", s.t.i32, 3);
+                s.m.store(s.entry, sink, v);
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        s
+    }
+
+    #[test]
+    fn no_wave_intrinsic_drops_stale_wave64_requirement() {
+        let mut s = Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        s.lds_dwords = 128;
+        s.wave_size = Some(64);
+        s.m.terminate(s.entry, super::super::bitcode::Term::Ret);
+        let dxil = s.finish();
+        let c = crate::dxbc::Container::parse(&dxil).unwrap();
+        let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+        assert_eq!(crate::dxbc::u32_at(psv, 20).unwrap(), 32);
+        assert_eq!(crate::dxbc::u32_at(psv, 24).unwrap(), 32);
+    }
+
+    #[test]
+    fn dead_wave_calls_do_not_prevent_default_rescue() {
+        let (_, wave, reason) = shader(Some("waveGetLaneIndex"), false).finish_wave(false, false);
+        assert_eq!((wave, reason), (Some(32), Some("no-wave-intrinsic")));
+    }
+
+    #[test]
+    fn broadcast_and_votes_require_opt_in() {
+        for name in [
+            "waveReadLaneFirst.i32",
+            "waveAnyTrue",
+            "waveAllTrue",
+            "waveActiveAllEqual.i32",
+        ] {
+            let (_, wave, reason) = shader(Some(name), true).finish_wave(false, false);
+            assert_eq!((wave, reason), (Some(64), None), "{name}");
+            let (dxil, wave, reason) = shader(Some(name), true).finish_wave(false, true);
+            assert_eq!(
+                (wave, reason),
+                (Some(32), Some("safe-intrinsics")),
+                "{name}"
+            );
+            let c = crate::dxbc::Container::parse(&dxil).unwrap();
+            let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+            assert_eq!(crate::dxbc::u32_at(psv, 20).unwrap(), 32);
+            assert_eq!(crate::dxbc::u32_at(psv, 24).unwrap(), 32);
+        }
+    }
+
+    #[test]
+    fn lane_masks_reductions_quads_and_unknown_wave_ops_stay64() {
+        for name in [
+            "waveGetLaneIndex",
+            "waveGetLaneCount",
+            "waveIsFirstLane",
+            "waveActiveBallot",
+            "waveReadLaneAt.i32",
+            "waveActiveOp.i32",
+            "wavePrefixOp.i32",
+            "quadReadLaneAt.i32",
+            "waveFutureOp",
+        ] {
+            let (_, wave, reason) = shader(Some(name), true).finish_wave(false, true);
+            assert_eq!((wave, reason), (Some(64), None), "{name}");
+        }
+    }
+
+    #[test]
+    fn barriers_and_indirect_exits_block_both_rescue_paths() {
+        for call in [None, Some("waveReadLaneFirst.i32")] {
+            let (_, wave, reason) = shader(call, true).finish_wave(true, true);
+            assert_eq!((wave, reason), (Some(64), None));
+            for mode in [8, 9] {
+                let mut s = shader(call, true);
+                let mode = s.m.i32(mode);
+                s.op(s.entry, "barrier", Attr::NoDuplicate, s.t.void, 80, &[mode]);
+                let (_, wave, reason) = s.finish_wave(false, true);
+                assert_eq!((wave, reason), (Some(64), None));
+            }
+        }
+    }
+
+    #[test]
+    fn other_wave_sizes_are_unchanged_and_switch_is_in_cache_key() {
+        for size in [None, Some(32)] {
+            let mut s = shader(None, false);
+            s.wave_size = size;
+            let (_, wave, reason) = s.finish_wave(false, true);
+            assert_eq!((wave, reason), (size, None));
+        }
+        assert!(
+            env!("VICTORY_SHADER_SWITCHES")
+                .split(',')
+                .any(|s| s == "VICTORY_WAVE_FORCE32")
+        );
+    }
+}
+
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
@@ -463,7 +659,28 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_wave(false, false).0
+    }
+
+    /// Decide only after optimisation, before writing both DXIL and PSV metadata.
+    /// Default rescue requires wave64, no indirect exit, and no remaining call
+    /// whose name (after `dx.op.`) starts with `wave`, `quad`, or `barrier`.
+    /// Without wave/quad operations, lane-local work cannot observe wave width;
+    /// splitting it into two waves preserves thread IDs and the thread-group size.
+    /// This assumes no implicit dependence on wave64 lockstep or lane layout.
+    /// LDS barriers (indeed all barriers) and indirect exits block rescue: this
+    /// check cannot establish cross-wave ordering or unseen control-flow effects.
+    /// Barrier-free LDS communication can still rely on lockstep, and derivatives
+    /// can rely on neighbouring/helper lanes. Such assumptions are unsafe to infer
+    /// away from builtin names; this is not a proof of race freedom or derivative
+    /// equivalence, and no additional derivative check is performed here.
+    /// The opt-in changes the scope of broadcasts/votes; it does not emulate wave64.
+    pub fn finish_wave(
+        mut self,
+        indirect_exit: bool,
+        force32: bool,
+    ) -> (Vec<u8>, Option<u32>, Option<&'static str>) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -485,6 +702,19 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        let used = self.m.usage();
+        let reason = if self.wave_size != Some(64) || indirect_exit || used.barrier {
+            None
+        } else if !used.wave_ops {
+            Some("no-wave-intrinsic")
+        } else if force32 && !used.unsafe_wave32 {
+            Some("safe-intrinsics")
+        } else {
+            None
+        };
+        if reason.is_some() {
+            self.wave_size = Some(32);
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -855,7 +1085,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        (container::build(&parts), self.wave_size, reason)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

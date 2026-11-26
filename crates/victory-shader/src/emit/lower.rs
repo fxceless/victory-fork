@@ -71,6 +71,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// A late wave64-to-wave32 change after dead-code elimination.
+    pub wave32_reason: Option<&'static str>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -2382,19 +2384,31 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
-        let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        let (dxil, wave_size, wave32_reason) = self.s.finish_wave(
+            self.x
+                .st
+                .exits
+                .iter()
+                .any(|e| matches!(e, LaneExit::Indirect)),
+            std::env::var("VICTORY_WAVE_FORCE32").is_ok_and(|v| v == "1"),
+        );
         Ok(Lowered {
             wave_size,
+            wave32_reason,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
             half_views,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            dxil,
             user_data,
             samplers: self.samplers,
         })

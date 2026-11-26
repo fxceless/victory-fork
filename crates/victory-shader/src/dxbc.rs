@@ -56,6 +56,8 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    /// Original container bytes, for the content hash used by pipeline diagnostics.
+    pub(crate) bytes: &'a [u8],
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
@@ -100,6 +102,7 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            bytes: data,
             digest,
             version,
             parts,

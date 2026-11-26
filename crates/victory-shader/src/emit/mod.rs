@@ -780,6 +780,10 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    if let Some(reason) = l.wave32_reason {
+        let hash = blake3::hash(c.bytes);
+        eprintln!("wave: {} 64->32 reason={reason}", &hash.to_hex()[..16]);
+    }
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
