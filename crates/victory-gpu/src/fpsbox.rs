@@ -63,8 +63,18 @@ fn text(tenths: u32) -> String {
     format!("{}.{} FPS", tenths / 10, tenths % 10)
 }
 
+/// A digit's or the point's rows, for the KittyOverlay's font.
+pub(crate) fn glyph_rows(c: char) -> [u8; 7] {
+    glyph(c)
+}
+
+/// One pixel of `format` in any colour (red, green, blue from 0 to 1).
+pub(crate) fn colour(format: DXGI_FORMAT, (r, g, b): (f32, f32, f32), out: &mut [u8]) {
+    paint(format, (r, g, b), out);
+}
+
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
-fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
+pub(crate) fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
     match format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
         DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
@@ -75,7 +85,11 @@ fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
 /// One pixel of `format`: of the text (`lit`) or of the box behind it.
 fn pixel(format: DXGI_FORMAT, lit: bool, out: &mut [u8]) {
     // The text: a bright yellow. The box: nearly black.
-    let (r, g, b): (f32, f32, f32) = if lit { (1.0, 0.92, 0.16) } else { (0.03, 0.03, 0.03) };
+    paint(format, if lit { (1.0, 0.92, 0.16) } else { (0.03, 0.03, 0.03) }, out);
+}
+
+/// One pixel of `format` in the colour given.
+fn paint(format: DXGI_FORMAT, (r, g, b): (f32, f32, f32), out: &mut [u8]) {
     let byte = |v: f32| (v * 255.0).round() as u8;
     match format {
         DXGI_FORMAT_R8G8B8A8_UNORM => out.copy_from_slice(&[byte(r), byte(g), byte(b), 255]),

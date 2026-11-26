@@ -665,6 +665,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    if ms > 0.0 {
+        crate::kitty::card_busy(100.0 * (1.0 - idle / ms));
+    }
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -8968,6 +8971,20 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        crate::kitty::measured(crate::kitty::Measured {
+            fps,
+            ms,
+            preparing: cpu,
+            copy_ms,
+            copy_mb,
+            back_ms,
+            back_mb,
+            waiting: gpu,
+            heap_ms: picked_ms,
+            draws,
+            dropped,
+            making: crate::pipeline::making() as f64,
+        });
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9233,7 +9250,9 @@ impl Host {
             list.CopyResource(&back, texture);
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            if !crate::kitty::draw(self, list, &back, (width, height, format)) {
+                crate::fpsbox::draw(self, list, &back, (width, height, format));
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

@@ -34,6 +34,7 @@ pub mod device;
 mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
+mod kitty;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
