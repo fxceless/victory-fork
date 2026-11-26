@@ -23,7 +23,14 @@ impl Source<'_> {
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
-            Source::Packed(r) => r.unpack().map(Cow::Owned),
+            Source::Packed(record) => {
+                let mut bytes = record.unpack()?;
+                // The unpacked record can extend past the DXBC container.
+                if let Ok(container) = Container::parse(&bytes) {
+                    bytes.truncate(container.as_bytes().len());
+                }
+                Some(Cow::Owned(bytes))
+            }
         }
     }
 
@@ -42,12 +49,13 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let container = Container::parse(&data[offset..]).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: container.as_bytes(),
+        })
+    });
     out.extend(raw);
     out
 }

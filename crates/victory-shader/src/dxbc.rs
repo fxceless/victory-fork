@@ -59,6 +59,7 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
+    bytes: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -103,7 +104,13 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
+            bytes: data,
         })
+    }
+
+    /// The bytes within this container's declared length.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
