@@ -697,6 +697,29 @@ impl HostPipeline {
                 },
             )
         };
+        // Only called on failure: no env check or counting on successful creations.
+        let trace_failure = |error: &windows::core::Error,
+                             nodemsk: u32,
+                             flags: i32,
+                             cs_len: usize| {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*TRACE
+                .get_or_init(|| std::env::var_os("VICTORY_TRACE_PSO").is_some_and(|v| v == "1"))
+            {
+                return;
+            }
+            tracing::warn!(
+                kind = if compute.is_some() { "compute" } else { "graphics" },
+                shader = %stages[0].0.hash, ?shaders, rootsig_params = params.len(),
+                // Includes one-view tables; excludes dynamically indexed heap contents.
+                descriptors = "root_bindings",
+                uav = bound.iter().map(|s| s.root_uavs.len()).sum::<usize>(),
+                srv = bound.iter().map(|s| s.root_srvs.len()).sum::<usize>(),
+                cbv = bound.iter().map(|s| s.root_cbvs.len()).sum::<usize>(),
+                nodemsk, flags, cs_len, hresult = format_args!("0x{:08x}", error.code().0 as u32),
+                "host PSO creation failed"
+            );
+        };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -715,6 +738,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    trace_failure(&e, desc.NodeMask, desc.Flags.0, desc.CS.BytecodeLength);
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -768,6 +792,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    trace_failure(&e, 0, 0, 0); // Stream omits NodeMask and Flags.
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -864,6 +889,7 @@ impl HostPipeline {
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
+            trace_failure(made.as_ref().unwrap_err(), desc.NodeMask, desc.Flags.0, 0);
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
@@ -874,6 +900,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                trace_failure(&e, desc.NodeMask, desc.Flags.0, 0);
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;

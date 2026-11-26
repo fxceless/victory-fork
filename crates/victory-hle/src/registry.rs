@@ -46,7 +46,12 @@ macro_rules! hle_export {
     };
 }
 
-static REGISTRY: LazyLock<Vec<HleModule>> = LazyLock::new(modules::all);
+static REGISTRY: LazyLock<Vec<HleModule>> = LazyLock::new(|| {
+    let mut modules = modules::all();
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    crate::trace::install(&mut modules);
+    modules
+});
 
 /// All modules we implement.
 pub fn registry() -> &'static [HleModule] {

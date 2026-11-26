@@ -446,11 +446,19 @@ fn scheduler() -> Option<&'static Scheduler> {
         .as_ref()?;
     STARTED.call_once(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        let worker = if *TRACE
+            .get_or_init(|| std::env::var_os("VICTORY_TRACE_READS").is_some_and(|v| v == "1"))
+        {
+            work::<true>
+        } else {
+            work::<false>
+        };
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || worker(scheduler))
                     .is_ok()
             })
             .count();
@@ -512,7 +520,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 }
 
 /// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn work<const TRACE: bool>(scheduler: &'static Scheduler) {
     // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
     // title's threads (`victory_gpu::framelog::keep_on_slow_cores`; off by
     // default until it is measured).
@@ -531,7 +539,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute::<TRACE>(&job.request);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -988,7 +996,7 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute<const TRACE: bool>(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1028,17 +1036,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
         return into_destination(request, size, |out| {
             if !bounce {
-                return read_into(request, out).map(|()| size);
+                return read_into::<TRACE>(request, out).map(|()| size);
             }
             let mut data = vec![0; size];
-            read_into(request, &mut data)?;
+            read_into::<TRACE>(request, &mut data)?;
             out.copy_from_slice(&data);
             Ok(size)
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source::<TRACE>(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1152,26 +1160,50 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source<const TRACE: bool>(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
+        if TRACE {
+            trace_read(request, bytes);
+        }
         return Ok(Cow::Borrowed(bytes));
     }
     let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    read_into::<TRACE>(request, &mut bytes)?;
     Ok(Cow::Owned(bytes))
+}
+
+/// The only payload observation: four bytes, when available, at offset zero.
+fn trace_read(request: &Request, bytes: &[u8]) {
+    let prefix = if request.offset == 0 {
+        bytes
+            .get(..4)
+            .map(|b| format!("{:08x}", u32::from_be_bytes(b.try_into().unwrap())))
+    } else {
+        None
+    };
+    tracing::info!(
+        off = request.offset,
+        len = request.source_size,
+        got = bytes.len(),
+        prefix,
+        "dstorage read"
+    );
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
 /// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+fn read_into<const TRACE: bool>(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        if TRACE {
+            trace_read(request, out);
+        }
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1190,6 +1222,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
             Err(error) => break Err(from_win32(&error)),
         }
     };
+    if TRACE {
+        trace_read(request, &out[..done]);
+    }
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }

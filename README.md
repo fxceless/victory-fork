@@ -817,7 +817,18 @@ info and above).
 
 ## Debugging
 
-A release build has no debugging aids. Build them in with
+Release builds support these opt-in traces (unset or values other than `1` disable them):
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_TRACE_HLE=1` | export names; CreateFileW/GetFileAttributesW paths; ReadFile want/got counts (`unknown` if unavailable), never buffer contents |
+| `VICTORY_TRACE_READS=1` | DirectStorage off/len/got counts; exactly four leading bytes in hex only at offset zero when available |
+| `VICTORY_TRACE_PSO=1` | failed PSO metadata, including root bindings (not bindless heap contents), never shader bytes |
+
+All three are cached once. Disabled HLE calls retain their original addresses;
+storage workers omit tracing at compile time; PSO tracing is checked only on failure.
+
+Build additional debugging aids with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe

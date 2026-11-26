@@ -15,6 +15,8 @@ mod host;
 pub mod modules;
 mod registry;
 pub mod runtime;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod trace;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
