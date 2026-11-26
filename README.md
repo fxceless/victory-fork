@@ -783,6 +783,26 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+Before the first run, translate the title's shaders into the cache (CPU
+only, about 4 minutes on 12 threads). Without it the first runs translate
+them while playing: the world stays grey or black, only 2D (credits,
+subtitles) is drawn, and the log's 5-second lines say
+`dropped N without a host pipeline (M being made)` with M in the
+thousands.
+
+```powershell
+# Take both values from a run's log ("host wave lanes ... max=",
+# "host view heaps hold N views"): the cache is keyed on them, and on
+# every translator switch (VICTORY_WAVE_WIDE, VICTORY_SHADER_OPT, ...),
+# so warm with the same ones you will run with.
+$env:VICTORY_HOST_WAVE = '32'        # NVIDIA; 64 on AMD
+$env:VICTORY_VIEW_LIMIT = '999999'   # N - 1
+target\release\victory.exe translate --warm all --jobs <logical cores>
+```
+
+The driver still builds each pipeline the first time it is drawn, so the
+second start into the world is faster than the first.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
