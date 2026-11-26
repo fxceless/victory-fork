@@ -1050,8 +1050,31 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+/// The values that hold a lane mask on some path: the masks, and every join one of whose
+/// incoming values does (directly or through other joins). A register holding a mask on one
+/// path and a number on the other (#356: `s_mov_b32 s20, vcc_lo` on one side, `5` on the
+/// other) is still the mask's bits where that path ran, so reading it as data depends on the
+/// lane layout.
+pub(super) fn mask_values(p: &Program, st: &Structured) -> HashSet<Value> {
+    let mut masks: HashSet<Value> = st.masks.keys().chain(st.highs.keys()).copied().collect();
+    let phis: Vec<_> = p.blocks.iter().flat_map(|b| &b.phis).collect();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for phi in &phis {
+            if !masks.contains(&phi.value) && phi.args.iter().any(|a| masks.contains(a)) {
+                masks.insert(phi.value);
+                grew = true;
+            }
+        }
+    }
+    masks
+}
+
+/// Whether `i` reads a lane mask as a number; `masks` is [`mask_values`] of the program.
+pub(super) fn reads_mask_as_data(st: &Structured, masks: &HashSet<Value>, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let holds_mask = |v: Value| masks.contains(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
@@ -1070,7 +1093,9 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        Operand::Scalar { code, .. } if code != NULL => {
+            i.read(Reg::S(code)).is_some_and(holds_mask)
+        }
         _ => false,
     })
 }
@@ -1258,6 +1283,7 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        let masks = mask_values(p, x.st);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1285,7 +1311,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+                    || reads_mask_as_data(x.st, &masks, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -1307,7 +1333,7 @@ impl<'a> Lower<'a> {
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
-                        || reads_mask_as_data(x.st, i)
+                        || reads_mask_as_data(x.st, &masks, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -1368,7 +1394,7 @@ impl<'a> Lower<'a> {
                             "v_writelane"
                         } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
                             "ds_(b)permute"
-                        } else if reads_mask_as_data(x.st, i) {
+                        } else if reads_mask_as_data(x.st, &masks, i) {
                             "mask as data"
                         } else {
                             continue;

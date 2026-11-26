@@ -454,19 +454,47 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
 /// keep their lanes' masks and their node numbers on one stack
 /// (`deferred_tiled:CS_LaserLightShadowRaytracing`, s46 at 0x104, 0x75c and 0x188). The
 /// mask arrives as the ballot of its lanes.
+const MASK_OR_NUMBER: [u32; 8] = [
+    0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+    0xBE94_036A, // s_mov_b32 s20, vcc_lo
+    0xBF06_8001, // s_cmp_eq_u32 s1, 0
+    0xBF85_0001, // s_cbranch_scc1 over the next
+    0xBE94_0385, // s_mov_b32 s20, 5
+    0x7E00_0214, // v_mov_b32 v0, s20
+    0x38 << 26 | 0x1C << 18,
+    0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+];
+
+/// The program above reads a lane mask as a number (on the path that kept it), so it needs
+/// the console's 32 lanes in a host wave: it declares `WaveSize(32)`. Without it, a host of
+/// 16-lane waves gave only 16 of the mask's bits (#356).
+#[test]
+fn a_lane_mask_joined_with_a_number_needs_the_consoles_wave_size() {
+    let native = native_of(&MASK_OR_NUMBER, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!(lowered.expect("lower").wave_size, Some(32));
+}
+
 #[test]
 fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
-    let words = [
-        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
-        0xBE94_036A, // s_mov_b32 s20, vcc_lo
-        0xBF06_8001, // s_cmp_eq_u32 s1, 0
-        0xBF85_0001, // s_cbranch_scc1 over the next
-        0xBE94_0385, // s_mov_b32 s20, 5
-        0x7E00_0214, // v_mov_b32 v0, s20
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
-    ];
-    let native = native_of(&words, false, 32);
+    let native = native_of(&MASK_OR_NUMBER, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
