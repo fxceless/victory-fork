@@ -1175,14 +1175,14 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut result = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0u32;
-    while !written && tries < retries {
+    while result.is_err() && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        result = super::xmem::write_physical(pages, offset, &data[..n]);
     }
-    if written {
+    let Err(error) = result else {
         if tries > 0 {
             let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
             tracing::info!(
@@ -1196,28 +1196,24 @@ fn into_destination(
         }
         // As above, after the write that succeeded.
         super::xmem::pages_written(pages, offset, n);
-        Ok(())
-    } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
-        );
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        return Ok(());
+    };
+    // Said aloud: the title never reads a request's result
+    // (it only polls for completion), so a destination left unwritten
+    // is a model or texture that silently holds whatever its pages
+    // held before.
+    let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        retries = tries,
+        given_up,
+        on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+        %error,
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
 
 /// Queues that submitted themselves, half full (diagnostics).

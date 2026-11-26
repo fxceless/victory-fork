@@ -505,6 +505,26 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     1
 }
 
+/// Why a DirectStorage write to physical pages failed.
+#[derive(Debug)]
+pub(crate) enum PhysicalWriteError {
+    PageRange,
+    UnknownPage(usize),
+    Map(std::io::Error),
+    Commit(std::io::Error),
+}
+
+impl std::fmt::Display for PhysicalWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PageRange => f.write_str("physical page range out of bounds"),
+            Self::UnknownPage(page) => write!(f, "unknown physical page {page:#x}"),
+            Self::Map(error) => write!(f, "MapViewOfFile failed: {error}"),
+            Self::Commit(error) => write!(f, "VirtualAlloc(MEM_COMMIT) failed: {error}"),
+        }
+    }
+}
+
 /// A view of our own on consecutive slices of one section, committed and
 /// writable, unmapped when dropped.
 struct View {
@@ -514,7 +534,7 @@ struct View {
 
 impl View {
     /// Maps `n` slices from `slice` on.
-    fn map(slice: &Slice, n: usize) -> Option<View> {
+    fn map(slice: &Slice, n: usize) -> Result<View, PhysicalWriteError> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
@@ -528,10 +548,11 @@ impl View {
             )
         };
         if at.Value.is_null() {
-            return None;
+            return Err(PhysicalWriteError::Map(std::io::Error::last_os_error()));
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len).map_err(PhysicalWriteError::Commit)?;
+        Ok(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -553,15 +574,25 @@ impl Drop for View {
 /// The pages behind bytes `[offset, offset + len)` of `pages` (64 KiB
 /// each), as runs of consecutive slices of one section: each run's first
 /// slice and its length in pages. One look at the page table, which the
-/// title's own mapping calls share with every DirectStorage worker. `None`
-/// if a page is unknown or `pages` ends early.
-fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
-    let end = offset.checked_add(len)?;
-    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
+/// title's own mapping calls share with every DirectStorage worker.
+fn runs(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> Result<Vec<(Slice, usize)>, PhysicalWriteError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(PhysicalWriteError::PageRange)?;
+    let pages = pages
+        .get(offset / PAGE..end.div_ceil(PAGE))
+        .ok_or(PhysicalWriteError::PageRange)?;
     let physical = physical();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
-    for page in pages {
-        let slice = physical.pages.get(page)?;
+    for &page in pages {
+        let slice = physical
+            .pages
+            .get(&page)
+            .ok_or(PhysicalWriteError::UnknownPage(page))?;
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -572,34 +603,27 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
             _ => runs.push((slice.clone(), 1)),
         }
     }
-    Some(runs)
-}
-
-/// Whether every page under `[offset, offset + len)` is known (a write that
-/// fails with them known is a host failure).
-pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
-    runs(pages, offset, len).is_some()
+    Ok(runs)
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
-pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
+pub(crate) fn write_physical(
+    pages: &[usize],
+    offset: usize,
+    data: &[u8],
+) -> Result<(), PhysicalWriteError> {
+    let runs = runs(pages, offset, data.len())?;
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
-        };
+        let mut view = View::map(slice, *n)?;
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    true
+    Ok(())
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -624,12 +648,12 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
+    let runs = runs(pages, offset, len).ok()?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: View::map(slice, *n).ok()?,
         within: offset % PAGE,
         len,
     })
@@ -828,7 +852,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if commit(base, len).is_err() {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -845,13 +869,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
+fn commit(base: usize, len: usize) -> std::io::Result<()> {
     if on_wine() {
-        return true; // sections are committed whole there
+        return Ok(()); // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-        return true;
+        return Ok(());
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
@@ -865,7 +889,7 @@ fn commit(base: usize, len: usize) -> bool {
     } else {
         tracing::warn!(len, %error, "committing physical pages failed");
     }
-    false
+    Err(error)
 }
 
 fn commit_limit_message(
@@ -1267,7 +1291,7 @@ mod tests {
             a.cast::<u8>().write(1);
         }
         // Writes into pages (DirectStorage's) show through their views.
-        assert!(write_physical(&pages[2..], 1, &[9]));
+        write_physical(&pages[2..], 1, &[9]).unwrap();
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
 
@@ -1420,7 +1444,9 @@ mod tests {
     fn runs_group_consecutive_pages_of_one_allocation() {
         let (a, b) = (allocate(3), allocate(1));
         let lengths = |pages: &[usize], offset, len| {
-            runs(pages, offset, len).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
+            runs(pages, offset, len)
+                .ok()
+                .map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
         };
         assert_eq!(lengths(&a, 0, 3 * PAGE), Some(vec![3]));
         // Only the pages the bytes reach.
@@ -1450,16 +1476,19 @@ mod tests {
         let data: Vec<u8> = (0..2 * PAGE + 64).map(|i| (i * 7 % 251) as u8).collect();
         let offset = PAGE - 32;
         // Past the third page: the second run is too short.
-        assert!(!write_physical(&pages, offset, &data));
-        assert!(write_physical(&pages, offset, &data[..2 * PAGE]));
+        assert!(matches!(
+            write_physical(&pages, offset, &data),
+            Err(PhysicalWriteError::PageRange)
+        ));
+        write_physical(&pages, offset, &data[..2 * PAGE]).unwrap();
         let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
         assert!(seen[..offset].iter().all(|&b| b == 0), "before the offset");
         assert_eq!(seen[offset..offset + 2 * PAGE], data[..2 * PAGE]);
         assert!(seen[offset + 2 * PAGE..].iter().all(|&b| b == 0), "after");
-        assert!(
-            !write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]),
-            "unknown page"
-        );
+        assert!(matches!(
+            write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]),
+            Err(PhysicalWriteError::UnknownPage(0x10))
+        ));
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
