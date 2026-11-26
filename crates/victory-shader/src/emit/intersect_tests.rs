@@ -9,10 +9,9 @@
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
 //! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! keeps copies of title memory. The reference comparisons put a stand-in
+//! under the node reader (`lower::intersect::TEST_MEMORY`). The missing-page
+//! test binds a real directory and null UAV.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -441,22 +440,27 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     (s, batches)
 }
 
+/// Write the operand VGPRs and the active flag read by one lane of `program`.
+fn record(data: &mut [u32], lane: usize, pointer: u64, ray: &Ray) {
+    let r = &mut data[lane * (RECORD / 4) as usize..][..13];
+    (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
+    r[2] = ray.extent.to_bits();
+    for a in 0..3 {
+        r[3 + a] = ray.origin[a].to_bits();
+        r[6 + a] = ray.direction[a].to_bits();
+        r[9 + a] = ray.inverse[a].to_bits();
+    }
+    r[12] = 1;
+}
+
 /// The buffer for one batch: the threads' records, then the nodes. Node
 /// pointers count from `base` before the first node, in bytes.
 fn buffer(scene: &Scene, batch: &[Case], base: u64) -> Vec<u32> {
     let mut data = vec![0u32; (NODES / 4) as usize];
     for (t, case) in batch.iter().enumerate() {
         let Some((n, kind, ray)) = case else { continue };
-        let r = &mut data[t * (RECORD / 4) as usize..][..13];
         let pointer = (base >> 3) + u64::from(scene.pointer(*n, *kind));
-        (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
-        r[2] = ray.extent.to_bits();
-        for a in 0..3 {
-            r[3 + a] = ray.origin[a].to_bits();
-            r[6 + a] = ray.direction[a].to_bits();
-            r[9 + a] = ray.inverse[a].to_bits();
-        }
-        r[12] = 1;
+        record(&mut data, t, pointer, ray);
     }
     data.extend(&scene.words);
     data
@@ -705,5 +709,116 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// The division of a box32 node at a page boundary puts its four child pointers
+/// and its first two boxes on the first page. The last two boxes are on the next.
+/// An unmapped page reads as zero through the real directory and null descriptor.
+/// A ray through the origin hits those zero bounds if they are mistaken for a box.
+#[test]
+fn boxes_with_missing_title_pages_only_return_resident_children() {
+    const PAGE: usize = 11;
+    const PAGE_BYTES: usize = 1 << 16;
+    let page_end = (PAGE + 1) * PAGE_BYTES;
+    let box32 = page_end - 64;
+    let box16 = box32 - 64;
+    let zero_box = box16 - 64;
+    let ids = [0, 0x10, 0x20, 0x30];
+    let unit = [[-1., -1., -1., 1., 1., 1.]; 4];
+    let mut copy = vec![0; (PAGE_BYTES + 64) / 4];
+    let wide = (PAGE_BYTES - 64) / 4;
+    copy[wide..wide + 28].copy_from_slice(&nodes::box32(ids, unit));
+    copy[wide - 16..wide].copy_from_slice(&nodes::box16(ids, unit)[..16]);
+
+    let mut records = vec![0; (NODES / 4) as usize];
+    let ray = Ray::new([-1.; 3], [1.; 3], 2.);
+    for (lane, (address, kind)) in [(box32, 5), (box16, 4), (zero_box, 4)]
+        .into_iter()
+        .enumerate()
+    {
+        record(&mut records, lane, (address >> 3) as u64 | kind, &ray);
+    }
+
+    // An inactive lane pointing to a different missing page must not request it.
+    records[3 * (RECORD / 4) as usize] = ((PAGE + 2) << 13) as u32 | 4;
+    let (shader, _) = build(true, WHOLE).expect("the shader reads through the title directory");
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let base = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
+        .unwrap();
+    constants[base.index as usize] = 2; // null UAV at 2 and copy 1 at 3
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("SM 6.6 adapter");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+
+    for (first, second) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut directory = vec![0; 2 * (PAGE + 3)];
+        directory[2 * PAGE] = u32::from(first);
+        directory[2 * (PAGE + 1)] = u32::from(second);
+        directory[2 * (PAGE + 1) + 1] = if second { PAGE_BYTES as u32 } else { 0 };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(constants.clone())),
+                        (1, Root::UavOutput(2)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: directory,
+                            },
+                        ),
+                    ],
+                    views: &[
+                        View::Buffer {
+                            data: &records,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                        View::NullRawUav,
+                        View::RawUavData(&copy),
+                        View::RawUav(super::MEMORY_FAULTS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let wanted_wide = if first && second {
+            ids
+        } else if first {
+            [ids[0], ids[1], bvh::NONE, bvh::NONE]
+        } else {
+            [bvh::NONE; 4]
+        };
+        assert_eq!(
+            out[0][..4],
+            wanted_wide,
+            "box32 mapped pages {first}/{second}"
+        );
+        assert_eq!(
+            out[0][4..8],
+            if first { ids } else { [bvh::NONE; 4] },
+            "box16 mapped pages {first}/{second}"
+        );
+        assert_eq!(
+            out[0][8..12],
+            if first { [0; 4] } else { [bvh::NONE; 4] },
+            "a mapped zero box is valid"
+        );
+        assert_eq!(out[0][12..16], BEFORE, "a masked lane keeps its registers");
+        assert_eq!(out[2][1 + PAGE], if first { 0 } else { PAGE as u32 });
+        assert_eq!(out[2][2 + PAGE], if second { 0 } else { (PAGE + 1) as u32 });
+        assert_eq!(out[2][3 + PAGE], 0, "no request for the inactive lane");
     }
 }

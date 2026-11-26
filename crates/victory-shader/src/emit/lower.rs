@@ -2857,6 +2857,12 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (handle, byte, _) = self.memory_page(lo, hi, guard);
+        (handle, byte)
+    }
+
+    /// As `memory`, also giving whether this page's directory entry has no copy.
+    fn memory_page(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2890,17 +2896,18 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
-        if let Some(g) = guard {
-            missing = self.s.m.bin(c, Bin::And, missing, g);
-        }
+        let missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let fault = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, missing, g),
+            None => missing,
+        };
         let places = k(self, MEMORY_FAULTS - 1);
         let place = self.s.m.bin(c, Bin::URem, page, places);
         let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let place = self.s.m.select(c, fault, place, zero);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
@@ -2918,7 +2925,7 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (h, byte, missing)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
