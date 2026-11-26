@@ -3595,8 +3595,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if size == 0 || address == 0 {
+                return None; // null CBV, via the typed fallback
+            }
+            let bytes = constant_view_size(size);
+            // Keep the existing shadow identity for persistent heap views;
+            // other users of that view can address the full title buffer.
+            address.checked_add(u64::from(size))?;
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            // SAFETY: the retained shadow owns a live D3D12 buffer.
+            let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+            let width = unsafe { shadow.buffer.GetDesc() }.Width;
+            if gpu.checked_sub(base)?.checked_add(u64::from(bytes))? > width {
+                once!(address, size, "constant buffer view extends beyond its host buffer");
+                return None;
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -3606,7 +3620,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_view_size(size),
+                SizeInBytes: bytes,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };

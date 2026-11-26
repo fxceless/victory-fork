@@ -1091,6 +1091,28 @@ pub(crate) fn dispatched() -> u64 {
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
+/// Payload and aligned scratch size of a conventional D3D12 CBV.
+fn scratch_constant_range(address: u64, size: u32) -> Option<(u32, u32)> {
+    let payload = size.min(65_536);
+    if payload == 0 || address == 0 {
+        return None;
+    }
+    address.checked_add(u64::from(payload))?;
+    Some((payload, payload.next_multiple_of(256)))
+}
+
+#[cfg(test)]
+#[test]
+fn scratch_constant_range_is_bounded_and_aligned() {
+    assert_eq!(scratch_constant_range(0x1010, 16), Some((16, 256)));
+    assert_eq!(scratch_constant_range(0x1010, 257), Some((257, 512)));
+    assert_eq!(scratch_constant_range(0x1010, 1_980_160), Some((65_536, 65_536)));
+    assert_eq!(scratch_constant_range(0x1010, u32::MAX), Some((65_536, 65_536)));
+    assert_eq!(scratch_constant_range(0x1010, 0), None);
+    assert_eq!(scratch_constant_range(0, 256), None);
+    assert_eq!(scratch_constant_range(u64::MAX - 15, 16), None);
+}
+
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB
 /// (cut at their buffer's end), other views as all that is left of their
 /// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
@@ -4055,11 +4077,17 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                        let Some((payload, rounded)) = scratch_constant_range(address, size) else {
+                            host.constant_at(index, 0, 0);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        let Some((gpu, to)) = list.scratch(u64::from(rounded)) else {
+                            host.constant_at(index, 0, 0);
+                            continue;
+                        };
+                        // SAFETY: the list owns the aligned scratch allocation.
+                        unsafe { to.add(payload as usize).write_bytes(0, (rounded - payload) as usize) };
+                        list.defer_fill(to, address as *const u8, payload as usize);
                         host.constant_at(index, gpu, size);
                         #[cfg(feature = "diagnostics")]
                         {
