@@ -96,20 +96,53 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let storage_mb = get("Game/PersistentLocalStorage/SizeMB")
+            .and_then(|v| v.parse::<u64>().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1 << 20),
         }
     }
 
     /// Where game saves live: next to persistent local storage, under the
-    /// data directory, never the cache.
+    /// data directory, never the cache. Empty when storage is unset.
     pub fn saves(&self) -> PathBuf {
+        if self.storage.as_os_str().is_empty() {
+            return PathBuf::new();
+        }
         self.storage.with_file_name("saves")
     }
+}
+
+/// Byte offset immediately after the closing `>` of the tag starting at `rest`,
+/// ignoring `>` inside single- or double-quoted attribute values.
+fn find_tag_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut quote = None;
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i + 1),
+            None => {}
+        }
+    }
+    None
+}
+
+fn decode_entities(text: &str) -> String {
+    [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&amp;", "&"),
+    ]
+    .iter()
+    .fold(text.to_owned(), |b, (entity, c)| b.replace(entity, c))
 }
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
@@ -117,17 +150,21 @@ impl Title {
 /// decoded; comments, CDATA sections, declarations and attributes are
 /// skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut path: Vec<&str> = Vec::new();
+    let mut open_entry: Option<usize> = None;
     let mut rest = text;
     while let Some(open) = rest.find('<') {
+        if let Some(idx) = open_entry {
+            out[idx].1.push_str(&rest[..open]);
+        }
         rest = &rest[open..];
         let end = if rest.starts_with("<!--") {
             rest.find("-->").map(|e| e + 3)
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            find_tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -136,26 +173,34 @@ fn elements(text: &str) -> Vec<(String, String)> {
             continue;
         }
         if let Some(name) = tag.strip_prefix('/') {
+            open_entry = None;
             if let Some(at) = path.iter().rposition(|n| *n == name.trim()) {
                 path.truncate(at);
             }
             continue;
         }
-        let closed = tag.ends_with('/');
-        let name = tag
+        let trimmed = tag.trim_end();
+        let closed = trimmed.ends_with('/');
+        let name = trimmed
             .trim_end_matches('/')
             .split_whitespace()
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
-        out.push((path.join("/"), body));
+        let idx = out.len();
+        out.push((path.join("/"), String::new()));
         if closed {
             path.pop();
+            open_entry = None;
+        } else {
+            open_entry = Some(idx);
         }
+    }
+    if let Some(idx) = open_entry {
+        out[idx].1.push_str(rest);
+    }
+    for (_, body) in &mut out {
+        *body = decode_entities(body.trim());
     }
     out
 }
@@ -232,5 +277,28 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn manifest_handles_quoted_gt_inline_comments_overflow_and_unset_saves() {
+        let text = "<Game configVersion=\"1\">\
+                    <Identity Name=\"a>b\"/>\
+                    <TitleId><!-- inline -->639A<!-- mid -->A8DD</TitleId>\
+                    <StoreId>9<!-- c -->&amp;C</StoreId>\
+                    <PersistentLocalStorage><SizeMB>17592186044416</SizeMB></PersistentLocalStorage>\
+                    </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        // 1 << 44 MB overflows u64 when shifted by 20; saturates instead of wrapping to 0.
+        assert_eq!(t.storage_bytes, u64::MAX);
+        // Unset storage yields an empty saves path instead of relative "saves" in CWD.
+        assert!(t.saves().as_os_str().is_empty());
+        assert!(Title::default().saves().as_os_str().is_empty());
+        let configured = Title {
+            storage: PathBuf::from("data/title/storage"),
+            ..t
+        };
+        assert_eq!(configured.saves(), PathBuf::from("data/title/saves"));
     }
 }

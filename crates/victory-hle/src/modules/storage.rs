@@ -87,18 +87,50 @@ pub struct SpaceInfo {
     pub total: u64,
 }
 
+/// Recursion cap so deep directory trees cannot exhaust the stack.
+const MAX_DIR_DEPTH: usize = 64;
+
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_path: &Path) -> bool {
+    false
+}
+
 fn used_bytes(dir: &Path) -> u64 {
+    used_bytes_inner(dir, 0)
+}
+
+fn used_bytes_inner(dir: &Path, depth: usize) -> u64 {
+    if depth >= MAX_DIR_DEPTH {
+        return 0;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    entries.flatten().fold(0u64, |acc, e| {
+        let Ok(ft) = e.file_type() else {
+            return acc;
+        };
+        let path = e.path();
+        if ft.is_symlink() || is_reparse_point(&path) {
+            return acc;
+        }
+        let bytes = if ft.is_dir() {
+            used_bytes_inner(&path, depth + 1)
+        } else if ft.is_file() {
+            e.metadata().map_or(0, |m| m.len())
+        } else {
+            0
+        };
+        acc.saturating_add(bytes)
+    })
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
@@ -235,6 +267,34 @@ mod tests {
             assert_eq!(prompt(this, bytes, &mut block), S_OK);
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
+        }
+    }
+
+    #[test]
+    fn used_bytes_walks_nested_dirs_and_skips_reparse_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("nested");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join("a.bin"), [1u8; 40]).unwrap();
+        std::fs::write(sub.join("b.bin"), [2u8; 60]).unwrap();
+        assert_eq!(used_bytes(dir.path()), 100);
+        // Depth limit stops traversal without recursing further.
+        assert_eq!(used_bytes_inner(dir.path(), MAX_DIR_DEPTH), 0);
+
+        // On Windows, a directory junction back to the root creates a cycle
+        // without requiring elevated privileges; `used_bytes` must skip it.
+        #[cfg(windows)]
+        {
+            let link = sub.join("loop");
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(dir.path())
+                .status();
+            if status.is_ok_and(|s| s.success()) {
+                assert_eq!(used_bytes(dir.path()), 100);
+                let _ = std::fs::remove_dir(&link);
+            }
         }
     }
 }
