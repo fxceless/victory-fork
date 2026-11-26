@@ -1494,8 +1494,41 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    let ok = map_batches(remap_batch(), batches.unwrap_or(&[]), pool, pool_pages, map);
+    if !ok {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+    }
+    S_OK
+}
+
+/// Whether one call's page mappings hold title memory still once, for all
+/// of them (`VICTORY_REMAP_BATCH=1`; off by default).
+///
+/// The runtime maps page by page (`map_alias`), and each page took the
+/// lock that keeps reads of title memory in place from meeting a change of
+/// mapping (`crate::watch::title_memory_remapping`) on its own: about 850
+/// takings a frame while the world streams in (README), each one waiting
+/// until every read in place under way is done (a texture refresh holds it
+/// for its hash and detile: `crate::texture`). With the switch the call
+/// takes it once, before its first page, and each page finds it held by
+/// its own thread: the title waits for the readers once a call. Readers
+/// wait for the whole batch instead (a refresh with
+/// `VICTORY_TEXTURE_NO_WAIT=1` reads through the kernel meanwhile). The
+/// frame log's `RemapWaitUs` then counts that one wait, and `RemapUs` the
+/// whole batch.
+fn remap_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// Maps `batches` with `map` (`(to, from, len)`, `from` 0 unmaps), as
+/// [`copy_page_mappings`] does; with `hold`, title memory held still once
+/// around all of them ([`remap_batch`]). False if a mapping failed.
+fn map_batches(hold: bool, batches: &[PageBatch], pool: u64, pool_pages: u32, map: impl Fn(u64, u64, u64) -> bool) -> bool {
+    let _held = hold.then(crate::watch::title_memory_remapping);
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
+    for b in batches {
         if b.ranges.is_null() {
             continue;
         }
@@ -1516,11 +1549,7 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
-    if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
-    }
-    S_OK
+    ok
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1673,5 +1702,120 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{PAGE, PageBatch, PageRange, map_batches};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The pool pages a batch of each kind of range maps, in order, and
+    /// that no read of title memory in place can begin in the middle of
+    /// the batch (held once with `hold`, or by each page's own taking);
+    /// each page takes the lock itself, as the runtime's `map_alias` does,
+    /// and with `hold` finds it held by its own thread without waiting.
+    #[test]
+    fn a_batch_maps_the_same_pages_held_once_or_page_by_page() {
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 3 }, // pool pages 2..5
+            PageRange { kind: 1, start: 7, count: 2 }, // pool page 7, twice
+            PageRange { kind: 2, start: 0, count: 1 }, // unmapped
+            PageRange { kind: 3, start: 0, count: 4 }, // left alone
+            PageRange { kind: 0, start: 9, count: 1 },
+        ];
+        let (dest, pool) = (0x10_0000_0000u64, 0x20_0000_0000u64);
+        let batches = [PageBatch { destination: dest, count: ranges.len() as u32, ranges: ranges.as_ptr() }];
+        let expected = vec![
+            (dest, pool + 2 * PAGE, 3 * PAGE),
+            (dest + 3 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 4 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 5 * PAGE, 0, PAGE),
+            (dest + 10 * PAGE, pool + 9 * PAGE, PAGE),
+        ];
+        // Page by page again last: a hold that left this thread counted as
+        // holding would let the pages of that run go unlocked, and a read
+        // begin in the middle (the assertion below).
+        for hold in [false, true, false] {
+            let seen = Mutex::new(Vec::new());
+            let map = |to, from, len| {
+                let _changing = crate::watch::title_memory_remapping();
+                // Nobody reads in place while a page changes.
+                assert!(crate::watch::title_memory_reading_now().is_none(), "a read began during a remap");
+                seen.lock().unwrap().push((to, from, len));
+                true
+            };
+            assert!(map_batches(hold, &batches, pool, 16, map));
+            assert_eq!(*seen.lock().unwrap(), expected, "hold {hold}");
+        }
+        // A source past the pool fails, as before.
+        let bad = [PageRange { kind: 0, start: 15, count: 2 }];
+        let batches = [PageBatch { destination: dest, count: 1, ranges: bad.as_ptr() }];
+        assert!(!map_batches(true, &batches, pool, 16, |_, _, _| true));
+    }
+
+    fn spin(us: u64) {
+        let until = Instant::now() + Duration::from_micros(us);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// What one call of 850 one-page mappings costs the title's thread while
+    /// two threads refresh textures (each holding title memory still for
+    /// `hold_us`, then letting go for 50 us): page by page, as today, and
+    /// held once (`VICTORY_REMAP_BATCH=1`); with the hold of a refresh today
+    /// (hash and detile, ~2 ms for a 5 MB texture on an i5-12400F) and with
+    /// `VICTORY_TEXTURE_SHORT_HOLD=1` (the copy, ~0.3 ms). Each mapping
+    /// works 5 us, about the kernel calls of one remap. Ignored by default:
+    ///   cargo test --release -p victory-gpu --lib batch_tests -- --ignored --nocapture
+    #[test]
+    #[ignore = "a measurement: run by hand"]
+    fn what_a_batch_of_page_mappings_waits_for_beside_texture_refreshes() {
+        const PAGES: u32 = 850;
+        // One range a page, as the title's streamed pages come.
+        let ranges: Vec<PageRange> = (0..PAGES).map(|i| PageRange { kind: 0, start: i, count: 1 }).collect();
+        let batches = [PageBatch { destination: 0x10_0000_0000, count: PAGES, ranges: ranges.as_ptr() }];
+        let map = |_, _, _| {
+            let _changing = crate::watch::title_memory_remapping();
+            spin(5);
+            true
+        };
+        println!();
+        println!("{:<28} {:>14} {:>14} {:>9}", "texture refreshes hold", "page by page", "held once", "faster");
+        for (what, hold_us) in [("~2 ms (today)", 2_000u64), ("~0.3 ms (SHORT_HOLD)", 300)] {
+            let mut row = Vec::new();
+            for once in [false, true] {
+                let stop = AtomicBool::new(false);
+                let total = std::thread::scope(|s| {
+                    for _ in 0..2 {
+                        s.spawn(|| {
+                            while !stop.load(Ordering::Relaxed) {
+                                {
+                                    let _reading = crate::watch::title_memory_reading();
+                                    spin(hold_us);
+                                }
+                                spin(50);
+                            }
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        let t = Instant::now();
+                        assert!(map_batches(once, &batches, 0x20_0000_0000, PAGES, map));
+                        times.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    times.sort_by(f64::total_cmp);
+                    times[times.len() / 2]
+                });
+                row.push(total);
+            }
+            println!("{what:<28} {:>11.1} ms {:>11.1} ms {:>8.1}x", row[0], row[1], row[0] / row[1]);
+            println!("RESULT hold_us={hold_us} page_by_page_ms={:.1} held_once_ms={:.1}", row[0], row[1]);
+        }
     }
 }

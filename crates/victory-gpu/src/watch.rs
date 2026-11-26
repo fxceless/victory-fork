@@ -1712,13 +1712,28 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+/// ([`title_memory_remapping`]): the lock, or nothing when this thread
+/// already held it.
+pub struct Remapping(#[allow(dead_code)] Option<std::sync::RwLockWriteGuard<'static, ()>>, std::time::Instant);
+
+thread_local! {
+    /// How many [`Remapping`]s this thread holds. A thread that holds the
+    /// lock for a whole batch of page mappings (`queue::copy_page_mappings`
+    /// with `VICTORY_REMAP_BATCH=1`) asks for it again for each page (the
+    /// runtime's `map_alias`), and must not wait for itself: before, no
+    /// thread ever asked twice (the lock is not reentrant, and that would
+    /// have hung).
+    static REMAPPING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        REMAPPING.with(|d| d.set(d.get().saturating_sub(1)));
+        // From asking for the lock until it is let go (the frame log); the
+        // outermost holder alone, so a batch is counted once.
+        if self.0.is_some() {
+            crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -1728,10 +1743,17 @@ impl Drop for Remapping {
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
     let asked = std::time::Instant::now();
-    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
+    // Held already by this thread (a batch of page mappings): nothing to
+    // wait for.
+    if REMAPPING.with(|d| d.get()) > 0 {
+        REMAPPING.with(|d| d.set(d.get() + 1));
+        return Remapping(None, asked);
+    }
+    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    REMAPPING.with(|d| d.set(d.get() + 1));
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    Remapping(Some(held), asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
