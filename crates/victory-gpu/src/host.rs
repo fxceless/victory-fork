@@ -239,6 +239,60 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// [`bury`] for the thread that lands flights (`Host::relay_land`), with
+/// `VICTORY_BURY_ASIDE=1` (off by default: [`bury`], as before): what is
+/// done with is taken out of [`RETIRED`] where it lies, the others staying
+/// in place (the partition in [`bury`] moves every one of them at each
+/// landing), and dropped on a thread of its own (`victory-bury`), not in
+/// the landing. Dropping later is always allowed: these objects only wait
+/// for the card. In the tree this comes from the partition was 0.9 ms a
+/// frame of the landing thread and releasing the objects 2 ms.
+fn bury_aside(finished: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1")) {
+        bury(finished);
+        return;
+    }
+    let done = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut done = Vec::new();
+        let mut i = 0;
+        while i < retired.len() {
+            if retired[i].0 <= finished {
+                done.push(retired.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        done
+    };
+    if done.is_empty() {
+        return;
+    }
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            // (No thread to take them: dropped here.)
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -2989,7 +3043,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3007,7 +3061,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3060,6 +3114,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+///
+/// `VICTORY_FILL_HOT=1` (off by default): only reads of the 64 KiB pieces of
+/// title memory in which that happened wait from then on (`HOT`); the
+/// others go on reading ahead, and are checked as before.
 mod fill_ahead {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -3072,8 +3130,29 @@ mod fill_ahead {
     /// every present that waits).
     const KEEP: u64 = 16;
 
-    /// A flight changed bytes a fill had read ahead of it: fills wait.
+    /// A flight changed bytes a fill had read ahead of it, without
+    /// `VICTORY_FILL_HOT=1`: every fill waits.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// With `VICTORY_FILL_HOT=1`: the 64 KiB pieces of title memory in which
+    /// a flight changed bytes a fill had read ahead of it. Fills and copies
+    /// that read them wait for the flights; the others go on reading ahead.
+    /// (Without the switch the first such fill turns the waiting on for
+    /// every fill. In the tree this comes from, in the title's opening
+    /// scene, that was one fill of 2,048 bytes of a small buffer shaders do
+    /// write each frame; from then on two fills a frame waited 54 ms for
+    /// flights, 1,229 of them looked at, each of 480 bytes of per-draw
+    /// constants elsewhere, and after the wait their bytes were the same
+    /// 1,229 times.)
+    static HOT: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// How many pieces `HOT` holds (read without the lock).
+    static HOT_PIECES: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the waiting is told apart by piece (`VICTORY_FILL_HOT=1`;
+    /// off by default).
+    fn by_piece() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_HOT").is_some_and(|v| v == "1"))
+    }
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -3102,9 +3181,25 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
+    fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    }
+
+    /// Whether a read of `len` bytes at `src` that flights may write goes
+    /// ahead of them: fills do not wait, and no flight was seen to change
+    /// bytes read ahead in the 64 KiB pieces it reads (`HOT`, which is
+    /// empty without `VICTORY_FILL_HOT=1`).
+    pub(super) fn ahead(src: usize, len: usize) -> bool {
+        if !on() {
+            return false;
+        }
+        if len == 0 || HOT_PIECES.load(Relaxed) == 0 {
+            return true;
+        }
+        let hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(hot) = hot.as_ref() else { return true };
+        !(src / PIECE..=(src + len - 1) / PIECE).any(|piece| hot.contains(&piece))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3162,6 +3257,25 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if by_piece() {
+                // Only reads of the pieces this fill read wait from here on.
+                let fresh = {
+                    let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+                    let hot = hot.get_or_insert_with(Default::default);
+                    let before = hot.len();
+                    hot.extend(from / PIECE..=(to - 1) / PIECE);
+                    HOT_PIECES.store(hot.len() as u64, Relaxed);
+                    hot.len() - before
+                };
+                if fresh > 0 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders                          changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the                          bytes from before. Reads of that 64 KiB of title memory wait for flights from here on                          (VICTORY_FILL_HOT=1; without it every fill would wait; {n} such fills)",
+                        to - from,
+                        a + first
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -3199,7 +3313,13 @@ mod fill_ahead {
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
-            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
+            if WAIT.load(Relaxed) {
+                " (fills wait again)".to_owned()
+            } else if by_piece() {
+                format!(" ({} pieces of 64 KiB whose reads wait, VICTORY_FILL_HOT=1)", HOT_PIECES.load(Relaxed))
+            } else {
+                String::new()
+            }
         );
     }
 }
@@ -5499,7 +5619,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_aside(last);
         }
         self.log_messages();
         fill_ahead::landing(0);

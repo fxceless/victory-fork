@@ -4067,26 +4067,45 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Everything that changes it, and [`lookup`] without its cache, takes it
+/// exclusive ([`buffers`]), as when it was a mutex; with
+/// `VICTORY_SHADOW_CACHE=1` [`lookup`] reads it shared for the ask whose
+/// buffer has its copy already.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+/// Counts the changes to [`BUFFERS`] that can change what [`lookup`] answers
+/// for an ask it answered from a buffer's copy before: a buffer added or
+/// taken out, a copy taken away. Bumped under the exclusive lock, after
+/// the change. (A copy made where there was none changes no such answer:
+/// [`lookup`] remembers only answers that were a copy.)
+static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_changed() {
+    BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    buffers_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    map.remove(&(start, resource));
+    buffers_changed();
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4125,6 +4144,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
                 gone.extend(entry.shadow.take());
             }
         }
+        buffers_changed();
     }
     let n = gone.len() as u64;
     for shadow in gone {
@@ -4175,16 +4195,106 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// The buffer an ask of `[address, end)` takes: of the 64 that start
+/// highest at or below `address`, the first that reaches `end`.
+fn buffer_for(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
+}
+
+/// Whether [`lookup`] remembers, per thread, the copies it answered asks
+/// with ([`answered`]), and reads the table shared for the others whose
+/// buffer has its copy (`VICTORY_SHADOW_CACHE=1`; off by default: every
+/// ask takes the table exclusive and looks in it, as before).
+///
+/// Every view of every draw asks, on every recording thread. In the tree
+/// this comes from the table's mutex was 32 ms a frame of those threads,
+/// 15 of them waiting for one another.
+fn lookup_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// An answer [`lookup`] gave from a buffer's copy: the ask, the count of
+/// [`BUFFERS_CHANGED`] it was given at, and the copy (weak: a remembered
+/// answer holds nothing, so a copy goes when it went before).
+struct Answer {
+    address: u64,
+    end: u64,
+    changes: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+/// Answers remembered per thread, by ask.
+const ANSWERS: usize = 512;
+
+thread_local! {
+    static ANSWERED: std::cell::RefCell<Vec<Option<Answer>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Where an ask is remembered.
+fn answer_slot(address: u64, end: u64) -> usize {
+    let h = (address ^ end.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> 40) as usize % ANSWERS
+}
+
+/// The copy [`lookup`] answered `[address, end)` with on this thread, if
+/// [`BUFFERS`] has not changed since in a way that could change the answer
+/// and the copy is still there. It is then the answer the table gives:
+/// what the table answers depends on the buffers in it and on which have a
+/// copy, and only [`BUFFERS_CHANGED`]'s changes take a copy away or change
+/// which buffer an ask takes.
+fn answered(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let changes = BUFFERS_CHANGED.load(Ordering::Acquire);
+    ANSWERED.with(|a| {
+        let a = a.borrow();
+        let hit = a.get(answer_slot(address, end))?.as_ref()?;
+        (hit.changes == changes && hit.address == address && hit.end == end).then(|| hit.shadow.upgrade()).flatten()
+    })
+}
+
+fn remember(address: u64, end: u64, changes: u64, shadow: &Arc<Shadow>) {
+    ANSWERED.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.is_empty() {
+            a.resize_with(ANSWERS, || None);
+        }
+        a[answer_slot(address, end)] = Some(Answer { address, end, changes, shadow: Arc::downgrade(shadow) });
+    });
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    lookup_as(address, len, any, lookup_cache())
+}
+
+/// [`lookup`], with its cache ([`lookup_cache`]) or without.
+fn lookup_as(address: u64, len: u64, any: bool, cache: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if cache {
+        if let Some(shadow) = answered(address, end) {
+            return Some(shadow);
+        }
+        // Shared, for the ask whose buffer has its copy already (all but
+        // the first ask of each buffer).
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        // (Changed only under the exclusive lock.)
+        let changes = BUFFERS_CHANGED.load(Ordering::Acquire);
+        match buffer_for(&map, address, end) {
+            None => {
+                drop(map);
+                return loose(address, end, len <= 1, any);
+            }
+            Some(key) => {
+                if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.clone()) {
+                    remember(address, end, changes, &shadow);
+                    return Some(shadow);
+                }
+            }
+        }
+        // The copy is to be made: exclusive, and looked for again below
+        // (the table may have changed between the locks).
+    }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let Some(key) = buffer_for(&map, address, end) else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
@@ -4790,4 +4900,44 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{lookup_as, register, unregister};
+    use std::sync::Arc;
+
+    /// The answers a thread remembers (`VICTORY_SHADOW_CACHE=1`) are the
+    /// table's: the same copy while the table stands, the inner buffer once
+    /// one is added, the outer one again when it goes, and not the copy of
+    /// a buffer taken out.
+    #[test]
+    fn remembered_answers_follow_the_table() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let find = |address: u64, len: u64| lookup_as(address, len, false, true);
+        const LEN: usize = 1 << 16;
+        // SAFETY: a plain allocation of our own.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let at = memory as u64;
+        let (outer, inner) = (0x71_0001usize, 0x71_0002usize);
+        register(outer, at, LEN as u64);
+        let one = find(at + 0x100, 0x40).expect("a host copy");
+        for _ in 0..3 {
+            assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &one));
+        }
+        register(inner, at + 0x100, 0x100);
+        let two = find(at + 0x100, 0x40).expect("the inner buffer's copy");
+        assert!(!Arc::ptr_eq(&two, &one), "the inner buffer, added since");
+        assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &two));
+        unregister(inner, at + 0x100);
+        assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &one), "the outer again");
+        unregister(outer, at);
+        assert!(find(at + 0x100, 0x40).is_none_or(|s| !Arc::ptr_eq(&s, &one)), "not the copy of a buffer gone");
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
 }

@@ -94,6 +94,20 @@ numbers are estimates until a run carries them.**
   frame-rate change (those passes cost under 1 ms of card time a frame on the test machine).
   Whether shadowed areas come out lit by the sky instead of black is not known until it runs.
   Also pull request #1141 (`VICTORY_WAVE_WIDE=last`, opt-in).
+- **`VICTORY_FILL_HOT=1`** (from Steenax6/VIctory-NVID `2e21055`; compiled here, not run): when a
+  flight changes bytes a fill of upload memory had read ahead of it, only reads of that 64 KiB of
+  title memory wait for flights from then on, where the first such fill made every fill wait for
+  the rest of the run. In that tree's opening scene one fill of 2,048 bytes did that, and two fills
+  a frame then waited 54 ms for flights whose bytes were the same afterwards 1,229 times of 1,229.
+- **`VICTORY_SHADOW_CACHE=1`** (from Steenax6/VIctory-NVID `2e21055`; compiled here, not run): the
+  table of title buffers is read shared by the ask whose buffer has its host copy already, and each
+  recording thread remembers the copies it was answered with until a buffer is added, taken out or
+  loses its copy. Every view of every draw asks; in that tree the table's mutex was 32 ms a frame
+  of the recording threads, 15 of them waiting for one another.
+- **`VICTORY_BURY_ASIDE=1`** (from Steenax6/VIctory-NVID `2e21055`; compiled here, not run): the
+  host objects that waited for a landed flight are released on a thread of their own, not in the
+  landing, and the ones that still wait are no longer moved at every landing. In that tree: about
+  3 ms a frame off the thread that lands flights.
 - `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
