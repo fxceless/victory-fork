@@ -48,6 +48,23 @@
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
 //! every other texture is made as before. Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
+//!
+//! Made without its top levels ([`DropPolicy`]): when the bytes of host
+//! copies of title textures pass a line under the card's budget, a large
+//! block-compressed texture with a chain of levels is made this way too
+//! (on by default, with or without levels on demand), and its most detailed
+//! level or two are never given tiles: each level left out is three
+//! quarters of what the texture would take. Every level keeps its number
+//! and size, so what a shader asks of the texture's size (`GetDimensions`,
+//! and the descriptor words rebuilt from it: `victory-shader`
+//! `descriptor_data.rs`) is what the title made. The views of such a
+//! texture keep their first level and get a `ResourceMinLODClamp` at the
+//! first level with tiles ([`shape_view`]): a sample stops there. (On the
+//! software adapter, the reference: the clamp is in the texture's levels,
+//! not the view's; a `Load` or a `Gather` of a level under it reads zeros,
+//! as a level without tiles does.) The uploads leave the levels left out
+//! alone, and [`Tiled::promote`] brings one back when the card has room
+//! again (`resource.rs` `promote_reduced`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -69,7 +86,15 @@ const HEAP_TILES: u32 = 1024;
 /// `UpdateTileMappings`; their microseconds; heaps given back to the card;
 /// uploads that left a held level without tiles (the card had no room, or
 /// no heap could be had); uploads recorded again for such a level.
-pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Then, for the textures made without their top levels ([`DropPolicy`]):
+/// (11) the bytes the textures made so far will take that no upload has
+/// given yet (counted from the making to the first upload, so that a pass
+/// that makes hundreds of textures before its list is submitted sees
+/// them); (12) such textures alive; (13) the bytes their levels left out
+/// would take; (14) such textures made in all; (15) levels brought back
+/// ([`Tiled::promote`]) in all; (16) their bytes; (17) levels left out at
+/// the making, in all.
+pub(crate) static STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
@@ -81,9 +106,34 @@ pub(crate) fn wanted() -> bool {
         if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
             return false;
         }
-        let Some(host) = host() else {
-            return false;
-        };
+        let on = card_can();
+        tracing::info!(
+            on,
+            floor_kb = floor() >> 10,
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+        );
+        on
+    })
+}
+
+/// Whether any texture was made this way so far (levels on demand, or
+/// without its top levels): a cheap test before a lock is taken.
+pub(crate) fn any_made() -> bool {
+    STATS[4].load(Ordering::Relaxed) > 0
+}
+
+/// Whether the card reads zeros from, and drops writes to, levels without
+/// memory (tiled resources tier 2): what both uses of this module need.
+pub(crate) fn card_can() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&on) = ON.get() {
+        return on;
+    }
+    // (Not settled before the host device exists.)
+    let Some(host) = host() else {
+        return false;
+    };
+    *ON.get_or_init(|| {
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
         // SAFETY: a plain query into a struct of its own size.
         let asked = unsafe {
@@ -95,12 +145,7 @@ pub(crate) fn wanted() -> bool {
         };
         let tier = options.TiledResourcesTier.0;
         let on = asked.is_ok() && tier >= 2;
-        tracing::info!(
-            tier,
-            on,
-            floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
-        );
+        tracing::info!(tier, on, "the card's tiled resources: textures can be given memory level by level");
         on
     })
 }
@@ -271,6 +316,57 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// How many of the most detailed levels are left out ([`DropPolicy`]):
+    /// they get no tiles from an upload, and the views stop above them.
+    dropped: AtomicU32,
+    /// The levels the title held at the last upload, those left out among
+    /// them, and the first level of them or of the card's own writes
+    /// (`u32::MAX`: none): where a view starts ([`Tiled::view_levels`]).
+    title_held: AtomicU32,
+    title_first: AtomicU32,
+    /// The bytes it will take that no upload has given yet: counted in
+    /// `STATS[11]` from the making to the first upload.
+    planned: AtomicU64,
+    /// When the host copy was last asked for (`crate::host::moment`): the
+    /// order in which levels left out are brought back.
+    used: AtomicU64,
+    /// What the views show ([`Tiled::view_levels`], [`Tiled::publish`]).
+    published: Mutex<Option<ViewLevels>>,
+    /// Made without levels (whether or not they came back since).
+    reduced: std::sync::atomic::AtomicBool,
+}
+
+/// Whether the views of textures made level by level follow their tiles
+/// only once the submission that gave the tiles has landed
+/// ([`Tiled::view_levels`]): `VICTORY_TILED_VIEW_PUBLISH` (on; `0`: at
+/// once, as before; the slots are then also made again by the texture
+/// pass, while submissions run, as before:
+/// `descriptor/host.rs` `levels_changed`).
+pub(crate) fn publishing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TILED_VIEW_PUBLISH").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: view changes left for their submission's landing; of
+/// them, those whose step ran with no submission in flight (it should not
+/// happen: the step runs while its submission is prepared); published at
+/// a landing, and with a change; slots made again at a moment with nothing
+/// in flight, and slots made again while submissions were in flight (the
+/// old way, `VICTORY_TILED_VIEW_PUBLISH=0`); and texture reads a list had
+/// not held the texture for before (`texture.rs` `upload`); moments taken
+/// for quiet that found submissions in flight (the slots wait for the next).
+pub(crate) static ORDER: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// What the views of a texture made this way show ([`shape_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewLevels {
+    /// The first level the title (or the card) holds: a view that starts
+    /// before it is moved there, as before.
+    pub(crate) first_held: u32,
+    /// The first of those that has tiles: samples stop there.
+    pub(crate) first_tiled: u32,
+    /// Levels left out ([`DropPolicy`]).
+    pub(crate) dropped: u32,
 }
 
 impl Tiled {
@@ -337,7 +433,182 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            dropped: AtomicU32::new(0),
+            title_held: AtomicU32::new(0),
+            title_first: AtomicU32::new(u32::MAX),
+            planned: AtomicU64::new(0),
+            used: AtomicU64::new(0),
+            published: Mutex::new(None),
+            reduced: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Leaves the `count` most detailed levels out (at the making; 0: none):
+    /// at most the levels with tiles of their own, and never all levels.
+    /// The bytes the others take are counted as planned until the first
+    /// upload (`STATS[11]`).
+    pub(crate) fn leave_out(&self, count: u32) {
+        let count = count.min(self.standard.len() as u32).min(self.levels.saturating_sub(1));
+        let before = self.dropped.swap(count, Ordering::Relaxed);
+        self.reduced.store(count > 0, Ordering::Relaxed);
+        self.count_dropped(before, count);
+        if before == 0 && count > 0 {
+            STATS[14].fetch_add(1, Ordering::Relaxed);
+            STATS[17].fetch_add(u64::from(count), Ordering::Relaxed);
+        }
+        let planned = self.full.saturating_sub(self.top_bytes(count));
+        let was = self.planned.swap(planned, Ordering::Relaxed);
+        STATS[11].fetch_add(planned, Ordering::Relaxed);
+        STATS[11].fetch_sub(was, Ordering::Relaxed);
+        // The views stop above the levels left out from the first one made.
+        self.publish();
+    }
+
+    /// The counts of textures alive without levels and the bytes left out,
+    /// from `before` to `now` levels left out.
+    fn count_dropped(&self, before: u32, now: u32) {
+        match (before > 0, now > 0) {
+            (false, true) => {
+                STATS[12].fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                STATS[12].fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        STATS[13].fetch_add(self.top_bytes(now), Ordering::Relaxed);
+        STATS[13].fetch_sub(self.top_bytes(before), Ordering::Relaxed);
+    }
+
+    /// The bytes of the tiles of the `count` most detailed levels.
+    fn top_bytes(&self, count: u32) -> u64 {
+        self.standard.iter().take(count as usize).map(|&tiles| u64::from(tiles) * TILE).sum()
+    }
+
+    /// How many of the most detailed levels are left out now.
+    pub(crate) fn dropped(&self) -> u32 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The levels left out now, a bit a level.
+    pub(crate) fn dropped_mask(&self) -> u32 {
+        let count = self.dropped();
+        if count >= 32 { u32::MAX } else { (1u32 << count) - 1 }
+    }
+
+    /// Brings back the least detailed of the levels left out, if any: from
+    /// now on uploads write it and give it tiles (when the card has room),
+    /// and the views go down to it once it has them. Returns the bytes it
+    /// will take.
+    pub(crate) fn promote(&self) -> Option<u64> {
+        let now = self.dropped.load(Ordering::Relaxed);
+        if now == 0 {
+            return None;
+        }
+        if self.dropped.compare_exchange(now, now - 1, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return None;
+        }
+        self.count_dropped(now, now - 1);
+        let bytes = u64::from(self.standard[(now - 1) as usize]) * TILE;
+        STATS[15].fetch_add(1, Ordering::Relaxed);
+        STATS[16].fetch_add(bytes, Ordering::Relaxed);
+        Some(bytes)
+    }
+
+    /// The bytes of the level a [`Tiled::promote`] would bring back (0:
+    /// none is left out).
+    pub(crate) fn promotion_bytes(&self) -> u64 {
+        match self.dropped() {
+            0 => 0,
+            now => u64::from(self.standard[(now - 1) as usize]) * TILE,
+        }
+    }
+
+    /// Notes that the host copy was asked for at `moment`.
+    pub(crate) fn touch(&self, moment: u64) {
+        self.used.store(moment, Ordering::Relaxed);
+    }
+
+    /// When the host copy was last asked for ([`Tiled::touch`]).
+    pub(crate) fn last_used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// The levels an upload from the staging buffer writes now: every one
+    /// but those left out that have no tiles (copies into them would go
+    /// nowhere). The upload's submission step gives tiles only to levels
+    /// its list wrote ([`Tiled::uploaded`]'s `copied`).
+    pub(crate) fn copied_now(&self) -> u32 {
+        self.every_level() & !(self.dropped_mask() & self.without(self.dropped_mask()))
+    }
+
+    /// What the views of the texture show ([`ViewLevels`]). With
+    /// [`publishing`] (the default): what was published, the shape the
+    /// tiles had once the submission that gave them landed
+    /// ([`Tiled::publish`]); a view made from it never reaches a level
+    /// whose tiles were mapped in a submission whose copies into them may
+    /// not have run yet. (The step that gives a level its tiles runs when
+    /// its submission is prepared, before any of that submission's lists
+    /// run: a list sent with it, or one recorded on another thread and
+    /// sent later, ahead of the upload's copies, read a level so shown
+    /// through tiles that still held what their last owner left.)
+    /// `VICTORY_TILED_VIEW_PUBLISH=0`: what the tiles are now, as before.
+    pub(crate) fn view_levels(&self) -> Option<ViewLevels> {
+        if publishing() {
+            *self.published.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            self.view_now()
+        }
+    }
+
+    /// Makes the views go by the tiles as they are now ([`Tiled::view_now`]);
+    /// whether that changes what they show. To be called once the
+    /// submission whose step changed the tiles has landed
+    /// (`resource.rs` `Publish`), or at the making.
+    pub(crate) fn publish(&self) -> bool {
+        let now = self.view_now();
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *published, now) != now
+    }
+
+    /// What the views would show by the tiles as they are now: `None`
+    /// while no level is both held and given and none is left out (the
+    /// views are then as the title made them, and read zeros). With levels
+    /// left out the views stop above them from the making on, before any
+    /// level has tiles (a level without tiles reads zeros either way).
+    fn view_now(&self) -> Option<ViewLevels> {
+        // A texture made without levels keeps views of that kind (moved by
+        // their clamp alone, [`shape_view`]) after its levels came back.
+        let dropped = if self.reduced.load(Ordering::Relaxed) { self.dropped().max(1) } else { self.dropped() };
+        let first_tiled = match self.first_shown() {
+            Some(first) => first,
+            None if dropped > 0 => dropped,
+            None => return None,
+        };
+        // (Before the first upload says, the title is taken to hold every
+        // level: its view as it made it.)
+        let first_held = match self.title_first.load(Ordering::Relaxed) {
+            u32::MAX => 0,
+            first => first.min(first_tiled),
+        };
+        Some(ViewLevels {
+            first_held,
+            first_tiled,
+            dropped,
+        })
+    }
+
+    /// [`Tiled::view_levels`] as far as [`shape_view`] goes by it: without
+    /// levels left out the first level held does not count.
+    fn view_shape(&self) -> Option<ViewLevels> {
+        self.view_now().map(|v| if v.dropped == 0 { ViewLevels { first_held: 0, ..v } } else { v })
+    }
+
+    /// Notes the first level the title or the card holds.
+    fn note_first(&self) {
+        let named = self.title_held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let first = if named == 0 { u32::MAX } else { named.trailing_zeros() };
+        self.title_first.store(first, Ordering::Relaxed);
     }
 
     /// At the submission of a list that uploads every level of `texture`
@@ -355,9 +626,12 @@ impl Tiled {
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    /// `copied`: the levels the list wrote ([`Tiled::copied_now`] when it
+    /// was recorded); the levels left out, and any level the list did not
+    /// write, get no tiles.
+    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, copied: u32, room: bool) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, copied, room),
             None => (false, false),
         }
     }
@@ -369,17 +643,30 @@ impl Tiled {
         device: &ID3D12Device,
         texture: &ID3D12Resource,
         held: u32,
+        copied: u32,
         room: bool,
     ) -> (bool, bool) {
-        let held = held & self.every_level();
+        let title = held & self.every_level();
+        let held = title & copied & !self.dropped_mask();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let before = self.view_shape();
         self.held.store(held, Ordering::Relaxed);
+        self.title_held.store(title, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        self.note_first();
+        let changed = self.view_shape() != before;
         let missing = self.without_locked(&given, named) != 0;
+        // What it will take is counted by its tiles from the first upload
+        // that gave every level it names (one kept waiting for room still
+        // counts as planned: the policy's count does not hang on when the
+        // card had room).
+        if !missing {
+            STATS[11].fetch_sub(self.planned.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        }
         (changed, missing)
     }
 
@@ -408,7 +695,8 @@ impl Tiled {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let prev = self.card.load(Ordering::Relaxed);
-        let changed = self.give_locked(
+        let before = self.view_shape();
+        self.give_locked(
             &mut given,
             queue,
             device,
@@ -427,7 +715,8 @@ impl Tiled {
         if without != 0 {
             self.unclaim(without);
         }
-        changed
+        self.note_first();
+        self.view_shape() != before
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -529,46 +818,41 @@ impl Tiled {
         if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
+        // The levels' tiles, then one mapping call per heap they come from
+        // (mostly one): a call for each level made some ten calls into the
+        // kernel for every texture made. Per heap: its regions (a level's
+        // first tile and its tiles) and their runs of the heap, in order.
+        struct Batch {
+            heap: ID3D12Heap,
+            at: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+            sizes: Vec<D3D12_TILE_REGION_SIZE>,
+            starts: Vec<u32>,
+            counts: Vec<u32>,
+        }
+        let mut batches: std::collections::BTreeMap<usize, Batch> = std::collections::BTreeMap::new();
         for (subresource, tiles, level) in wanted {
             let Some((heap, index, runs)) = take(device, tiles) else {
                 continue;
             };
-            let at = D3D12_TILED_RESOURCE_COORDINATE {
+            let batch = batches.entry(index).or_insert_with(|| Batch {
+                heap,
+                at: Vec::new(),
+                sizes: Vec::new(),
+                starts: Vec::new(),
+                counts: Vec::new(),
+            });
+            batch.at.push(D3D12_TILED_RESOURCE_COORDINATE {
                 X: 0,
                 Y: 0,
                 Z: 0,
                 Subresource: subresource,
-            };
-            let size = D3D12_TILE_REGION_SIZE {
+            });
+            batch.sizes.push(D3D12_TILE_REGION_SIZE {
                 NumTiles: tiles,
                 ..Default::default()
-            };
-            // One region, the subresource's tiles in order, on as many
-            // ranges of the heap as the runs taken.
-            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; runs.len()];
-            let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
-            let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
-            let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
-            STATS[6].fetch_add(1, Ordering::Relaxed);
-            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            });
+            batch.starts.extend(runs.iter().map(|run| run.0));
+            batch.counts.extend(runs.iter().map(|run| run.1));
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,
@@ -578,6 +862,31 @@ impl Tiled {
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        for batch in batches.values() {
+            let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; batch.starts.len()];
+            let began = std::time::Instant::now();
+            // SAFETY: a live reserved texture and a live heap of ours;
+            // `at.len()` regions, each a level's tiles in order from its
+            // first; `starts.len()` ranges of the heap whose counts add up
+            // to the regions' tiles, region by region, in arrays that live
+            // through the call.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    batch.at.len() as u32,
+                    Some(batch.at.as_ptr()),
+                    Some(batch.sizes.as_ptr()),
+                    &batch.heap,
+                    batch.starts.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(batch.starts.as_ptr()),
+                    Some(batch.counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let with_tiles = |level: u32| {
             if level < first_packed {
@@ -620,6 +929,57 @@ impl Tiled {
         if self.levels >= 32 { u32::MAX } else { (1 << self.levels) - 1 }
     }
 
+    /// Takes every tile from `texture` (this one's texture), on the queue,
+    /// before its tiles go back to the pool and the texture is kept for
+    /// another of its description (`resource.rs` `keep_reserved`): one
+    /// `UpdateTileMappings` that maps the whole texture to nothing. The
+    /// card runs it after everything sent before it and before anything
+    /// sent after it; to be called only once nothing on the card uses the
+    /// texture (its host copy is dropped after the landing). False without
+    /// a host (the texture is then not kept).
+    pub(crate) fn unmap_all(&self, texture: &ID3D12Resource) -> bool {
+        match host() {
+            Some(host) => {
+                self.unmap_all_on(host.queue(), texture);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Tiled::unmap_all`] on a queue.
+    pub(crate) fn unmap_all_on(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        if given.runs.is_empty() {
+            return;
+        }
+        let flags = [D3D12_TILE_RANGE_FLAG_NULL];
+        let began = std::time::Instant::now();
+        // SAFETY: a live reserved texture; one region that is the whole
+        // texture (no coordinates, no sizes) and one range of no heap that
+        // covers it.
+        unsafe {
+            queue.UpdateTileMappings(
+                texture,
+                1,
+                None,
+                None,
+                None::<&ID3D12Heap>,
+                1,
+                Some(flags.as_ptr()),
+                None,
+                None,
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // From here on the texture names no tile: what it was given goes
+        // back to the pool when this is dropped.
+        given.levels.iter_mut().for_each(|has| *has = false);
+        given.packed = false;
+    }
+
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
@@ -642,19 +1002,24 @@ impl Drop for Tiled {
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        STATS[11].fetch_sub(*self.planned.get_mut(), Ordering::Relaxed);
+        let dropped = *self.dropped.get_mut();
+        self.count_dropped(dropped, 0);
     }
 }
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// it started before it, and shows as many levels fewer (clamped to the
+/// remaining levels). `ResourceMinLODClamp` stays: it counts the texture's
+/// levels, not the view's (the software adapter: a view from level 1 with
+/// a clamp of 2.0 samples level 2, not 3). It was lowered by the shift
+/// before, which let a sample reach a level under the title's clamp.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
     }
-    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+    let clamp = |most: &mut u32, mips: &mut u32, _min_lod: &mut f32| {
         if first <= *most {
             return;
         }
@@ -662,9 +1027,6 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         *most = first;
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
-        }
-        if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
         }
     };
     match desc.ViewDimension {
@@ -682,14 +1044,259 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
     }
 }
 
+/// Keeps a two-dimensional shader view of a texture of `levels` levels
+/// from sampling the levels before `first`, with its first level where it
+/// was: `ResourceMinLODClamp` rises to `first` (in the texture's levels).
+/// A view that ends before `first` (one that names exactly a level left
+/// out, say) is moved to `first` instead, one level of it: a clamp past
+/// the view's last level is not something to rely on.
+pub(crate) fn min_lod_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    if first == 0 || first >= levels {
+        return;
+    }
+    let last = |most: u32, mips: u32| if mips == u32::MAX || mips == 0 { levels - 1 } else { most.saturating_add(mips - 1) };
+    let (starts_there, ends_before) = match desc.ViewDimension {
+        // SAFETY: `ViewDimension` selects the member.
+        D3D12_SRV_DIMENSION_TEXTURE2D => unsafe {
+            let v = &desc.Anonymous.Texture2D;
+            (v.MostDetailedMip >= first, last(v.MostDetailedMip, v.MipLevels) < first)
+        },
+        // SAFETY: as above.
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => unsafe {
+            let v = &desc.Anonymous.Texture2DArray;
+            (v.MostDetailedMip >= first, last(v.MostDetailedMip, v.MipLevels) < first)
+        },
+        _ => return,
+    };
+    if starts_there {
+        return;
+    }
+    if ends_before {
+        show_from(desc, first, levels);
+        return;
+    }
+    let raise = |min_lod: &mut f32| *min_lod = min_lod.max(first as f32);
+    match desc.ViewDimension {
+        // SAFETY: `ViewDimension` selects `Texture2D`.
+        D3D12_SRV_DIMENSION_TEXTURE2D => raise(unsafe { &mut desc.Anonymous.Texture2D.ResourceMinLODClamp }),
+        // SAFETY: `ViewDimension` selects `Texture2DArray`.
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => raise(unsafe { &mut desc.Anonymous.Texture2DArray.ResourceMinLODClamp }),
+        _ => {}
+    }
+}
+
+/// How a view of a texture made this way is made from the title's
+/// (`descriptor/host.rs` `make`). Without levels left out, as before:
+/// from the first level that is held and has tiles ([`show_from`]). With
+/// levels left out: from the first level the title holds, as the title's
+/// own view mostly starts already, and sampled no further than the first
+/// level with tiles ([`min_lod_from`]); its size, as `GetDimensions` gives
+/// it, is the title's. `VICTORY_TEXTURE_DROP_VIEWS=shift`: from the first
+/// level with tiles, as without (a `Gather` and a `Load` then read that
+/// level, and the size is that level's: 2, 4 times smaller).
+///
+/// By default (`clamp`) a view of a texture with levels left out never
+/// moves at all: its first level, its levels and its format stay the
+/// title's, and only `ResourceMinLODClamp` rises to the first level with
+/// tiles, also where the title holds fewer levels (a view that starts
+/// below the first level held) or the view names only levels without
+/// tiles (it then reads zeros, as a level without tiles does). The slots
+/// of such a texture are made again as its tiles change; a view made again
+/// differs from the one before in its clamp alone, never in the levels or
+/// the place in the card's memory it starts from. `keep`: as the first
+/// version (moved to the first level the title holds, and to the first
+/// level with tiles where the view ends before it).
+pub(crate) fn shape_view(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, view: ViewLevels, levels: u32) {
+    #[derive(PartialEq)]
+    enum How {
+        Clamp,
+        Keep,
+        Shift,
+    }
+    static HOW: std::sync::OnceLock<How> = std::sync::OnceLock::new();
+    let how = HOW.get_or_init(|| match std::env::var("VICTORY_TEXTURE_DROP_VIEWS").as_deref().map(str::trim) {
+        Ok("shift") => How::Shift,
+        Ok("keep") => How::Keep,
+        _ => How::Clamp,
+    });
+    if view.dropped == 0 || *how == How::Shift {
+        show_from(desc, view.first_tiled, levels);
+        return;
+    }
+    if *how == How::Keep {
+        show_from(desc, view.first_held, levels);
+        min_lod_from(desc, view.first_tiled, levels);
+        return;
+    }
+    clamp_from(desc, view.first_tiled, levels);
+}
+
+/// Raises a two-dimensional view's `ResourceMinLODClamp` to `first` (in
+/// the texture's levels) and changes nothing else.
+pub(crate) fn clamp_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    if first == 0 || first >= levels {
+        return;
+    }
+    let raise = |min_lod: &mut f32| *min_lod = min_lod.max(first as f32);
+    match desc.ViewDimension {
+        // SAFETY: `ViewDimension` selects `Texture2D`.
+        D3D12_SRV_DIMENSION_TEXTURE2D => raise(unsafe { &mut desc.Anonymous.Texture2D.ResourceMinLODClamp }),
+        // SAFETY: `ViewDimension` selects `Texture2DArray`.
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => raise(unsafe { &mut desc.Anonymous.Texture2DArray.ResourceMinLODClamp }),
+        _ => {}
+    }
+}
+
+/// Whether a texture's host copy is made without its most detailed levels,
+/// and how many: `VICTORY_TEXTURE_DROP_LEVELS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropMode {
+    /// `0`: never, as before.
+    Off,
+    /// The default (`auto`): by the bytes of host copies made so far
+    /// against the line ([`DropPolicy`]).
+    Auto,
+    /// `force1`, `force2`: that many from every texture that may lose levels,
+    /// whatever the room (for comparisons).
+    Force(u32),
+}
+
+/// What [`DropPolicy`] asks of a texture.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shape {
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) levels: u32,
+    /// Layers (or depth): only textures of one may lose levels.
+    pub(crate) layers: u32,
+    /// Two-dimensional, one sample, a texture the title fills, placed in
+    /// title memory.
+    pub(crate) plain_2d: bool,
+    /// Of a block-compressed format (BC1 to BC7).
+    pub(crate) block_compressed: bool,
+}
+
+/// Which host copies of title textures are made without their most
+/// detailed levels, and how many, at the moment each is made. Never a
+/// texture that is small (under `min_side` texels in width or height),
+/// not block-compressed, of fewer than `min_levels` levels, of several
+/// layers, or not two-dimensional: such textures may be lookup tables,
+/// noise or masks read texel by texel (`Load`), where a level left out
+/// reads zeros. Of the others, with [`DropMode::Auto`]: none while the
+/// bytes of host copies of title textures (`filled`, with what textures
+/// made but not uploaded yet will take) are under `one_from`; one from
+/// there; two from `two_from`. Only the bytes counted so far decide, so the
+/// same requests in the same order get the same answers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DropPolicy {
+    pub(crate) mode: DropMode,
+    pub(crate) min_side: u32,
+    pub(crate) min_levels: u32,
+    pub(crate) one_from: u64,
+    pub(crate) two_from: u64,
+}
+
+impl DropPolicy {
+    /// From the switches' values: `mode` (`VICTORY_TEXTURE_DROP_LEVELS`:
+    /// `0`, `auto`, `force1`, `force2`), `min_side`
+    /// (`VICTORY_TEXTURE_DROP_MIN_SIDE`, 1024), `min_levels`
+    /// (`VICTORY_TEXTURE_DROP_MIN_LEVELS`, 5), `from`
+    /// (`VICTORY_TEXTURE_DROP_FROM`: the shares of `line` in percent at
+    /// which one and two levels are left out, `50,80`), and `line`: the bytes
+    /// of host copies of title textures the card has room for.
+    pub(crate) fn parse(
+        mode: Option<&str>,
+        min_side: Option<&str>,
+        min_levels: Option<&str>,
+        from: Option<&str>,
+        line: u64,
+    ) -> DropPolicy {
+        let mode = match mode.map(str::trim) {
+            Some("0" | "off") => DropMode::Off,
+            Some("force1" | "force") => DropMode::Force(1),
+            Some("force2") => DropMode::Force(2),
+            Some("force3") => DropMode::Force(3),
+            _ => DropMode::Auto,
+        };
+        let number = |v: Option<&str>, default: u64| v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
+        let min_side = number(min_side, 1024).clamp(16, 1 << 14) as u32;
+        let min_levels = number(min_levels, 5).clamp(2, 16) as u32;
+        let (one, two) = match from.map(|v| v.split(',').map(|p| p.trim().parse::<u64>().ok()).collect::<Vec<_>>()) {
+            Some(parts) if parts.len() == 2 && parts.iter().all(Option::is_some) => {
+                let one = parts[0].unwrap_or(50).min(1000);
+                (one, parts[1].unwrap_or(80).clamp(one, 1000))
+            }
+            _ => (50, 80),
+        };
+        DropPolicy {
+            mode,
+            min_side,
+            min_levels,
+            one_from: line / 100 * one,
+            two_from: line / 100 * two,
+        }
+    }
+
+    /// Whether a texture of this shape may lose levels at all.
+    pub(crate) fn may_drop(&self, shape: &Shape) -> bool {
+        self.mode != DropMode::Off
+            && shape.plain_2d
+            && shape.block_compressed
+            && shape.layers == 1
+            && shape.levels >= self.min_levels
+            && shape.width >= u64::from(self.min_side)
+            && shape.height >= self.min_side
+    }
+
+    /// How many of its most detailed levels a texture of this shape leaves
+    /// out, made when host copies of title textures take `filled` bytes.
+    pub(crate) fn levels(&self, shape: &Shape, filled: u64) -> u32 {
+        if !self.may_drop(shape) {
+            return 0;
+        }
+        let wanted = match self.mode {
+            DropMode::Off => 0,
+            DropMode::Force(n) => n,
+            DropMode::Auto if filled >= self.two_from => 2,
+            DropMode::Auto if filled >= self.one_from => 1,
+            DropMode::Auto => 0,
+        };
+        // At least `min_levels - 2` levels stay (a 1024 texture keeps its
+        // 256x256 level and below with two left out).
+        wanted.min(shape.levels.saturating_sub(self.min_levels.saturating_sub(2).max(1)))
+    }
+}
+
 /// For the log, with the texture queue's line: what this saves, and what
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
     static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    // What making a host copy or an upload costs in calls into the kernel:
+    // what is reused and what is made.
+    let [taken, made, not_kept, zeroed, spare] = crate::texture::staging_pool_stats();
+    let [r_taken, r_made, r_kept, r_released, r_spare] = crate::resource::reserved_reuse_stats();
+    tracing::info!(
+        "staging buffers since the start: {taken} reused, {made} made (VICTORY_STAGING_POOL_MB), {not_kept} spare ones \
+         released for want of room in the pool, {zeroed} reused ones zeroed at their first check, {} MB spare now, {} made \
+         without the levels their texture leaves out; textures without memory of their own since the start: {r_taken} \
+         reused, {r_made} made (VICTORY_RESERVED_REUSE), {r_kept} kept when let go, {r_released} released for want of \
+         places, {r_spare} spare now",
+        spare >> 20,
+        crate::texture::STAGED_LEFT_OUT.load(Ordering::Relaxed),
+    );
     if s[4] == 0 {
         return;
     }
+    let o: Vec<u64> = ORDER.iter().map(|o| o.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "views of textures made level by level (VICTORY_TILED_VIEW_PUBLISH): since the start {} changes left for their \
+         submission's landing, {} of them with no submission in flight at the step (should be 0), {} published at a \
+         landing ({} with a change); slots made again with nothing in flight {}, made again while submissions were in \
+         flight {} (the old way; should be 0), quiet moments that found submissions in flight {}; texture reads held by \
+         their list that were not before {}",
+        o[0], o[1], o[2], o[3], o[4], o[5], o[7], o[6],
+    );
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
     tracing::info!(
@@ -713,7 +1320,28 @@ pub(crate) fn status() {
         s[9],
         s[10],
     );
+    if s[14] == 0 && s[15] == 0 {
+        return;
+    }
+    tracing::info!(
+        "textures made without their most detailed levels (VICTORY_TEXTURE_DROP_LEVELS): {} alive, {} MB of the \
+         card not allocated for the levels left out; {} made so far, {} levels left out at their making; {} levels \
+         brought back so far ({} MB); {} MB planned for textures made and not uploaded yet; slots of textures held \
+         back for want of room at the last pass: {}",
+        s[12],
+        s[13] >> 20,
+        s[14],
+        s[17],
+        s[15],
+        s[16] >> 20,
+        s[11] >> 20,
+        WAITING_FOR_ROOM.load(Ordering::Relaxed),
+    );
 }
+
+/// Slots of textures picked by index that the last texture pass held back
+/// for want of room on the card (`draw.rs` `heap_textures`), for the line.
+pub(crate) static WAITING_FOR_ROOM: AtomicU64 = AtomicU64::new(0);
 
 /// On the card, without the title: what levels on demand relies on, with
 /// the pool and the mapping call of this module on a device of the test's
@@ -1380,14 +2008,14 @@ void look() {
         };
         // No room: nothing is given, the held levels are said to wait,
         // nothing is shown, every level reads zeros.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), u32::MAX, false);
         rig.check("an upload without room");
         assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), u32::MAX, true);
         rig.check("the upload again, with room");
         assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
@@ -1396,7 +2024,7 @@ void look() {
         // More levels held and no room again: the ones that have tiles
         // are brought up to date, the new ones wait, the view stays.
         let before = tiled.given_bytes();
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), u32::MAX, false);
         rig.check("more levels held, without room");
         assert!(!changed && waiting, "more levels without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), before);
@@ -1411,7 +2039,7 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), u32::MAX, true);
         rig.check("the last upload, with room");
         assert!(!waiting && tiled.whole());
         read_as_given(rig, "everything given");
@@ -1435,6 +2063,281 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    /// What a shader reads through one view: a sample at level 0 and at
+    /// level 2, a gather, a `Load` of level 0, the width and the levels
+    /// `GetDimensions` gives.
+    const READ: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors = 1)), UAV(u0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)"
+Texture2D<float4> t : register(t0);
+SamplerState nearest : register(s0);
+RWByteAddressBuffer words : register(u0);
+uint v(float x) { return (uint)(x * 255.0 + 0.5); }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void read() {
+    words.Store(0, v(t.SampleLevel(nearest, float2(0.3, 0.3), 0).x));
+    words.Store(4, v(t.SampleLevel(nearest, float2(0.3, 0.3), 2).x));
+    words.Store(8, v(t.GatherRed(nearest, float2(0.3, 0.3)).x));
+    words.Store(12, v(t.Load(int3(1, 1, 0)).x));
+    uint w, h, n;
+    t.GetDimensions(0, w, h, n);
+    words.Store(16, w);
+    words.Store(20, n);
+}
+"#;
+
+    /// Runs [`READ`] through `view` of `texture` (in the copy destination
+    /// state, and left in it).
+    fn read_through(rig: &mut Rig, texture: &ID3D12Resource, view: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<[u32; 6]> {
+        let cs = compile(READ, s!("read"), s!("cs_5_1")).ok()?;
+        // SAFETY: plain object creation; the view is made in a heap that
+        // lives to the end of the function, of a live texture.
+        let (root, pipeline, views, words, back) = unsafe {
+            let root: ID3D12RootSignature = rig.device.CreateRootSignature(0, &cs[..]).ok()?;
+            let pipeline: ID3D12PipelineState = rig
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.as_ptr().cast(),
+                        BytecodeLength: cs.len(),
+                    },
+                    ..Default::default()
+                })
+                .ok()?;
+            let views: ID3D12DescriptorHeap = rig
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            rig.device.CreateShaderResourceView(texture, Some(std::ptr::from_ref(view)), views.GetCPUDescriptorHandleForHeapStart());
+            let words = rig.buffer(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                256,
+            );
+            let back = rig.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, 256);
+            (root, pipeline, views, words, back)
+        };
+        rig.check("the read's pipeline and view made");
+        rig.run(|list| {
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pipeline);
+                list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRootUnorderedAccessView(1, words.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[
+                    transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                list.CopyBufferRegion(&back, 0, &words, 0, 24);
+            }
+        });
+        // SAFETY: a read-back buffer the finished list copied 24 bytes into.
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).ok()?;
+            let mut read = [0u32; 6];
+            read.copy_from_slice(std::slice::from_raw_parts(data.cast::<u32>(), 6));
+            back.Unmap(0, None);
+            Some(read)
+        }
+    }
+
+    /// (viii) A texture made without its most detailed level: the upload
+    /// gives that level no tiles, the view keeps its first level (the size
+    /// the shader is told is the title's) and its samples read the first
+    /// level kept; brought back, the level gets its tiles at the next
+    /// upload and is sampled. And the clamp counts the texture's levels,
+    /// not the view's ([`show_from`] keeps it).
+    fn a_texture_without_its_top_level(rig: &mut Rig) -> Option<()> {
+        rig.step = "step 8, a texture made without its most detailed level";
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let desc = Rig::desc(format, SIDE, LEVELS, true);
+        let layout = rig.footprints(&desc);
+        let (texture, tiled) = rig.reserved(&desc);
+        tiled.leave_out(1);
+        assert_eq!(tiled.dropped_mask(), 1);
+        let copied = tiled.copied_now();
+        assert_eq!(copied, tiled.every_level() & !1, "the upload leaves level 0 alone");
+        // Each level's bytes are sixteen times its number plus one.
+        let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
+        // The views stop above the level left out from the making on: the
+        // first upload changes none (no slot is made again for it).
+        let before = tiled.view_levels();
+        assert_eq!(
+            before,
+            Some(ViewLevels {
+                first_held: 0,
+                first_tiled: 1,
+                dropped: 1
+            })
+        );
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, tiled.every_level(), copied, true);
+        rig.check("the upload's tiles");
+        assert!(!changed && !waiting, "changed {changed}, waiting {waiting}");
+        assert_eq!(tiled.view_levels(), before);
+        assert!(!tiled.has_tiles(0) && tiled.has_tiles(1));
+        let without_top = tiled.given_bytes();
+        rig.round_trip(&texture, &layout, Some(&upload));
+        let levels = tiled.view_levels().expect("a level is shown");
+        assert_eq!(
+            levels,
+            ViewLevels {
+                first_held: 0,
+                first_tiled: 1,
+                dropped: 1
+            }
+        );
+        let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::MAX,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let mut shaped = whole;
+        shape_view(&mut shaped, levels, u32::from(LEVELS));
+        let read = read_through(rig, &texture, &shaped)?;
+        eprintln!(
+            "without level 0: sample at level 0 {}, at level 2 {}, gather {}, load of level 0 {}, width {}, levels {}",
+            read[0], read[1], read[2], read[3], read[4], read[5]
+        );
+        assert_eq!(read[0], 32, "a sample at level 0 reads level 1, the first kept");
+        assert_eq!(read[1], 48, "a sample at level 2 reads level 2");
+        assert_eq!((read[4], read[5]), (SIDE, u32::from(LEVELS)), "the size is the title's");
+        // (A gather and a load of level 0 read zeros: what the module's
+        // comment says shaders could see.)
+        if !rig.card {
+            assert_eq!((read[2], read[3]), (0, 0), "the software adapter: gather and load under the clamp");
+        }
+        // A view of level 0 alone, clamped past its own levels (it is not
+        // moved, `clamp_from`): the debug layer takes it, and it reads the
+        // level without tiles: zeros.
+        let mut only_top = whole;
+        only_top.Anonymous.Texture2D.MipLevels = 1;
+        clamp_from(&mut only_top, 1, u32::from(LEVELS));
+        let read = read_through(rig, &texture, &only_top)?;
+        assert_eq!(read[0], 0, "a view of the level left out alone reads zeros");
+        // Brought back: the next upload writes level 0 and gives it tiles.
+        assert_eq!(tiled.promote(), Some(u64::from(tiled.standard[0]) * TILE));
+        assert_eq!(tiled.promote(), None, "one level was left out");
+        let copied = tiled.copied_now();
+        assert_eq!(copied, tiled.every_level());
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, tiled.every_level(), copied, true);
+        rig.check("the upload after the level came back");
+        assert!(changed && !waiting && tiled.whole());
+        assert_eq!(tiled.given_bytes(), without_top + u64::from(tiled.standard[0]) * TILE);
+        rig.round_trip(&texture, &layout, Some(&upload));
+        // The views follow once the submission that gave the tiles landed
+        // (`resource.rs` `Publish`); not before.
+        if publishing() {
+            assert_eq!(tiled.view_levels().map(|v| v.first_tiled), Some(1), "not published before the landing");
+        }
+        assert!(tiled.publish(), "the landing changes the views");
+        let levels = tiled.view_levels().expect("a level is shown");
+        assert_eq!(levels.first_tiled, 0);
+        assert!(levels.dropped > 0, "a view of a texture made without levels moves by its clamp alone");
+        let read = read_through(rig, &texture, &whole)?;
+        assert_eq!((read[0], read[2], read[3]), (16, 16, 16), "level 0 is back");
+        // The clamp is in the texture's levels: a view from level 1 with a
+        // clamp of 2 samples level 2.
+        let mut from_one = whole;
+        // (Writing a union's field needs no `unsafe`.)
+        from_one.Anonymous.Texture2D.MostDetailedMip = 1;
+        from_one.Anonymous.Texture2D.ResourceMinLODClamp = 2.0;
+        let read = read_through(rig, &texture, &from_one)?;
+        assert_eq!(read[0], 48, "the clamp counts the texture's levels");
+        Some(())
+    }
+
+    /// (ix) A texture kept for reuse (`resource.rs` `keep_reserved`): every
+    /// tile is taken from it by one call, after which every level reads
+    /// zeros; made again level by level (a new [`Tiled`] on the same
+    /// texture), it reads what is written into the levels given and zeros
+    /// in the others. And a staging laid out from its first level kept on
+    /// (`texture.rs` `staging` for a texture that leaves levels out) lands
+    /// in the right levels.
+    fn a_texture_kept_for_reuse(rig: &mut Rig) {
+        rig.step = "step 9, a texture kept for reuse, and a staging without its left-out level";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let layout = rig.footprints(&desc);
+        let (texture, tiled) = rig.reserved(&desc);
+        rig.give(&tiled, &texture, tiled.every_level());
+        let upload = rig.filled(&layout, |level| level as u8 + 1);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(read.iter().enumerate().all(|(level, bytes)| all(bytes, level as u8 + 1)));
+        tiled.unmap_all_on(&rig.queue, &texture);
+        rig.check("every tile taken by one call");
+        assert!(tiled.without(tiled.every_level()) == tiled.every_level(), "no level has tiles");
+        let read = rig.round_trip(&texture, &layout, None);
+        for (level, bytes) in read.iter().enumerate() {
+            assert!(all(bytes, 0), "after the tiles were taken level {level} reads {bytes:?}");
+        }
+        drop(tiled);
+        // The same texture, made again: one level left out, the staging laid
+        // out from level 1.
+        let again = Tiled::make(&rig.device, &texture, u32::from(LEVELS)).expect("cut again");
+        again.leave_out(1);
+        let copied = again.copied_now();
+        let (changed, waiting) = again.uploaded_on(&rig.queue, &rig.device, &texture, again.every_level(), copied, true);
+        rig.check("the reused texture's tiles");
+        assert!(!changed && !waiting);
+        assert!(again.has_tiles(1) && !again.has_tiles(0));
+        let first = 1u32;
+        let count = u32::from(LEVELS) - first;
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        let mut rows = vec![0u32; count as usize];
+        let mut total = 0u64;
+        // SAFETY: outputs for `count` subresources from `first` on.
+        unsafe {
+            rig.device.GetCopyableFootprints(
+                &desc,
+                first,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        assert!(total * 2 < layout.total, "without level 0 the staging is far smaller ({total} of {})", layout.total);
+        let compact = Laid {
+            footprints: footprints.clone(),
+            rows,
+            wide: vec![0; count as usize],
+            total,
+        };
+        let staged = rig.filled(&compact, |i| 0x40 + i as u8 + first as u8);
+        rig.run(|list| {
+            for (i, f) in footprints.iter().enumerate() {
+                // SAFETY: an open list; live resources.
+                unsafe { list.CopyTextureRegion(&sub(&texture, first + i as u32), 0, 0, 0, &placed(&staged, *f), None) };
+            }
+        });
+        let read = rig.round_trip(&texture, &layout, None);
+        assert!(all(&read[0], 0), "the level left out reads {:?}", read[0]);
+        for (level, bytes) in read.iter().enumerate().skip(1) {
+            assert!(all(bytes, 0x40 + level as u8), "level {level} reads {bytes:?}");
+        }
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1453,6 +2356,10 @@ void look() {
         a_claim_given_up_is_made_again(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
+        }
+        a_texture_kept_for_reuse(&mut rig);
+        if a_texture_without_its_top_level(&mut rig).is_none() {
+            eprintln!("the test of a texture without its top level could not make its shader or objects; skipped");
         }
         rig.step = "the end";
         rig.check("every step done");
@@ -1481,7 +2388,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_from_clamps_2d_and_2d_array_and_keeps_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1501,7 +2408,8 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        // In the texture's levels: unchanged by the shift.
+        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1523,7 +2431,135 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, 1.5);
+    }
+
+    fn view2d(most: u32, mips: u32, clamp: f32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC7_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: most,
+                    MipLevels: mips,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: clamp,
+                },
+            },
+        }
+    }
+
+    fn of(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u32, u32, f32) {
+        // SAFETY: the tests make 2D views only.
+        let v = unsafe { desc.Anonymous.Texture2D };
+        (v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp)
+    }
+
+    #[test]
+    fn a_view_of_a_texture_without_its_top_levels_keeps_its_first_level_and_is_clamped() {
+        let dropped = |first_held, first_tiled, dropped| ViewLevels {
+            first_held,
+            first_tiled,
+            dropped,
+        };
+        // The whole chain, one level left out: the view starts where it
+        // did (its size is the title's), samples stop at level 1.
+        let mut v = view2d(0, u32::MAX, 0.0);
+        shape_view(&mut v, dropped(0, 1, 1), 11);
+        assert_eq!(of(&v), (0, u32::MAX, 1.0));
+        // The title's own clamp above that stays.
+        let mut v = view2d(0, 11, 2.5);
+        shape_view(&mut v, dropped(0, 1, 1), 11);
+        assert_eq!(of(&v), (0, 11, 2.5));
+        // A view that names exactly the level left out is not moved: it is
+        // clamped past its own levels (and reads zeros, as a level without
+        // tiles does); a view never changes but in its clamp.
+        let mut v = view2d(0, 1, 0.0);
+        shape_view(&mut v, dropped(0, 1, 1), 11);
+        assert_eq!(of(&v), (0, 1, 1.0));
+        let mut v = view2d(0, 2, 0.0);
+        shape_view(&mut v, dropped(0, 2, 2), 11);
+        assert_eq!(of(&v), (0, 2, 2.0));
+        // The title holds from level 3 and views from 0 (a neighbour where
+        // its large levels would be): clamped at 3, not moved.
+        let mut v = view2d(0, u32::MAX, 0.0);
+        shape_view(&mut v, dropped(3, 3, 1), 11);
+        assert_eq!(of(&v), (0, u32::MAX, 3.0));
+        // A view that starts below the levels left out keeps a clamp under
+        // its own first level, which changes nothing it samples.
+        let mut v = view2d(4, u32::MAX, 0.0);
+        shape_view(&mut v, dropped(0, 1, 1), 11);
+        assert_eq!(of(&v), (4, u32::MAX, 1.0));
+        // Nothing left out: as before, from the first level with tiles.
+        let mut v = view2d(0, u32::MAX, 0.0);
+        shape_view(&mut v, dropped(0, 2, 0), 11);
+        assert_eq!(of(&v), (2, u32::MAX, 0.0));
+    }
+
+    fn shape(side: u32, levels: u32, block_compressed: bool) -> Shape {
+        Shape {
+            width: u64::from(side),
+            height: side,
+            levels,
+            layers: 1,
+            plain_2d: true,
+            block_compressed,
+        }
+    }
+
+    #[test]
+    fn the_policy_leaves_out_levels_of_large_textures_only_past_its_lines() {
+        const MB: u64 = 1 << 20;
+        let p = DropPolicy::parse(None, None, None, None, 4000 * MB);
+        assert_eq!(p.mode, DropMode::Auto);
+        assert_eq!((p.one_from, p.two_from), (2000 * MB, 3200 * MB));
+        let big = shape(2048, 12, true);
+        // Under the first line: whole.
+        assert_eq!(p.levels(&big, 0), 0);
+        assert_eq!(p.levels(&big, 1999 * MB), 0);
+        // Past it: one level; past the second: two.
+        assert_eq!(p.levels(&big, 2000 * MB), 1);
+        assert_eq!(p.levels(&big, 3199 * MB), 1);
+        assert_eq!(p.levels(&big, 3200 * MB), 2);
+        assert_eq!(p.levels(&big, 9000 * MB), 2);
+        // Always whole: small, one level, few levels, not block-compressed,
+        // several layers, not a plain 2D texture.
+        for (shape, why) in [
+            (shape(512, 10, true), "small"),
+            (Shape { height: 512, ..shape(2048, 12, true) }, "narrow"),
+            (shape(2048, 1, true), "one level"),
+            (shape(2048, 4, true), "few levels"),
+            (shape(2048, 12, false), "not block-compressed"),
+            (Shape { layers: 6, ..shape(2048, 12, true) }, "a cube"),
+            (Shape { plain_2d: false, ..shape(2048, 12, true) }, "not plain 2D"),
+        ] {
+            assert_eq!(p.levels(&shape, 9000 * MB), 0, "{why}");
+        }
+        // The same requests give the same answers.
+        let answers = |p: &DropPolicy| (0..64u64).map(|i| p.levels(&big, i * 100 * MB)).collect::<Vec<_>>();
+        assert_eq!(answers(&p), answers(&p));
+        // At least three levels stay: a 1024 texture of five levels loses two.
+        assert_eq!(p.levels(&shape(1024, 5, true), 9000 * MB), 2);
+    }
+
+    #[test]
+    fn the_policy_switches() {
+        const MB: u64 = 1 << 20;
+        let off = DropPolicy::parse(Some("0"), None, None, None, 4000 * MB);
+        assert_eq!(off.mode, DropMode::Off);
+        assert_eq!(off.levels(&shape(4096, 13, true), u64::MAX), 0);
+        let forced = DropPolicy::parse(Some("force1"), None, None, None, 4000 * MB);
+        assert_eq!(forced.levels(&shape(4096, 13, true), 0), 1);
+        assert_eq!(forced.levels(&shape(512, 10, true), 0), 0, "under the size: whole even when forced");
+        let two = DropPolicy::parse(Some("force2"), Some("512"), Some("4"), Some("10,20"), 1000 * MB);
+        assert_eq!(two.levels(&shape(512, 10, true), 0), 2);
+        assert_eq!((two.one_from, two.two_from), (100 * MB, 200 * MB));
+        // A second line under the first is raised to it; nonsense is the default.
+        let odd = DropPolicy::parse(Some("auto"), Some("x"), None, Some("70,30"), 1000 * MB);
+        assert_eq!((odd.one_from, odd.two_from, odd.min_side), (700 * MB, 700 * MB, 1024));
+        let junk = DropPolicy::parse(Some("auto"), None, None, Some("70"), 1000 * MB);
+        assert_eq!((junk.one_from, junk.two_from), (500 * MB, 800 * MB));
     }
 
     #[test]
@@ -1569,6 +2605,13 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            dropped: AtomicU32::new(0),
+            title_held: AtomicU32::new(0),
+            title_first: AtomicU32::new(u32::MAX),
+            planned: AtomicU64::new(0),
+            used: AtomicU64::new(0),
+            published: Mutex::new(None),
+            reduced: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
@@ -1579,7 +2622,7 @@ void look() {
         // Even if level 0 later becomes allocatable, an upload with `room == false`
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
-        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
+        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, u32::MAX, false);
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);

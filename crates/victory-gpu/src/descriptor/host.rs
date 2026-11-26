@@ -133,6 +133,14 @@ pub(crate) fn levels_changed(start: u64) {
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
 
+/// The starts [`levels_changed`] noted, taken (each once).
+pub(crate) fn take_levels_changed() -> Vec<u64> {
+    let mut starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose last upload left a held level without tiles (the card had no
 /// room, or no heap could be had), and when (`crate::host::moment`). A
@@ -1373,11 +1381,25 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
-        if self.sampler {
+        // With the views published at landings (`crate::tiles::publishing`)
+        // the slots are made again only at a moment with nothing in flight
+        // ([`remake_at_quiet_point`]), not here, while submissions run.
+        if crate::tiles::publishing() {
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
-        if starts.is_empty() {
+        let flying = crate::host::submissions_in_flight() > 0;
+        let remade = self.texture_views_remade_at(&starts);
+        if flying {
+            crate::tiles::ORDER[5].fetch_add(remade as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        remade
+    }
+
+    /// [`HostHeap::texture_views_remade`] for the placed textures that
+    /// start at `starts`.
+    pub(crate) fn texture_views_remade_at(&self, starts: &[u64]) -> usize {
+        if self.sampler || starts.is_empty() {
             return 0;
         }
         let slots: Vec<u32> = {
@@ -2777,9 +2799,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // level is shown from the first level that is the title's
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
-                // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
-                    && first > 0
+                // title's own view mostly starts there already. One made
+                // without its most detailed levels keeps its first level and
+                // is clamped above them (`crate::tiles::shape_view`).
+                if let Some(levels) = crate::resource::view_levels(resource)
+                    && levels.first_tiled > 0
                 {
                     // SAFETY: a live resource.
                     let own = unsafe { texture.GetDesc() };
@@ -2797,7 +2821,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                             },
                         },
                     };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    crate::tiles::shape_view(desc.get_or_insert(whole), levels, u32::from(own.MipLevels));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

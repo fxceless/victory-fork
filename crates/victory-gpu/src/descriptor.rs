@@ -827,6 +827,45 @@ fn wait_for(resource: usize, handle: u64) {
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
+/// Levels on demand and textures made without levels (`crate::tiles`):
+/// makes the host slots of the placed textures whose views changed
+/// (`host::levels_changed`) again, in every view heap. To be called only
+/// at a moment with nothing in flight on the card (`crate::host` `sweep`,
+/// through `crate::resource::let_go_idle`): a slot is part of a heap the
+/// card reads while it runs the lists that sample it, and one made again
+/// under a running list is undefined in D3D12 (the list may read half of
+/// the old view and half of the new). Lists recorded and not yet sent read
+/// the slot as made here when they run. Returns the slots made again.
+pub(crate) fn remake_at_quiet_point() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::tiles::publishing() {
+        return 0;
+    }
+    let starts = host::take_levels_changed();
+    if starts.is_empty() {
+        return 0;
+    }
+    if crate::host::submissions_in_flight() > 0 {
+        // Not a quiet moment after all: kept for the next one.
+        crate::tiles::ORDER[7].fetch_add(1, Relaxed);
+        for start in starts {
+            host::levels_changed(start);
+        }
+        return 0;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut remade = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            remade += host.texture_views_remade_at(&starts);
+        }
+    }
+    crate::tiles::ORDER[4].fetch_add(remade as u64, Relaxed);
+    remade
+}
+
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {

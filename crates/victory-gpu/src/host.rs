@@ -79,6 +79,12 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started and not yet finished (landed) now: 0 when nothing
+/// the host sent can be running on the card.
+pub(crate) fn submissions_in_flight() -> u64 {
+    STARTED.load(Ordering::Acquire).saturating_sub(FINISHED.load(Ordering::Acquire))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -221,6 +227,20 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// Drops `object` at the next landing after every submission started by
+/// now, never here: on the thread that buries ([`bury_aside`]) where there
+/// is one. For the sweeps, which let go of hundreds of host textures in one
+/// call on the thread that submits: releasing a reserved texture is two
+/// calls into the kernel (its allocation, its range of the card's address
+/// space), 20 ms a frame of that thread in the opening cutscene.
+pub(crate) fn retire_later<T: 'static>(object: T) {
+    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((STARTED.load(Ordering::Acquire), Retired(Box::new(object))));
 }
 
 /// Drops what waited for submissions up to `finished`.

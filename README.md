@@ -584,6 +584,25 @@ use):
   texture the title fills takes card memory only for the levels the title
   holds (2.2 to 3.0 GB of the copies were levels it does not hold). Its test
   runs on the software adapter; it has not run on a card yet.
+- Large title textures without their most detailed levels when the card is
+  short of room (`VICTORY_TEXTURE_DROP_LEVELS`, on; `0` = as before,
+  `force1`/`force2` = one or two levels left out whatever the room): placed,
+  title-filled, block-compressed 2D textures of 1024 and more a side are
+  made as reserved textures and, past a line of host-copy bytes, without
+  their one or two most detailed levels. Their views keep the title's first
+  level and clamp the level of detail, so the sizes shaders read stay the
+  title's; levels come back while there is room
+  (`VICTORY_TEXTURE_PROMOTE_MB`). Measured in Steenax6/VIctory-NVID on an
+  RTX 4070 Ti 12 GB, not on this tree: some 22,000 textures picked by index
+  waited for room in every run and which were there differed from run to
+  run (the first room lit in one run, dark in the next); with the switch
+  none is held back, 17,458 title textures alive in 2,964 MB where 9,521
+  took 3,932 MB. Reserved textures and staging buffers are reused
+  (`VICTORY_RESERVED_REUSE`, `VICTORY_STAGING_POOL_MB` now 1,024 with
+  buffers up to 64 MiB), a texture made without levels stages only what
+  its upload writes (`VICTORY_STAGE_LEFT_OUT=1` = all), and its views
+  follow its tiles only once the submission that gave them has landed
+  (`VICTORY_TILED_VIEW_PUBLISH=0` = at once; `VICTORY_TEXTURE_DROP_VIEWS`).
 - Refused texture slots are held back for a few seconds so that a pass
   reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
   room can be kept for the card copies of title buffers

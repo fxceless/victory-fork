@@ -69,6 +69,20 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// The levels the last submitted upload wrote (a bit a level): all but
+    /// the levels a texture made without them left out
+    /// (`crate::tiles::Tiled::copied_now`). An upload that would write
+    /// more now (a level was brought back) is recorded again.
+    copied: std::sync::atomic::AtomicU32,
+    /// The first subresource the buffer holds: the levels before it are
+    /// left out of a texture made without them (a texture of one layer;
+    /// `footprints[i]` is subresource `first + i`). An upload that would
+    /// write one of them makes the staging anew ([`upload`]).
+    first: u32,
+    /// The buffer came from the pool and holds what an earlier staging
+    /// left: zeroed at the first check unless a detiling filled it whole
+    /// by then ([`Staging::refresh`]).
+    stale: std::sync::atomic::AtomicBool,
     /// The size of the buffer if it came from the pool of spare staging
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
@@ -85,13 +99,35 @@ unsafe impl Send for Spare {}
 /// Spare staging buffers by size (a power of two), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
-/// Staging buffers taken from the spare ones, and made, since the start.
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// The largest buffer that is pooled, and the most bytes kept spare when
+/// `VICTORY_STAGING_POOL_MB` says nothing ([`spare_most`]).
+const SPARE_LARGEST: u64 = 64 << 20;
+const SPARE_MOST_DEFAULT_MB: u64 = 1024;
+/// Since the start: staging buffers taken from the spare ones; made anew
+/// (pooled sizes and not); spare ones the pool had no room to keep; and
+/// buffers taken from the pool that were zeroed at their first check
+/// because nothing had filled them by then ([`Staging::refresh`]).
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// A mapped upload buffer of `total` bytes for a texture's staging, all
-/// zeros, and its pool size (0: not pooled).
+/// The most bytes of spare staging buffers kept: `VICTORY_STAGING_POOL_MB`
+/// (1,024; it was 256 MB, with buffers of at most 8 MiB pooled).
+fn spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(SPARE_MOST_DEFAULT_MB)
+            .min(16 << 10)
+            << 20
+    })
+}
+
+/// A mapped upload buffer of at least `total` bytes for a texture's
+/// staging, its pool size (0: not pooled), and whether its bytes may be
+/// what an earlier staging left (a spare buffer: the caller has it zeroed
+/// before its first use unless something fills it first,
+/// [`Staging::refresh`]).
 ///
 /// Every texture the title streams in got a buffer of its own from the
 /// host and gave it back when its staging went: about a quarter of a
@@ -99,20 +135,26 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// threads for some 100 uploads, most of it the graphics kernel waiting)
 /// and more to free on the thread that submits. A streaming burst is 200
 /// to 500 uploads in a frame (run 222), and those are the frames that
-/// dip. Buffers of up to 8 MiB are now kept by size and used again,
-/// zeroed as a new one is (levels not there yet must read as zeros).
+/// dip. Buffers of up to 8 MiB were kept by size and used again, zeroed as
+/// they were taken, within 256 MB; with textures made without their top
+/// levels nothing waits for room and the opening cutscene staged 100 to
+/// 230 MB a frame, so most buffers were made again (32.7 ms a frame in
+/// `CreateCommittedResource` on the thread of the texture pass). Now up to
+/// 64 MiB and within `VICTORY_STAGING_POOL_MB`, and not zeroed when taken:
+/// the detiling writes every staged level, and a staging buffer nothing
+/// filled before its first upload is zeroed then.
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 /// `VICTORY_STAGING_POOL=alt`: twenty seconds with the pool, twenty
 /// without, in turn, each change said in the log: a buffer made without
 /// is freed as before, and the spare ones wait for the next turn.
-/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
-fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+/// `VICTORY_STAGING_POOL_MB`: the most kept spare (1,024 unless said).
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !staging_pool() {
+    if size > SPARE_LARGEST || !staging_pool() {
         // (Counted as made: the frame log's "staging N made" is then the
         // buffers of a run without the pool too.)
         SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0, false));
     }
     let spare = {
         let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -124,13 +166,25 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     };
     if let Some(Spare(buffer, data)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
-        // else holds.
-        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
-        return Some((buffer, data as *mut u8, size));
+        return Some((buffer, data as *mut u8, size, true));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size, false))
+}
+
+/// For the 5-second line: staging buffers taken from the pool and made
+/// anew since the start, spare ones the pool could not keep, pooled ones
+/// zeroed late, and the bytes spare now.
+pub(crate) fn staging_pool_stats() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).1;
+    [
+        SPARE_STATS[0].load(Relaxed),
+        SPARE_STATS[1].load(Relaxed),
+        SPARE_STATS[2].load(Relaxed),
+        SPARE_STATS[3].load(Relaxed),
+        spare,
+    ]
 }
 
 /// Whether staging buffers are taken from and returned to the spare ones
@@ -158,14 +212,6 @@ fn staging_pool() -> bool {
             on
         }
     }
-}
-
-/// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
-fn spare_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
-    })
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -497,6 +543,10 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Staging buffers made without the levels their texture leaves out, since
+/// the start.
+pub(crate) static STAGED_LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -506,10 +556,37 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= spare_most() {
+            // Full: spare buffers of the size that holds the most bytes
+            // make way (the sizes the title streams change from scene to
+            // scene; a pool full of one size made every other size anew).
+            let most = spare_most();
+            let mut evicted = Vec::new();
+            while all.1 + self.pooled > most && self.pooled <= most {
+                let Some((&size, _)) = all
+                    .0
+                    .iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .max_by_key(|&(size, v)| *size * v.len() as u64)
+                else {
+                    break;
+                };
+                if let Some(spare) = all.0.get_mut(&size).and_then(Vec::pop) {
+                    all.1 -= size;
+                    evicted.push(spare);
+                }
+            }
+            if !evicted.is_empty() {
+                SPARE_STATS[2].fetch_add(evicted.len() as u64, Relaxed);
+            }
+            if all.1 + self.pooled <= most {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            } else {
+                SPARE_STATS[2].fetch_add(1, Relaxed);
             }
+            // (Released after the lock.)
+            drop(all);
+            drop(evicted);
         }
     }
 }
@@ -695,10 +772,25 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let Some(mut staging) = staging(resource, texture) else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    // A staging made without the first levels of a texture that leaves
+    // fewer out now (a level brought back): made anew with them.
+    if staging.first > 0 {
+        let wants = crate::resource::host_tiled(resource)
+            .as_ref()
+            .and_then(|t| t.tiled())
+            .map_or(u32::MAX, crate::tiles::Tiled::copied_now);
+        if wants & ((1u32 << staging.first) - 1) != 0 {
+            unstage(resource);
+            let Some(again) = self::staging(resource, texture) else {
+                return;
+            };
+            staging = again;
+        }
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -706,6 +798,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // this list's submission, and uploaded by this list.
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
+        staging.dirty.store(true, Relaxed);
+    }
+    // A texture made without its most detailed levels writes all but
+    // those that have no tiles (`crate::tiles::Tiled::copied_now`); one
+    // brought back since the last upload (`crate::resource::promote_reduced`)
+    // is uploaded again, which gives it its tiles.
+    let tiled = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    let copied = tiled.as_ref().and_then(|t| t.tiled()).map_or(u32::MAX, crate::tiles::Tiled::copied_now);
+    // (Never a level the staging does not hold.)
+    let copied = copied & !((1u32 << staging.first.min(31)) - 1);
+    if copied & !staging.copied.load(Relaxed) != 0 {
         staging.dirty.store(true, Relaxed);
     }
     // Levels on demand: the last upload left a held level without tiles
@@ -733,6 +836,19 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        // The list reads the texture all the same (through a table copied
+        // as it is recorded): it holds it until it is reset, as it does a
+        // texture it uploads (through its transition). Without, nothing but
+        // the idle time kept the sweep from letting the host copy go while
+        // the list was recorded and not yet sent (`VICTORY_ASYNC_SUBMIT`
+        // sends later); a texture released before the list that reads it is
+        // sent is a page fault when it runs. `VICTORY_TEXTURE_HOLD_READS=0`:
+        // not held, as before.
+        static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HOLD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOLD_READS").is_none_or(|v| v != "0")) {
+            crate::tiles::ORDER[6].fetch_add(1, Relaxed);
+            list.keep(texture);
+        }
         list.defer_texture(staging);
         return;
     }
@@ -744,6 +860,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        let sub = staging.first + i as u32;
+        let level = sub % staging.mips;
+        if level < 32 && copied & (1 << level) == 0 {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -753,7 +874,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             list.note_read(
                 || {
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {sub} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -776,7 +897,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
+                SubresourceIndex: sub,
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -798,23 +919,24 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            staging.copied.store(copied, Relaxed);
         });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
     // order of this list's steps, and before the list is executed, the
     // levels the staging buffer holds as the title's are given the card's
-    // memory if they have none. The list copies every level, so each one
-    // given here is written whole by it (the rest are copies into no
-    // memory, which the card drops).
-    let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
-    let Some(on_demand) = on_demand else {
+    // memory if they have none. The list copies every level but those left
+    // out ([`crate::tiles::Tiled::copied_now`]), so each one given here is
+    // written whole by it (the rest are copies into no memory, which the
+    // card drops).
+    let Some(on_demand) = tiled else {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         return;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), copied, staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -1012,6 +1134,20 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        // A spare buffer nothing filled whole yet (the memory was all zeros,
+        // or could not be read): zeros, as a new buffer holds, before the
+        // first upload from it runs.
+        // (Under the lock every detiling holds.)
+        if self.stale.load(Relaxed) {
+            let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            if self.stale.swap(false, Relaxed) {
+                // SAFETY: the buffer's mapping holds at least `bytes`
+                // bytes; no list has read it yet (its uploads run after
+                // this step).
+                unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+                SPARE_STATS[3].fetch_add(1, Relaxed);
+            }
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -1207,7 +1343,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let sub = self.first + i as u32;
+            let (mip, slice) = (sub % self.mips, sub / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1228,6 +1365,8 @@ impl Staging {
                 return;
             }
         }
+        // Every staged level written: what a spare buffer held is gone.
+        self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1238,6 +1377,18 @@ pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
+    }
+}
+
+/// [`unstage`] for the sweep of idle host copies: the staging state is
+/// dropped later, off the thread that submits (`crate::host::retire_later`).
+pub(crate) fn unstage_later(resource: This) {
+    let gone = {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_mut().and_then(|map| map.remove(&(resource as usize)))
+    };
+    if let Some(gone) = gone {
+        crate::host::retire_later(gone);
     }
 }
 
@@ -1465,7 +1616,18 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let tiled = crate::resource::host_tiled(resource);
+    let on_demand = tiled.is_some();
+    // The levels an upload leaves out now (`crate::tiles::Tiled::copied_now`):
+    // the first ones are not staged at all (they are three quarters of the
+    // texture's bytes or more), when `VICTORY_STAGE_LEFT_OUT` is not `1`.
+    static STAGE_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stage_all = *STAGE_ALL.get_or_init(|| std::env::var_os("VICTORY_STAGE_LEFT_OUT").is_some_and(|v| v == "1"));
+    let left_out = if stage_all {
+        0
+    } else {
+        tiled.as_ref().and_then(|t| t.tiled()).map_or(0, |t| (!t.copied_now()).trailing_ones().min(31))
+    };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -1487,19 +1649,27 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+    let all = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
+    // Only a texture of one layer leaves levels out: its subresources are
+    // its levels, and those left out are the first ones.
+    let first = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize == 1 {
+        left_out.min(all.saturating_sub(1))
+    } else {
+        0
+    };
+    let count = all - first;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
+    // SAFETY: outputs for `count` subresources from `first` on.
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            0,
+            first,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1508,7 +1678,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    if first > 0 {
+        STAGED_LEFT_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (buffer, data, pooled, stale) = staging_buffer(host, total)?;
     crate::host::name_frame(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1537,6 +1710,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        copied: std::sync::atomic::AtomicU32::new(0),
+        first,
+        stale: std::sync::atomic::AtomicBool::new(stale),
         pooled,
     });
     map.insert(resource as usize, s.clone());
