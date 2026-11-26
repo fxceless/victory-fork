@@ -42,12 +42,16 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        Container::parse(tail).ok()?;
+        let total = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        let container = tail.get(..total)?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: container,
+        })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +228,50 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_dxbc(payload: &[u8]) -> Vec<u8> {
+        let header = 0x20usize;
+        let part_offset = header + 4;
+        let total = part_offset + 8 + payload.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0u8; 16]); // digest
+        out.extend_from_slice(&1u16.to_le_bytes()); // major
+        out.extend_from_slice(&0u16.to_le_bytes()); // minor
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // part count
+        out.extend_from_slice(&(part_offset as u32).to_le_bytes());
+        out.extend_from_slice(b"HASH");
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn raw_sources_slice_to_container_total_size() {
+        let container = minimal_dxbc(b"synthetic-shader-payload");
+        let expected_hash = blake3::hash(&container);
+
+        let mut blob = vec![0xAAu8; 17];
+        let first_at = blob.len();
+        blob.extend_from_slice(&container);
+        blob.extend_from_slice(&[0xBBu8; 29]);
+        let second_at = blob.len();
+        blob.extend_from_slice(&container);
+        blob.extend_from_slice(&[0xCCu8; 64]);
+
+        let found = sources(&blob);
+        assert_eq!(found.len(), 2);
+        for (src, expected_offset) in found.iter().zip([first_at, second_at]) {
+            let bytes = src.bytes().unwrap();
+            assert_eq!(bytes.as_ref(), container.as_slice());
+            assert_eq!(blake3::hash(&bytes), expected_hash);
+            assert_eq!(src.label(), format!("@{expected_offset:#x}"));
+        }
+    }
 }
