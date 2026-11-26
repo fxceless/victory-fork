@@ -266,6 +266,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         return Ok(());
     }
     let started = std::time::Instant::now();
+    // The newest copy sent so far, read after the memory was made.
+    let floor = MAPPED_ASKED.load(Ordering::Acquire);
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
@@ -311,11 +313,33 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
+        // A copy sent after `floor` was read was sent after this memory was
+        // made, so it starts only once the memory is mapped: if another
+        // thread sent one since, its signal is waited for instead of a copy
+        // of our own (`VICTORY_MAPPED_SHARED=0`: always our own). The wait is
+        // made outside the lock, so threads that made memory at the same
+        // time wait together and not one after another (v7 on the RTX 5070:
+        // 161,200 waits of 0.16 ms each, all in a row behind this lock).
+        let want = if shared_mapped() && a.value > floor {
+            floor + 1
+        } else {
+            a.value += 1;
+            // Told before the copy is sent: whoever reads it later knows the
+            // copy is sent after its read.
+            MAPPED_ASKED.store(a.value, Ordering::Release);
+            a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+            a.queue.Signal(&a.fence, a.value)?;
+            a.value
+        };
+        if shared_mapped() {
+            let fence = a.fence.clone();
+            drop(aside);
+            if fence.GetCompletedValue() < want {
+                // No event: the call returns once the fence has the value.
+                fence.SetEventOnCompletion(want, windows::Win32::Foundation::HANDLE::default())?;
+            }
+        } else if a.fence.GetCompletedValue() < want {
+            a.fence.SetEventOnCompletion(want, a.event)?;
             WaitForSingleObject(a.event, INFINITE);
         }
     }
@@ -332,6 +356,18 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The value of the newest signal [`mapped`] has asked for (set before its
+/// copy is sent).
+static MAPPED_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`mapped`] waits for a copy another thread sent after the memory
+/// was made, and outside its lock (on by default; `VICTORY_MAPPED_SHARED=0`:
+/// a copy of its own each time, waited for under the lock, as before).
+fn shared_mapped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_SHARED").is_none_or(|v| v != "0"))
 }
 
 /// Times, microseconds and the longest of [`mapped`].
