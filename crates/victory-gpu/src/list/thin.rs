@@ -362,6 +362,12 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    if ops_timed() {
+        let ops = heaviest_ops(frames, 8);
+        let text: Vec<String> =
+            ops.iter().map(|(name, calls, ms, us)| format!("{name} {calls:.0} calls {ms:.1} ms ({us:.1} us each)")).collect();
+        tracing::info!("list calls translated by kind per frame, heaviest first (VICTORY_THIN_OPS=0: not timed): {}", text.join(", "));
+    }
 }
 
 #[inline]
@@ -428,6 +434,8 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        /// Their names, for the line of [`line`].
+        const PLAIN_NAMES: &[&str] = &[$(stringify!($op)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -499,6 +507,78 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+/// The names of the calls after [`Plain`]'s, in the order of [`after`].
+const AFTER_NAMES: [&str; 17] = [
+    "RESET",
+    "CLOSE",
+    "UPLOAD",
+    "BARRIER",
+    "BARRIER_GROUPS",
+    "VIEWPORTS",
+    "SCISSORS",
+    "BLEND_FACTOR",
+    "HEAPS",
+    "COMPUTE_CONSTANTS",
+    "GRAPHICS_CONSTANTS",
+    "INDEX_BUFFER",
+    "VERTEX_BUFFERS",
+    "TARGETS",
+    "CLEAR_RTV",
+    "CLEAR_DSV",
+    "COPY_TEXTURE",
+];
+
+/// The name of call `op` of a stream.
+fn op_name(op: usize) -> &'static str {
+    PLAIN_NAMES.get(op).or_else(|| AFTER_NAMES.get(op.wrapping_sub(Plain::END as usize))).copied().unwrap_or("?")
+}
+
+/// Calls of each kind ([`op_name`]) translated since the last line, and the
+/// nanoseconds they took on all threads (`VICTORY_THIN_OPS=0`: not timed).
+const OPS: usize = 64;
+static OP_CALLS: [AtomicU64; OPS] = [const { AtomicU64::new(0) }; OPS];
+static OP_NS: [AtomicU64; OPS] = [const { AtomicU64::new(0) }; OPS];
+
+fn ops_timed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_OPS").is_none_or(|v| v != "0"))
+}
+
+/// Times one translated call from its start to the end of its scope.
+struct OpTimer(Option<(usize, std::time::Instant)>);
+
+impl OpTimer {
+    #[inline]
+    fn start(op: u64) -> Self {
+        OpTimer(ops_timed().then(|| ((op as usize).min(OPS - 1), std::time::Instant::now())))
+    }
+}
+
+impl Drop for OpTimer {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((op, began)) = self.0 {
+            OP_CALLS[op].fetch_add(1, Relaxed);
+            OP_NS[op].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
+/// The kinds of call that took longest since the last line, most first:
+/// (name, calls, ms on all threads, us a call), per frame over `frames`.
+fn heaviest_ops(frames: f64, most: usize) -> Vec<(&'static str, f64, f64, f64)> {
+    let mut ops: Vec<_> = (0..OPS)
+        .filter_map(|op| {
+            let calls = OP_CALLS[op].swap(0, Relaxed);
+            let ns = OP_NS[op].swap(0, Relaxed);
+            (calls > 0).then(|| (op_name(op), calls as f64 / frames, ns as f64 / 1e6 / frames, ns as f64 / 1e3 / calls as f64))
+        })
+        .collect();
+    ops.sort_by(|a, b| b.2.total_cmp(&a.2));
+    ops.truncate(most);
+    ops
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -732,6 +812,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        // (timed with `VICTORY_THIN_OPS`, until the end of this call)
+        let _timed = OpTimer::start(op);
         if run_plain(op, list, w) {
             continue;
         }
@@ -891,6 +973,16 @@ mod tests {
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.
+    #[test]
+    fn every_kind_of_call_has_a_name() {
+        assert_eq!(super::op_name(super::Plain::TOPOLOGY as usize), "TOPOLOGY");
+        assert_eq!(super::op_name(super::Plain::SYNC as usize), "SYNC");
+        assert_eq!(super::op_name(super::RESET as usize), "RESET");
+        assert_eq!(super::op_name(super::COPY_TEXTURE as usize), "COPY_TEXTURE");
+        assert_eq!(super::op_name(super::UPLOAD as usize), "UPLOAD");
+        assert!((super::COPY_TEXTURE as usize) < super::OPS);
+    }
+
     #[test]
     fn every_recording_method_is_written_down() {
         const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
