@@ -201,7 +201,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -2297,6 +2297,7 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let samplers = self.samplers.into_iter().map(|(words, _)| words).collect();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2309,7 +2310,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
-            samplers: self.samplers,
+            samplers,
         })
     }
 
@@ -6424,18 +6425,25 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self
+                    .samplers
+                    .iter()
+                    .position(|entry| *entry == (words, cmp))
+                {
                     Some(n) => n,
                     None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
+                        let n = self.samplers.len();
+                        if n >= u64::BITS as usize {
+                            return Err("too many static samplers");
+                        }
+                        self.samplers.push((words, cmp));
+                        if cmp {
+                            self.s.cmp_samplers |= 1 << n;
+                        }
+                        n
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -12041,5 +12049,416 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum SampleOp {
+        Sample,
+        SampleCmp,
+    }
+
+    /// Lowers a synthetic compute shader that reads a 2D texture at `s0` using
+    /// constant sampler `words` across `ops` in order, keeping each sample's
+    /// result live in LDS.
+    fn lower_constant_sampler(sampler_words: [u32; 4], ops: &[SampleOp]) -> Lowered {
+        assert!(ops.len() <= 2);
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], null
+            0xBE88_03FF,
+            sampler_words[0], // s_mov_b32 s8, words[0]
+            0xBE89_03FF,
+            sampler_words[1], // s_mov_b32 s9, words[1]
+            0xBE8A_03FF,
+            sampler_words[2], // s_mov_b32 s10, words[2]
+            0xBE8B_03FF,
+            sampler_words[3], // s_mov_b32 s11, words[3]
+            0x7E04_0D00,      // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,      // v_mov_b32 v3, v2
+            0x7E08_0302,      // v_mov_b32 v4, v2
+            0x060A_04F2,      // v_add_f32 v5, 1.0, v2
+            0x7E0C_0305,      // v_mov_b32 v6, v5
+            0x7E0E_0305,      // v_mov_b32 v7, v5
+            0xBF8C_0070,      // s_waitcnt vmcnt(0) lgkmcnt(0)
+        ];
+        for (idx, &op) in ops.iter().enumerate() {
+            let vaddr = 2 + 3 * idx as u32;
+            let vdata = 12 + idx as u32;
+            let w0 = match op {
+                SampleOp::Sample => 0xF09C_0108,    // image_sample_lz dmask:0x1 2D
+                SampleOp::SampleCmp => 0xF0BC_0108, // image_sample_c_lz dmask:0x1 2D
+            };
+            let w1 = 0x0043_0002 | (vdata << 8) | vaddr;
+            words.extend([
+                w0,
+                w1,
+                0xBF8C_3F70,                    // s_waitcnt vmcnt(0)
+                0xD834_0000 | (4 * idx as u32), // ds_write_b32 offset:(4*idx)
+                vdata << 8,                     // v0, v{vdata}
+            ]);
+        }
+        words.push(S_ENDPGM);
+
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap()
+    }
+
+    struct DxilSamplerInfo {
+        /// `(register, kind)` entries from `dx.resources` sampler metadata.
+        resource_samplers: Vec<(u32, u32)>,
+        /// For each `sampleLevel`/`sampleCmpLevelZero` call: `(is_cmp_op, bind_reg, props0)`.
+        sample_calls: Vec<(bool, u32, u32)>,
+    }
+
+    /// Parses the emitted DXIL bitcode's sampler metadata and sampler handle
+    /// annotations for each sample call.
+    fn inspect_dxil_samplers(dxil: &[u8]) -> DxilSamplerInfo {
+        let container = crate::Container::parse(dxil).unwrap();
+        let bitcode = crate::DxilProgram::parse(container.part(crate::FourCC::DXIL).unwrap().data)
+            .unwrap()
+            .bitcode;
+        assert_eq!(&bitcode[..4], b"BC\xC0\xDE");
+
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            pos: usize,
+            cur: u64,
+            bits: u32,
+        }
+        impl<'a> Reader<'a> {
+            fn read(&mut self, n: u32) -> u64 {
+                while self.bits < n {
+                    let b = u64::from(self.bytes[self.pos]);
+                    self.pos += 1;
+                    self.cur |= b << self.bits;
+                    self.bits += 8;
+                }
+                let out = if n == 64 {
+                    self.cur
+                } else {
+                    self.cur & ((1u64 << n) - 1)
+                };
+                self.cur = if n == 64 { 0 } else { self.cur >> n };
+                self.bits -= n;
+                out
+            }
+            fn vbr(&mut self, width: u32) -> u64 {
+                let mut out = 0u64;
+                let mut shift = 0u32;
+                loop {
+                    let chunk = self.read(width);
+                    let lo = chunk & ((1u64 << (width - 1)) - 1);
+                    out |= lo << shift;
+                    if chunk >> (width - 1) == 0 {
+                        return out;
+                    }
+                    shift += width - 1;
+                }
+            }
+            fn align32(&mut self) {
+                let rem = self.bits % 32;
+                if rem != 0 {
+                    self.read(rem);
+                }
+                // Also align byte position to 4-byte boundary.
+                let used_bytes = self.pos - (self.bits as usize / 8);
+                let aligned = used_bytes.next_multiple_of(4);
+                self.pos = aligned;
+                self.cur = 0;
+                self.bits = 0;
+            }
+        }
+
+        #[derive(Clone)]
+        enum ConstVal {
+            Int(i64),
+            Agg(Vec<usize>),
+            Other,
+        }
+        #[derive(Clone)]
+        enum MdVal {
+            Str,
+            Value(usize),
+            Node(Vec<Option<usize>>),
+        }
+
+        let mut r = Reader {
+            bytes: bitcode,
+            pos: 4,
+            cur: 0,
+            bits: 0,
+        };
+        let mut stack: Vec<(u64, u32)> = Vec::new();
+        let mut width = 2u32;
+        let mut type_void = Vec::<bool>::new();
+        let mut func_ret_void = Vec::<bool>::new();
+        let mut globals = 0usize;
+        let mut funcs = Vec::<usize>::new();
+        let mut consts = Vec::<ConstVal>::new();
+        let mut names = std::collections::HashMap::<usize, String>::new();
+        let mut mds = Vec::<MdVal>::new();
+        let mut named_mds = std::collections::HashMap::<String, Vec<usize>>::new();
+        let mut pending_md_name = None::<String>;
+        let mut calls = Vec::<(usize, usize, Vec<usize>)>::new();
+        let mut inst_id = 0usize;
+        let mut func_base_set = false;
+
+        while r.pos < r.bytes.len() || r.bits > 0 {
+            let entry = r.read(width);
+            match entry {
+                0 => {
+                    r.align32();
+                    stack.pop();
+                    width = stack.last().map_or(2, |s| s.1);
+                    if stack.is_empty() {
+                        break;
+                    }
+                }
+                1 => {
+                    let id = r.vbr(8);
+                    let new_w = r.vbr(4) as u32;
+                    r.align32();
+                    let _len_words = r.read(32);
+                    stack.push((id, new_w));
+                    width = new_w;
+                    if id == 12 && !func_base_set {
+                        inst_id = globals + funcs.len() + consts.len();
+                        func_base_set = true;
+                    }
+                }
+                3 => {
+                    let code = r.vbr(6);
+                    let n = r.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                    let block = stack.last().map_or(0, |s| s.0);
+                    match (block, code) {
+                        (17, 2) => type_void.push(true),
+                        (17, 3 | 7 | 8 | 11 | 18 | 20) => type_void.push(false),
+                        (17, 21) => {
+                            let ret = ops[1] as usize;
+                            type_void.push(false);
+                            let _ = ret;
+                            // Track func ret type separately via func_ret_void on (8, 8).
+                            // Store ret index in a map? Easier: compute from type_void below.
+                        }
+                        _ => {}
+                    }
+                    if block == 17 && code == 21 {
+                        func_ret_void.push(type_void[ops[1] as usize]);
+                    } else if block == 17 && matches!(code, 2 | 3 | 7 | 8 | 11 | 18 | 20) {
+                        func_ret_void.push(false);
+                    }
+                    match (block, code) {
+                        (8, 7) => globals += 1,
+                        (8, 8) => funcs.push(ops[0] as usize),
+                        (11, 3 | 6) => consts.push(ConstVal::Other),
+                        (11, 4) => {
+                            let v = ops[0];
+                            let signed = if v & 1 == 0 {
+                                (v >> 1) as i64
+                            } else {
+                                -((v >> 1) as i64)
+                            };
+                            consts.push(ConstVal::Int(signed));
+                        }
+                        (11, 7) => {
+                            consts.push(ConstVal::Agg(ops.iter().map(|&v| v as usize).collect()))
+                        }
+                        (14, 1) => {
+                            let s = String::from_utf8(ops[1..].iter().map(|&c| c as u8).collect())
+                                .unwrap();
+                            names.insert(ops[0] as usize, s);
+                        }
+                        (15, 1) => mds.push(MdVal::Str),
+                        (15, 2) => mds.push(MdVal::Value(ops[1] as usize)),
+                        (15, 3) => mds.push(MdVal::Node(
+                            ops.iter()
+                                .map(|&o| (o != 0).then(|| o as usize - 1))
+                                .collect(),
+                        )),
+                        (15, 4) => {
+                            pending_md_name = Some(
+                                String::from_utf8(ops.iter().map(|&c| c as u8).collect()).unwrap(),
+                            );
+                        }
+                        (15, 10) => {
+                            let name = pending_md_name.take().unwrap();
+                            named_mds.insert(name, ops.iter().map(|&o| o as usize).collect());
+                        }
+                        (12, 2 | 3 | 16 | 20 | 26 | 28 | 29 | 38 | 43 | 46) => {
+                            inst_id += 1;
+                        }
+                        (12, 34) => {
+                            let fty = ops[2] as usize;
+                            let func_val = inst_id - ops[3] as usize;
+                            let args = ops[4..].iter().map(|&a| inst_id - a as usize).collect();
+                            let ret_void = func_ret_void[fty];
+                            let res_id = if ret_void { usize::MAX } else { inst_id };
+                            calls.push((res_id, func_val, args));
+                            if !ret_void {
+                                inst_id += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                other => panic!("unexpected bitcode entry {other}"),
+            }
+        }
+
+        let const_base = globals + funcs.len();
+        let const_int = |val_id: usize| -> i64 {
+            match &consts[val_id - const_base] {
+                ConstVal::Int(v) => *v,
+                _ => panic!("expected int constant for value {val_id}"),
+            }
+        };
+        let const_agg = |val_id: usize| -> Vec<i64> {
+            match &consts[val_id - const_base] {
+                ConstVal::Agg(elems) => elems.iter().map(|&e| const_int(e)).collect(),
+                _ => panic!("expected aggregate constant for value {val_id}"),
+            }
+        };
+
+        let dx_resources = named_mds.get("dx.resources").expect("dx.resources");
+        let MdVal::Node(res_groups) = &mds[dx_resources[0]] else {
+            panic!();
+        };
+        let sampler_list_md = res_groups[3].expect("sampler resources");
+        let MdVal::Node(sampler_nodes) = &mds[sampler_list_md] else {
+            panic!();
+        };
+        let resource_samplers = sampler_nodes
+            .iter()
+            .map(|node_idx| {
+                let MdVal::Node(fields) = &mds[node_idx.unwrap()] else {
+                    panic!();
+                };
+                let MdVal::Value(reg_val) = mds[fields[4].unwrap()] else {
+                    panic!();
+                };
+                let MdVal::Value(kind_val) = mds[fields[6].unwrap()] else {
+                    panic!();
+                };
+                (const_int(reg_val) as u32, const_int(kind_val) as u32)
+            })
+            .collect();
+
+        let call_map: std::collections::HashMap<usize, (usize, Vec<usize>)> = calls
+            .iter()
+            .filter(|(res, ..)| *res != usize::MAX)
+            .map(|(res, f, args)| (*res, (*f, args.clone())))
+            .collect();
+
+        let mut sample_calls = Vec::new();
+        for (_, func_val, args) in &calls {
+            let fname = names.get(func_val).map(String::as_str).unwrap_or("");
+            let is_cmp_op = match fname {
+                "dx.op.sampleLevel.f32" => false,
+                "dx.op.sampleCmpLevelZero.f32" => true,
+                _ => continue,
+            };
+            let sh = args[2];
+            let (ann_fn, ann_args) = call_map.get(&sh).expect("annotated sampler handle");
+            assert_eq!(names[ann_fn], "dx.op.annotateHandle");
+            let props = const_agg(ann_args[2]);
+            let (bind_fn, bind_args) = call_map.get(&ann_args[1]).expect("created sampler handle");
+            assert_eq!(names[bind_fn], "dx.op.createHandleFromBinding");
+            let bind = const_agg(bind_args[1]);
+            let index = const_int(bind_args[2]) as u32;
+            assert_eq!(bind[0], bind[1]);
+            assert_eq!(bind[0] as u32, index);
+            assert_eq!(bind[2] as u32, super::super::SAMPLER_SPACE);
+            assert_eq!(bind[3], 3);
+            sample_calls.push((is_cmp_op, index, props[0] as u32));
+        }
+
+        DxilSamplerInfo {
+            resource_samplers,
+            sample_calls,
+        }
+    }
+
+    fn assert_valid_dxil(dxil: &[u8]) {
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.to_vec()).unwrap();
+        }
+    }
+
+    #[test]
+    fn static_sampler_separates_ordinary_then_comparison_uses() {
+        let words = [0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000];
+        let l = lower_constant_sampler(words, &[SampleOp::Sample, SampleOp::SampleCmp]);
+        assert_eq!(l.samplers, vec![words, words]);
+        assert_eq!(l.cmp_samplers, 0b10);
+        assert_eq!(
+            super::super::StaticSampler::from_words(l.samplers[0]).filter & 0x80,
+            0
+        );
+        assert_eq!(
+            super::super::StaticSampler::from_words(l.samplers[1]).filter & 0x80,
+            0
+        );
+        let info = inspect_dxil_samplers(&l.dxil);
+        assert_eq!(info.resource_samplers, vec![(0, 0), (1, 1)]);
+        assert_eq!(
+            info.sample_calls,
+            vec![(false, 0, 14), (true, 1, 14 | 0x8000)]
+        );
+        assert_valid_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn static_sampler_separates_comparison_then_ordinary_uses() {
+        let words = [0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000];
+        let l = lower_constant_sampler(words, &[SampleOp::SampleCmp, SampleOp::Sample]);
+        assert_eq!(l.samplers, vec![words, words]);
+        assert_eq!(l.cmp_samplers, 0b01);
+        let info = inspect_dxil_samplers(&l.dxil);
+        assert_eq!(info.resource_samplers, vec![(0, 1), (1, 0)]);
+        assert_eq!(
+            info.sample_calls,
+            vec![(true, 0, 14 | 0x8000), (false, 1, 14)]
+        );
+        assert_valid_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn static_sampler_deduplicates_matching_sampler_kinds() {
+        let words = [0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000];
+
+        let ordinary = lower_constant_sampler(words, &[SampleOp::Sample, SampleOp::Sample]);
+        assert_eq!(ordinary.samplers, vec![words]);
+        assert_eq!(ordinary.cmp_samplers, 0);
+        let ord_info = inspect_dxil_samplers(&ordinary.dxil);
+        assert_eq!(ord_info.resource_samplers, vec![(0, 0)]);
+        assert_eq!(ord_info.sample_calls, vec![(false, 0, 14), (false, 0, 14)]);
+        assert_valid_dxil(&ordinary.dxil);
+
+        let cmp = lower_constant_sampler(words, &[SampleOp::SampleCmp, SampleOp::SampleCmp]);
+        assert_eq!(cmp.samplers, vec![words]);
+        assert_eq!(cmp.cmp_samplers, 1);
+        let cmp_info = inspect_dxil_samplers(&cmp.dxil);
+        assert_eq!(cmp_info.resource_samplers, vec![(0, 1)]);
+        assert_eq!(
+            cmp_info.sample_calls,
+            vec![(true, 0, 14 | 0x8000), (true, 0, 14 | 0x8000)]
+        );
+        assert_valid_dxil(&cmp.dxil);
     }
 }
