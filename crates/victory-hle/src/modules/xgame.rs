@@ -90,6 +90,127 @@ extern "system" fn launch_new_game(
     }
 }
 
+/// Normalizes a path for matching the current executable argument across
+/// `/` vs `\`, `\\?\` verbatim prefixes, `.`/`..` segments, relative paths,
+/// and Windows case-insensitivity.
+fn normalize_path(path: &std::path::Path, cwd: Option<&std::path::Path>) -> String {
+    let full: std::borrow::Cow<'_, std::path::Path> = match cwd {
+        Some(dir) if path.is_relative() => std::borrow::Cow::Owned(dir.join(path)),
+        _ => std::borrow::Cow::Borrowed(path),
+    };
+    let raw = full.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = stripped.replace('\\', "/");
+    let (drive_prefix, rest) = if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
+        (Some(normalized[..2].to_ascii_lowercase()), &normalized[2..])
+    } else {
+        (None, normalized.as_str())
+    };
+    let leading_slash = rest.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|&p| p != "..") {
+                    parts.pop();
+                } else if !leading_slash && drive_prefix.is_none() {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = String::new();
+    if let Some(drive) = drive_prefix {
+        out.push_str(&drive);
+    }
+    if leading_slash {
+        out.push('/');
+    }
+    out.push_str(&parts.join("/"));
+    if cfg!(windows) {
+        out.to_ascii_lowercase()
+    } else {
+        out
+    }
+}
+
+fn same_path(a: &std::ffi::OsStr, b: &std::ffi::OsStr, cwd: Option<&std::path::Path>) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b))
+        && ca == cb
+    {
+        return true;
+    }
+    normalize_path(std::path::Path::new(a), cwd) == normalize_path(std::path::Path::new(b), cwd)
+}
+
+/// Splits a Windows command-line argument string following `CommandLineToArgvW`
+/// quoting and backslash-escaping rules, preserving spaces inside `"..."`.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = args.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut token = String::new();
+        let mut in_quotes = false;
+        while let Some(&ch) = chars.peek() {
+            if !in_quotes && ch.is_ascii_whitespace() {
+                break;
+            }
+            match ch {
+                '\\' => {
+                    let mut slashes = 0usize;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        slashes += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        for _ in 0..slashes / 2 {
+                            token.push('\\');
+                        }
+                        if slashes % 2 == 1 {
+                            chars.next();
+                            token.push('"');
+                        } else {
+                            chars.next();
+                            in_quotes = !in_quotes;
+                        }
+                    } else {
+                        for _ in 0..slashes {
+                            token.push('\\');
+                        }
+                    }
+                }
+                '"' => {
+                    chars.next();
+                    if in_quotes && chars.peek() == Some(&'"') {
+                        chars.next();
+                        token.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                }
+                _ => {
+                    chars.next();
+                    token.push(ch);
+                }
+            }
+        }
+        out.push(token);
+    }
+    out
+}
+
 /// Our own arguments for the relaunch: the title's executable replaced by
 /// `exe`, earlier title arguments dropped, `args` after `--`.
 fn relaunch_args(
@@ -99,14 +220,18 @@ fn relaunch_args(
     args: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut out: Vec<_> = ours.into_iter().take_while(|a| a != "--").collect();
+    let cwd = std::env::current_dir().ok();
     if !exe.is_empty()
-        && let Some(slot) = out.iter_mut().find(|a| a.as_os_str() == current)
+        && let Some(slot) = out
+            .iter_mut()
+            .find(|a| same_path(a.as_os_str(), current, cwd.as_deref()))
     {
         *slot = exe.into();
     }
-    if !args.trim().is_empty() {
+    let parsed = split_args(args);
+    if !parsed.is_empty() {
         out.push("--".into());
-        out.extend(args.split_whitespace().map(Into::into));
+        out.extend(parsed.into_iter().map(Into::into));
     }
     out
 }
@@ -207,6 +332,41 @@ mod tests {
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn relaunch_matches_normalized_paths_and_preserves_quoted_args() {
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            r"G:/Games/./Title/../Title/game.exe",
+            "--execute",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
+        let current = std::ffi::OsStr::new(r"\\?\g:\games\title\GAME.EXE");
+        let cmd = relaunch_args(
+            ours,
+            current,
+            r"G:\Games\Title\other.exe",
+            r#"-profile="My Profile" -path "C:\Program Files\Save\\" -say "a \"b\"" -empty """#,
+        );
+        assert_eq!(cmd[1], r"G:\Games\Title\other.exe");
+        assert_eq!(cmd[3], "--");
+        assert_eq!(
+            cmd[4..],
+            [
+                "-profile=My Profile",
+                "-path",
+                r"C:\Program Files\Save\",
+                "-say",
+                r#"a "b""#,
+                "-empty",
+                "",
+            ]
+            .map(std::ffi::OsString::from)
+        );
     }
 
     #[test]
