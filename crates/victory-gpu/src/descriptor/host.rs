@@ -13,6 +13,63 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Descriptor indices are bounded by the heap size. Keep them in slot order
+/// so a pass visits neighboring descriptors and their bookkeeping together.
+#[derive(Default)]
+struct SlotSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl SlotSet {
+    fn insert(&mut self, slot: u32) {
+        let word = (slot / 64) as usize;
+        let bit = 1 << (slot % 64);
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        if self.words[word] & bit == 0 {
+            self.words[word] |= bit;
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, slot: &u32) -> bool {
+        let bit = 1 << (slot % 64);
+        if let Some(word) = self.words.get_mut((slot / 64) as usize)
+            && *word & bit != 0
+        {
+            *word &= !bit;
+            self.len -= 1;
+            return true;
+        }
+        false
+    }
+
+    fn slots(&self) -> Vec<u32> {
+        let mut slots = Vec::with_capacity(self.len);
+        if self.len != 0 {
+            for (word, &bits) in self.words.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    slots.push(word as u32 * 64 + bits.trailing_zeros());
+                    bits &= bits - 1;
+                }
+            }
+        }
+        slots
+    }
+
+    fn take(&mut self) -> Vec<u32> {
+        let slots = self.slots();
+        if self.len != 0 {
+            self.words.fill(0);
+            self.len = 0;
+        }
+        slots
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -62,10 +119,10 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: Mutex<SlotSet>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Mutex<SlotSet>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1514,14 +1571,14 @@ impl HostHeap {
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        buffers.slots()
     }
 
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        changed.take()
     }
 
     /// Records what title slot `index` now holds for shaders that pick
@@ -3128,6 +3185,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_slot_set_reports_changed_slots_once_in_slot_order() {
+        let mut set = super::SlotSet::default();
+        for slot in [131_071, 64, 0, 63, 64, 131_071] {
+            set.insert(slot);
+        }
+        assert!(!set.remove(&65));
+        assert!(set.remove(&64));
+        assert_eq!(set.slots(), [0, 63, 131_071]);
+        assert_eq!(set.take(), [0, 63, 131_071]);
+        assert!(set.take().is_empty());
+        set.insert(64);
+        assert_eq!(set.take(), [64]);
+    }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA).
