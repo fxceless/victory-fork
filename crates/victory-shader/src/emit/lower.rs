@@ -3691,7 +3691,13 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if self.s.m.const_f32(a) == Some(0.0) || self.s.m.const_f32(b) == Some(0.0) {
+            return self.s.m.f32(0);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if a == b {
+            return m;
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
@@ -3719,8 +3725,14 @@ impl<'a> Lower<'a> {
     /// than turning an infinite or NaN factor into a NaN.
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
-        let fused = self.fmad(a, b, c);
         let zero = self.s.m.f32(0);
+        if self.s.m.const_f32(a) == Some(0.0) || self.s.m.const_f32(b) == Some(0.0) {
+            return self.s.m.bin(cur, Bin::Add, zero, c);
+        }
+        let fused = self.fmad(a, b, c);
+        if a == b {
+            return fused;
+        }
         let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
         let z = self.s.m.bin(cur, Bin::Or, az, bz);

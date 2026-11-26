@@ -1657,6 +1657,38 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
     });
 }
 
+/// Squaring (`a == b`) in `v_mul_legacy_f32` and `v_mad_legacy_f32` preserves
+/// `+0.0`, `-0.0`, `±inf`, and `NaN` with the plain product/fma.
+#[test]
+fn legacy_square_fastpath_matches_full_semantics() {
+    let mul_sq = build_valu_cs(&[vop2(0x07, 0, vgpr(1), 1)]);
+    let mad_sq = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(1), vgpr(2)));
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+    let mul_cases = [
+        [0x0000_0000, 0, 0, 0], // +0 * +0 -> +0
+        [0x8000_0000, 0, 0, 0], // -0 * -0 -> +0
+        [0x7f80_0000, 0, 0, 0], // +inf * +inf -> +inf
+        [0xff80_0000, 0, 0, 0], // -inf * -inf -> +inf
+        [0x4040_0000, 0, 0, 0], // 3.0 * 3.0 -> 9.0
+    ];
+    let mul_want = [0x0000_0000u32, 0x0000_0000, 0x7f80_0000, 0x7f80_0000, 0x4110_0000];
+    run_cases(&mul_sq, &mul_cases, |backend, i, _, got| {
+        assert_eq!(got, mul_want[i], "{backend}: mul_sq case {i}");
+    });
+
+    let mad_cases = [
+        [0x8000_0000, 0x8000_0000, 0, 0], // (-0)^2 + -0 -> +0
+        [0x4000_0000, 0xbf80_0000, 0, 0], // 2.0^2 - 1.0 -> 3.0
+    ];
+    let mad_want = [0x0000_0000u32, 0x4040_0000];
+    run_cases(&mad_sq, &mad_cases, |backend, i, _, got| {
+        assert_eq!(got, mad_want[i], "{backend}: mad_sq case {i}");
+    });
+}
+
 /// A dispatch spread across z past 65,535 groups in x
 /// (`USER_DISPATCH_SPREAD`): the program sees the group id the title asked
 /// for, `(x + z * row)`, and the groups past the asked count do nothing.

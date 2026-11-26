@@ -300,6 +300,13 @@ impl Module {
         let t = self.float();
         self.constant(t, Const::Float(bits))
     }
+    pub fn const_f32(&self, v: V) -> Option<f32> {
+        let V::Const(id) = v else { return None };
+        match self.consts.get(id as usize)?.1 {
+            Const::Float(bits) => Some(f32::from_bits(bits)),
+            _ => None,
+        }
+    }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
     }
