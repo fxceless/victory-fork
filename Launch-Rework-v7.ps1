@@ -1,34 +1,31 @@
-# Launch the rework/v7-5070 binary (Belobug a-publier + DexNom overflow fix).
+# Launch the rework/v7-5070 binary (Belobug a-publier + DexNom overflow fix)
+# with Belobug's proven scripts\play.ps1 performance stack + on-screen HUD.
 #
 # Usage:
 #   cd C:\Users\Alpacher\Downloads\victory-fork-rework
 #   Set-ExecutionPolicy -Scope Process Bypass
-#   .\Launch-Rework-v7.ps1              # safe high-ROI NVIDIA switches (PORT_CBV off)
-#   .\Launch-Rework-v7.ps1 -Safe        # Belobug defaults only, no VICTORY_PORT_*
-#   .\Launch-Rework-v7.ps1 -PortCbv     # A/B: also set VICTORY_PORT_CBV=1
+#   .\Launch-Rework-v7.ps1                 # proven play.ps1 stack + HUD (recommended)
+#   .\Launch-Rework-v7.ps1 -SeriesS        # Xbox Series S profile (lower RAM, ~5 ms faster)
+#   .\Launch-Rework-v7.ps1 -Ports          # opt-in: add experimental VICTORY_PORT_* patches
+#   .\Launch-Rework-v7.ps1 -PortCbv        # opt-in: add VICTORY_PORT_CBV=1
+#   .\Launch-Rework-v7.ps1 -Output 1920x1080
+#   .\Launch-Rework-v7.ps1 -Safe           # Belobug play.ps1 -Safe
 #
-# Uses target-v7\release\victory.exe and a fresh cache-rework-v7.
-# Does not touch target-v3/v4/v5/v6 or cache-rework / cache-rework-v4 / cache-rework-v6.
-#
-# PORT_CBV is off by default: it works on NVIDIA but drops the constant-cache
-# path. -PortCbv uses a different shader-cache key; warm the default cache
-# first, then optionally .\Warm-v7.ps1 -PortCbv.
-#
-# Full console output is teed as UTF-8 (no BOM) to
-# logs\run-v7-YYYYMMDD-HHMMSS.log. The writer is buffered (64 KiB,
-# AutoFlush off, flush every 32 lines) so logging does not back-pressure
-# Victory. Native stderr is converted to text so Windows PowerShell does
-# not paint a red NativeCommandError banner.
+# Uses target-v7\release\victory.exe and cache-rework-v7.
+# Does not touch target-v3/v4/v5/v6 or earlier caches.
 
 param(
     [switch]$Safe,
-    [switch]$PortCbv
+    [switch]$Ports,
+    [switch]$PortCbv,
+    [switch]$SeriesS,
+    [string]$Output
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-# Drop leftovers from a v1-v6 or Belobug play.ps1 session in this window,
+# Drop leftover VICTORY_* switches from earlier sessions in this window,
 # except path settings.
 $keep = @('VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR')
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Object {
@@ -38,34 +35,67 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Ob
 $env:VICTORY_GAME_DIR = 'C:\Users\Alpacher\Downloads\GTA'
 $env:VICTORY_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'VIctory\cache-rework-v7'
 $env:VICTORY_LOG = 'info'
-# Always pick the discrete NVIDIA adapter on this machine (not a PORT_* switch).
 $env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
-# Device-loss fix: do not show a texture slot before its upload ran.
-# Belobug scripts/play.ps1 sets this even in -Safe; it is not a PORT_* switch.
-$env:VICTORY_SHOW_AFTER = '1'
+$env:VICTORY_PANEL = '1'
 
-$mode = 'default'
+# Belobug scripts\play.ps1 core performance & stability stack
+$env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_RELAY = '2'
+$env:VICTORY_WIDE_BACK = '1'
+$env:VICTORY_CARD_REHASH_RUNS = '1'
+$env:VICTORY_JOIN_COPIES = '1'
+$env:VICTORY_INDIRECT_WINDOW = '1'
+$env:VICTORY_RELAY_COPY = '1'
+$env:VICTORY_CARD_STEPS = '2'
+$env:VICTORY_INDIRECT_BATCH = '2'
+$env:VICTORY_MAP_THREADS = '1'
+$env:VICTORY_TITLE_PRIORITIES = '0'
+$env:VICTORY_CARD_AWAKE = '1'
+$env:VICTORY_SHOW_AFTER = '1'
+$env:VICTORY_AMBIENT = '0.8'
+$env:VICTORY_D3D12_DRED = 'light'
+
+# DirectStorage & memory tuning
+$env:VICTORY_DSTORAGE_STAGING_MB = '256'
+$env:VICTORY_MAP_LEAN = '1'
+$env:VICTORY_STREAM_PRIORITY = '1'
+$env:VICTORY_FRAME_INTERVAL_MS = '16.667'
+
+$mode = 'play.ps1 stack + HUD'
 if ($Safe) {
-    $mode = 'safe (Belobug defaults; no VICTORY_PORT_*)'
+    $env:VICTORY_UNDER_WIDE = '0'
+    $env:VICTORY_LAND_ECHO = '0'
+    $mode = 'safe (play.ps1 -Safe)'
 } else {
+    $env:VICTORY_THIN = '1'
+    # 5800X3D is 8c/16t; Belobug default is 8 (tuned on a 12900K).
+    $env:VICTORY_THIN_THREADS = '6'
+    $env:VICTORY_JOIN_PARTS = '8'
+    $env:VICTORY_UPLOAD_AHEAD = '1'
+}
+
+if ($Ports) {
     $env:VICTORY_PORT_GUARD = '1'
     $env:VICTORY_PORT_JOURNAL = '1'
     $env:VICTORY_PORT_CONSTANTS = '1'
     $env:VICTORY_PORT_DESCRIPTORS = '1'
-    $env:VICTORY_THIN = '1'
-    # 5800X3D is 8c/16t; Belobug default is 8 (tuned on a 12900K).
-    $env:VICTORY_THIN_THREADS = '6'
-    $env:VICTORY_DSTORAGE_STAGING_MB = '256'
-    # Already default-on in Belobug unless set to 0; set explicitly.
-    $env:VICTORY_MAP_LEAN = '1'
-    $env:VICTORY_STREAM_PRIORITY = '1'
-    $env:VICTORY_OUTPUT = '1920x1080'
-    $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
+    $mode = "$mode + PORT_*"
 }
 
 if ($PortCbv) {
     $env:VICTORY_PORT_CBV = '1'
     $mode = "$mode + PORT_CBV=1"
+}
+
+if ($Output) {
+    $env:VICTORY_OUTPUT = $Output
+    $mode = "$mode + OUTPUT=$Output"
+}
+
+$extraArgs = @()
+if ($SeriesS) {
+    $extraArgs += @('--console', 'series-s')
+    $mode = "$mode + SeriesS"
 }
 
 $exe = Join-Path $PSScriptRoot 'target-v7\release\victory.exe'
@@ -80,6 +110,7 @@ if (-not (Test-Path -LiteralPath $game)) {
 
 $logDir = Join-Path $PSScriptRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$stamp = Get-Date -Format 'yyyyMMdd-HHMMSS'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $logDir "run-v7-$stamp.log"
 New-Item -ItemType Directory -Force -Path $env:VICTORY_CACHE_DIR | Out-Null
@@ -89,14 +120,14 @@ VIctory rework v7 launch
   exe:      $exe
   game:     $game
   mode:     $mode
+  console:  $(if ($SeriesS) { 'Xbox Series S' } else { 'Xbox Series X' })
   cache:    $($env:VICTORY_CACHE_DIR)
   adapter:  VICTORY_D3D12_ADAPTER=NVIDIA
-  show:     VICTORY_SHOW_AFTER=1
-  ports:    $(if ($Safe) { 'none' } else { 'GUARD=1 JOURNAL=1 CONSTANTS=1 DESCRIPTORS=1' })
-  cbv:      $(if ($PortCbv) { 'VICTORY_PORT_CBV=1 (A/B; loses NVIDIA constant cache; different shader key)' } else { 'off' })
-  thin:     $(if ($Safe) { 'unset' } else { 'VICTORY_THIN=1  VICTORY_THIN_THREADS=6' })
-  io:       $(if ($Safe) { 'Belobug defaults' } else { 'DSTORAGE_STAGING_MB=256  MAP_LEAN=1  STREAM_PRIORITY=1' })
-  output:   $(if ($Safe) { 'title default' } else { 'VICTORY_OUTPUT=1920x1080  FRAME_INTERVAL_MS=16.667' })
+  hud:      VICTORY_PANEL=1
+  stack:    RELAY=2 JOIN_PARTS=$(if ($Safe) { 'off' } else { '8' }) UPLOAD_AHEAD=$(if ($Safe) { 'off' } else { '1' }) CARD_STEPS=2 TEXTURE_NO_WAIT=1 SHOW_AFTER=1
+  thin:     $(if ($Safe) { 'off' } else { 'VICTORY_THIN=1  VICTORY_THIN_THREADS=6' })
+  ports:    $(if ($Ports) { 'GUARD=1 JOURNAL=1 CONSTANTS=1 DESCRIPTORS=1' } else { 'off (use -Ports to enable)' })
+  output:   $(if ($Output) { $Output } else { 'title default (normal HUD scale)' })
   stats:    $log
   HEAD:     $((git -C $PSScriptRoot rev-parse --short HEAD))
 Starting... (does not overwrite target-v3/v4/v5/v6 or earlier caches)
@@ -113,7 +144,7 @@ try {
     Write-Host ''
 
     $ErrorActionPreference = 'Continue'
-    & $exe run $game --execute 2>&1 | ForEach-Object {
+    & $exe run $game @extraArgs --execute 2>&1 | ForEach-Object {
         if ($_ -is [System.Management.Automation.ErrorRecord]) {
             $line = $_.Exception.Message
         } else {
