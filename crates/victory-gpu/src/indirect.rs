@@ -638,6 +638,16 @@ pub(crate) fn gather_by_copy_kept() -> bool {
 /// same declarations), and a write to another host copy of the same bytes
 /// is not seen through this one on the card either way. A pipeline the
 /// layer does not know still ends the gathering whole.
+///
+/// NOT PROVEN EXACT (an independent review, 2026-11-26): three kinds of
+/// shader write are declared nowhere. (1) A buffer the shader picks from
+/// the view heap by an index it computes, and (2) title memory by address
+/// through a copy another list numbered: for programs that can do either
+/// the gathering still ends whole (`State::gather_ends`). (3) An entry of
+/// a descriptor array past the program's used-resource list, and a picked
+/// view that needs no stride: NOT covered. Before this switch is used for
+/// play, a run with it in turn and `VICTORY_INDIRECT_WINDOW_CHECK=1` must
+/// show that "differed" does not grow in the phases with it.
 pub(crate) fn gather_by_copy() -> bool {
     match gather_by_copy_mode() {
         0 => false,
@@ -1956,7 +1966,11 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                // WHICH two draws keep the budget is the order the card
+                // runs the threads in, which nothing fixes (the software
+                // device gave another two in five runs of seven): only how
+                // many is the clamp's to say, below.
+                assert_ne!(i, 0, "the record that is no draw charges nothing and is not kept as one");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2576,7 +2590,8 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
+        /// Kept beside `depth_tested` (the view the rig clears through when it is made).
+        _depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2884,7 +2899,7 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
+                    _depth_written: depth_written,
                     depth_tested,
                     stamps,
                     back,
