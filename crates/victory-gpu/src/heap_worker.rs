@@ -260,7 +260,9 @@ fn worker() {
     let Some(job) = JOB.get() else {
         return;
     };
+    crate::frame_why::worker(crate::frame_why::Worker::Heap);
     loop {
+        let waiting = crate::frame_why::span(crate::frame_why::Phase::Idle);
         let heap = {
             let mut next = lock(&job.heap);
             loop {
@@ -270,8 +272,10 @@ fn worker() {
                 }
             }
         };
+        drop(waiting);
         let started = std::time::Instant::now();
         {
+            let _working = crate::frame_why::span(crate::frame_why::Phase::Prepare);
             let _pass = lock(&PASS);
             let heap = heap.heap();
             if let Some(host) = heap.host() {

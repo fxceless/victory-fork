@@ -1,6 +1,12 @@
 //! With `VICTORY_FRAME_WHY2=1` (off by default), every five seconds show
 //! where each thread spent the time between present calls. A phase still open
 //! at a present is split there, even a worker asleep for many frames.
+//!
+//! Two lines each time, `why2 mean` and `why2 longest`: the presenting
+//! thread, the submit worker, the relay worker and all other callers. While
+//! the texture worker runs (`VICTORY_HEAP_WORKER=1`), each is followed by a
+//! `why2 heap worker` line: its pass (prepare), waiting for one (idle), and
+//! the rest (other).
 use std::cell::Cell;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -12,6 +18,8 @@ static ON: LazyLock<bool> =
 pub(crate) enum Worker {
     Submit,
     Relay,
+    /// The texture worker ([`crate::heap_worker`]).
+    Heap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +50,7 @@ const SUBMIT: &[(Phase, &str)] = &[
     (Idle, "idle"),
 ];
 const RELAY: &[(Phase, &str)] = &[(WaitFence, "fence wait"), (Land, "land"), (Idle, "idle")];
+const HEAP: &[(Phase, &str)] = &[(Prepare, "prepare"), (Idle, "idle")];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -120,6 +129,7 @@ pub(crate) fn span(phase: Phase) -> Span {
         None => TITLE,
         Some(Worker::Submit) => SUBMIT,
         Some(Worker::Relay) => RELAY,
+        Some(Worker::Heap) => HEAP,
     };
     if !phases.iter().any(|&(p, _)| p == phase) {
         return Span(None);
@@ -136,17 +146,22 @@ pub(crate) fn span(phase: Phase) -> Span {
 #[derive(Default)]
 struct Reading {
     wall: u64,
-    // Presenting caller, submit worker, relay worker, all other callers.
-    lanes: [Times; 4],
-    workers: [bool; 2],
+    // Presenting caller, submit worker, relay worker, all other callers,
+    // texture worker.
+    lanes: [Times; 5],
+    // Whether the submit, relay and texture workers were seen.
+    workers: [bool; 3],
 }
 
 impl Reading {
     fn finish(&mut self, wall: Duration) {
         self.wall = wall.as_nanos() as u64;
-        for lane in &mut self.lanes[..3] {
+        for (i, lane) in self.lanes.iter_mut().enumerate() {
             // Also covers the time before the worker started. Other callers
             // can overlap one another and have no single frame of wall time.
+            if i == 3 {
+                continue;
+            }
             lane[Other as usize] = self.wall.saturating_sub(lane.iter().sum::<u64>());
         }
     }
@@ -173,7 +188,7 @@ impl Reading {
                 .iter()
                 .map(|&(p, name)| format!("{name} {:.1}", ms(self.lanes[lane][p as usize])))
                 .collect();
-            if lane < 3 {
+            if lane != 3 {
                 fields.push(format!("other {:.1}", ms(self.lanes[lane][Other as usize])));
             }
             fields.join(", ")
@@ -186,6 +201,9 @@ impl Reading {
             fields(2, RELAY),
             fields(3, TITLE)
         );
+        if self.workers[2] {
+            tracing::info!("why2 heap worker {what} (frames={frames}, ms): {}", fields(4, HEAP));
+        }
     }
 }
 
@@ -220,11 +238,15 @@ fn sample(presenter: &Arc<Mutex<Track>>) -> (Instant, Reading) {
         let lane = match t.worker {
             Some(Worker::Submit) => 1,
             Some(Worker::Relay) => 2,
+            Some(Worker::Heap) => 4,
             None if Arc::ptr_eq(track, presenter) => 0,
             None => 3,
         };
-        if t.worker.is_some() {
-            frame.workers[lane - 1] = true;
+        match t.worker {
+            Some(Worker::Submit) => frame.workers[0] = true,
+            Some(Worker::Relay) => frame.workers[1] = true,
+            Some(Worker::Heap) => frame.workers[2] = true,
+            None => {}
         }
         for (out, ns) in frame.lanes[lane].iter_mut().zip(t.sample(now)) {
             *out += ns;
@@ -301,14 +323,14 @@ mod tests {
         frame.lanes[2][WaitFence as usize] = 6;
         frame.lanes[3][Record as usize] = 22;
         frame.finish(Duration::from_nanos(10));
-        assert_eq!(frame.lanes.map(|t| t[Other as usize]), [2, 6, 4, 0]);
+        assert_eq!(frame.lanes.map(|t| t[Other as usize]), [2, 6, 4, 0, 10]);
         let mut window = Reading::default();
         window.add(&frame);
         window.add(&frame);
         assert_eq!(window.wall, 20);
         assert_eq!(
             window.lanes.map(|t| t.iter().sum::<u64>()),
-            [20, 20, 20, 44]
+            [20, 20, 20, 44, 20]
         );
     }
 }
