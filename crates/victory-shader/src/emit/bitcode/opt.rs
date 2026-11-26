@@ -85,6 +85,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A fused multiply-add (`dx.op.tertiary.*`, opcode 46).
+    pub fmad: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1027,6 +1029,10 @@ impl Module {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
                     );
+                } else if name.starts_with("tertiary.")
+                    && matches!(args.first().and_then(|&op| self.int_k(op)), Some((_, 46)))
+                {
+                    u.fmad = true;
                 }
             }
         }

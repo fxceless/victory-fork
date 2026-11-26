@@ -91,6 +91,7 @@ pub const USER_DISPATCH_THREADS: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const NO_REFACTORING: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -174,6 +175,8 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -231,6 +234,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            fused: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -462,8 +466,23 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (Intel UHD and some NVIDIA drivers do); only `FMad`
+    /// needs it, to fuse at all.
+    fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
+    }
+
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_with_flags().0
+    }
+
+    /// The finished container and the final `ShaderFlags` settled after
+    /// module optimization.
+    pub(crate) fn finish_with_flags(mut self) -> (Vec<u8>, u64) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -473,6 +492,7 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            self.fused = used.fmad;
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
@@ -710,6 +730,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
@@ -855,7 +876,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        (container::build(&parts), self.flags)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

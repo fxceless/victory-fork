@@ -77,6 +77,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the host may refactor its arithmetic (fuse multiply-adds).
+    #[cfg(test)]
+    pub refactoring: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2383,6 +2386,12 @@ impl<'a> Lower<'a> {
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        let (dxil, final_flags) = self.s.finish_with_flags();
+        let _ = final_flags;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2391,10 +2400,12 @@ impl<'a> Lower<'a> {
             root_uavs,
             half_views,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            #[cfg(test)]
+            refactoring: final_flags & flags::NO_REFACTORING == 0,
+            dxil,
             user_data,
             samplers: self.samplers,
         })
@@ -3501,6 +3512,7 @@ impl<'a> Lower<'a> {
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
+        self.s.fused = true;
         self.s.op(
             self.cur,
             "tertiary.f32",
@@ -11951,6 +11963,52 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    /// Lowers `alu` on the thread id v0 into v3, kept by an LDS store.
+    fn refactoring(alu: &[u32]) -> (bool, Vec<String>) {
+        let mut words = alu.to_vec();
+        words.extend([
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0xD834_0000, // ds_write_b32 v4, v3
+            0x0000_0304,
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let names = ir::build(&code, false, 256).unwrap().blocks[0]
+            .insts
+            .iter()
+            .map(|i| i.name().to_string())
+            .collect();
+        let lowered = lower_with(&words, vec![], vec![]).unwrap();
+        (lowered.refactoring, names)
+    }
+
+    #[test]
+    fn only_programs_with_fmad_let_the_host_refactor() {
+        let (fused, names) = refactoring(&[
+            0xD54B_0003, // v_fma_f32 v3, v0, v0, v0
+            0x0402_0100,
+        ]);
+        assert_eq!(names[0], "v_fma_f32");
+        assert!(fused, "FMad needs refactoring to fuse");
+        let (apart, names) = refactoring(&[
+            0x1006_0100, // v_mul_f32 v3, v0, v0
+            0x0606_0103, // v_add_f32 v3, v3, v0
+        ]);
+        assert_eq!(names[..2], ["v_mul_f32", "v_add_f32"]);
+        assert!(!apart, "a multiply and an add stay apart");
+        let (dead_fma, names) = refactoring(&[
+            0xD54B_0009, // v_fma_f32 v9, v0, v0, v0 (unused; removed by DCE)
+            0x0402_0100,
+            0x1006_0100, // v_mul_f32 v3, v0, v0
+            0x0606_0103, // v_add_f32 v3, v3, v0
+        ]);
+        assert_eq!(names[..3], ["v_fma_f32", "v_mul_f32", "v_add_f32"]);
+        assert!(
+            !dead_fma,
+            "dead FMad removed by DCE must still disable refactoring"
+        );
     }
 
     fn perm_features(selector: u32) -> u64 {
