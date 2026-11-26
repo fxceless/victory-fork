@@ -1154,6 +1154,10 @@ fn root_signature(
 }
 
 #[cfg(test)]
+#[path = "r11_test.rs"]
+mod r11_test;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
@@ -1173,7 +1177,7 @@ mod tests {
     const PS: &str = "float4 main() : SV_Target { return 1; }";
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
-    fn dxc() -> Option<PathBuf> {
+    pub(super) fn dxc() -> Option<PathBuf> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => PathBuf::from(p),
             None => victory_shader::emit::validator::Validator::default_path()?
@@ -1182,7 +1186,7 @@ mod tests {
         dxc.exists().then_some(dxc)
     }
 
-    fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
+    pub(super) fn compile(dxc: &Path, dir: &Path, src: &str, profile: &str) -> Vec<u8> {
         let (hlsl, out) = (
             dir.join(format!("{profile}.hlsl")),
             dir.join(format!("{profile}.dxil")),

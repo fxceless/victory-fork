@@ -76,6 +76,10 @@ impl Host {
                     && let Some(debug) = debug
                 {
                     debug.EnableDebugLayer();
+                    #[cfg(test)]
+                    if !warp && std::env::var_os("VICTORY_NVIDIA_HARDWARE_TESTS").is_some_and(|v| v == "1") {
+                        debug.cast::<ID3D12Debug1>().expect("GPU validation interface").SetEnableGPUBasedValidation(true);
+                    }
                 }
             }
             let mut device: Option<ID3D12Device> = None;
@@ -288,6 +292,34 @@ impl Host {
             queue.ClearStoredMessages();
         }
         text
+    }
+
+    #[cfg(test)]
+    pub(super) fn check_hardware_validation(&self) {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+            return;
+        }
+        let queue: ID3D12InfoQueue = self.device.cast().expect("D3D12 debug layer");
+        let (mut errors, mut warnings) = (0, 0);
+        // SAFETY: storage is aligned for the message and sized for its inline text.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let text = std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                    eprintln!("D3D12 #{}: {}", message.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
+                    if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING { warnings += 1 } else { errors += 1 }
+                }
+            }
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+        }
+        eprintln!("D3D12 hardware validation: {errors} errors, {warnings} warnings");
+        assert_eq!(errors, 0);
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -600,6 +632,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -979,6 +1012,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -992,6 +1026,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`]).
+    HalfUintUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1224,12 +1261,18 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),

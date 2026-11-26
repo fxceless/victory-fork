@@ -29,6 +29,7 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    r11: OnceLock<Arc<Pending>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -63,6 +64,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            r11: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -74,6 +76,25 @@ impl Pending {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    pub(crate) fn for_r11(
+        p: &Arc<Self>,
+        samples: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC,
+    ) -> Option<&Arc<Self>> {
+        let Some(graphics) = p.graphics.as_deref() else { return Some(p) };
+        if graphics.targets.NumRenderTargets != 1
+            || graphics.targets.RTFormats[0] != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM
+        {
+            return Some(p);
+        }
+        if !graphics.matches_samples(samples) {
+            return None;
+        }
+        Some(p.r11.get_or_init(|| {
+            let state = graphics.r11_variant(samples).expect("checked target and samples");
+            Arc::new(Self::new(p.shaders.clone(), Some(Box::new(state))))
+        }))
     }
 }
 
