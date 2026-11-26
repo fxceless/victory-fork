@@ -2166,14 +2166,21 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// than the walk in the last two, by a fifth: it never ran in a game.)
 #[cfg(target_arch = "x86_64")]
 fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *AVX2.get_or_init(|| {
+        std::env::var_os("VICTORY_CHANGED_RUNS_AVX2").is_some_and(|v| v == "1")
+            && std::is_x86_feature_detected!("avx2")
+    }) {
+        // SAFETY: AVX2 support is checked at runtime.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_sse2(now, was)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_sse2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
-    let n = now.len().min(was.len());
-    let (now, was) = (&now[..n], &was[..n]);
-    let mut runs = Vec::with_capacity(64);
-    // The first byte of a run not yet ended.
-    let mut open: Option<usize> = None;
-    let mut base = 0;
-    while base + 64 <= n {
+    changed_runs_masks(now, was, |now, was, base| {
         // Bit `k`: byte `base + k` differs.
         let mut differ = 0u64;
         for part in 0..4 {
@@ -2187,6 +2194,46 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             };
             differ |= u64::from(!equal & 0xffff) << (16 * part);
         }
+        differ
+    })
+}
+
+/// Compare two 32-byte lanes instead of four 16-byte lanes, retaining the
+/// same run extraction and scalar tail. Only called after AVX2 detection.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    changed_runs_masks(now, was, |now, was, base| {
+        // SAFETY: the shared walker calls this closure only for a full 64-byte
+        // block within both slices; loads are unaligned. AVX2 is enabled here.
+        unsafe {
+            let a = _mm256_loadu_si256(now.as_ptr().add(base).cast::<__m256i>());
+            let b = _mm256_loadu_si256(was.as_ptr().add(base).cast::<__m256i>());
+            let c = _mm256_loadu_si256(now.as_ptr().add(base + 32).cast::<__m256i>());
+            let d = _mm256_loadu_si256(was.as_ptr().add(base + 32).cast::<__m256i>());
+            let lo = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            let hi = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, d)) as u32;
+            u64::from(lo) | (u64::from(hi) << 32)
+        }
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn changed_runs_masks(
+    now: &[u8],
+    was: &[u8],
+    mut difference_mask: impl FnMut(&[u8], &[u8], usize) -> u64,
+) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        let differ = difference_mask(now, was, base);
         if differ == 0 {
             if let Some(first) = open.take() {
                 runs.push((first, base - first));
@@ -2422,6 +2469,83 @@ mod merge_tests {
         // Slices of unlike lengths: the shorter one's bytes.
         assert_eq!(changed_runs_wide(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
         assert_eq!(changed_runs_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_changed_runs_match_sse2_for_unaligned_and_short_inputs() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for offset in 0..32 {
+            for n in [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 511, 4097] {
+                let was = vec![0x5au8; n + offset + 2];
+                for rarity in [1, 2, 16, 64, 4096] {
+                    let mut now = was.clone();
+                    for b in &mut now {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        if seed.is_multiple_of(rarity) {
+                            *b ^= 0xff;
+                        }
+                    }
+                    let a = &now[offset..offset + n];
+                    let b = &was[offset + 1..];
+                    // SAFETY: AVX2 detection above.
+                    let avx = unsafe { super::changed_runs_avx2(a, b) };
+                    assert_eq!(avx, super::changed_runs_sse2(a, b));
+                    assert_eq!(avx, changed_runs_bytes(a, b));
+                }
+            }
+        }
+    }
+
+    /// Synthetic benchmark; no title or GPU needed. Compare medians for
+    /// equal, sparse, dense and fully changed byte patterns.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "manual release-mode microbenchmark"]
+    fn benchmark_changed_runs_avx2() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use std::{hint::black_box, time::Instant};
+        let was = vec![0x5au8; 16 * 1024 * 1024];
+        for (name, stride) in [("equal", 0), ("sparse", 64), ("dense", 4), ("all", 1)] {
+            let mut now = was.clone();
+            if stride != 0 {
+                for b in now.iter_mut().step_by(stride) {
+                    *b ^= 0xff;
+                }
+            }
+            // SAFETY: AVX2 detection above.
+            assert_eq!(unsafe { super::changed_runs_avx2(&now, &was) },
+                       super::changed_runs_sse2(&now, &was));
+            let mut sse = Vec::new();
+            let mut avx = Vec::new();
+            for i in 0..9 {
+                let mut measure = |use_avx: bool| {
+                    let start = Instant::now();
+                    let out = if use_avx {
+                        // SAFETY: AVX2 detection above.
+                        unsafe { super::changed_runs_avx2(black_box(&now), black_box(&was)) }
+                    } else {
+                        super::changed_runs_sse2(black_box(&now), black_box(&was))
+                    };
+                    black_box(out.len());
+                    drop(out);
+                    let us = start.elapsed().as_micros();
+                    if use_avx { avx.push(us); } else { sse.push(us); }
+                };
+                measure(i % 2 == 0);
+                measure(i % 2 != 0);
+            }
+            sse.sort_unstable();
+            avx.sort_unstable();
+            println!("{name}: SSE2 {} us, AVX2 {} us", sse[4], avx[4]);
+        }
     }
 
     /// The runs hold exactly the bytes that differ: putting them into the
