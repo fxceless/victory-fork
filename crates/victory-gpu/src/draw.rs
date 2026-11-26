@@ -580,7 +580,10 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// binds counted (`VICTORY_BIND_SPLIT=0`: not timed). For the line of list
 /// calls by kind: DISPATCH and EXECUTE_INDIRECT took 40-60 us each (run
 /// v8-220247) and nothing said where.
-pub(crate) static BIND_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// v10: then, within the tables, ns of making slots (`make_at`), of views
+/// made once a list (`make_listed`), and of copies of views' own bytes
+/// (`crate::shadow::exact`).
+pub(crate) static BIND_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Whether [`BIND_NS`] is kept (`VICTORY_BIND_SPLIT`, on unless `0`).
 pub(crate) fn bind_split() -> bool {
@@ -589,11 +592,11 @@ pub(crate) fn bind_split() -> bool {
 }
 
 /// Adds the time from its start to its drop to [`BIND_NS`]`[part]`.
-struct BindLap(Option<(usize, std::time::Instant)>);
+pub(crate) struct BindLap(Option<(usize, std::time::Instant)>);
 
 impl BindLap {
     #[inline]
-    fn start(part: usize) -> Self {
+    pub(crate) fn start(part: usize) -> Self {
         BindLap(bind_split().then(|| (part, std::time::Instant::now())))
     }
 }
@@ -612,11 +615,11 @@ impl Drop for BindLap {
 
 /// [`BIND_NS`] per frame, taken: ms of binds, early textures, tables,
 /// title memory by address, and binds; `None` when not timed or none.
-pub(crate) fn take_bind_split(frames: f64) -> Option<[f64; 5]> {
+pub(crate) fn take_bind_split(frames: f64) -> Option<[f64; 8]> {
     if !bind_split() {
         return None;
     }
-    let v: [u64; 5] = std::array::from_fn(|i| BIND_NS[i].swap(0, Ordering::Relaxed));
+    let v: [u64; 8] = std::array::from_fn(|i| BIND_NS[i].swap(0, Ordering::Relaxed));
     (v[4] > 0).then(|| std::array::from_fn(|i| if i == 4 { v[4] as f64 / frames } else { v[i] as f64 / 1e6 / frames }))
 }
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
@@ -3634,7 +3637,10 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = {
+                        let _lap = BindLap::start(6);
+                        host.make_listed(recording, words, index)
+                    }
                 {
                     let kind = group
                         .entry(k)
@@ -3698,7 +3704,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        {
+                            let _lap = BindLap::start(5);
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
