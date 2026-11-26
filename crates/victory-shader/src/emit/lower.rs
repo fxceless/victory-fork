@@ -1785,7 +1785,7 @@ impl<'a> Lower<'a> {
             }
         };
         if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
-            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+            for (k, x) in self.raw_dwords(h, off, n, None).into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -5662,7 +5662,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
-    /// read in the current block by one call for every four of them
+    /// read in the current block by one call per dword or per group of four
     /// ([`Self::wide_loads`]). They are the dwords of ONE console load,
     /// which the console reads as one (address plus 4, 8, ... without
     /// wrapping at 32 bits): the same bytes as a call a dword reads. Loads
@@ -5670,12 +5670,20 @@ impl<'a> Lower<'a> {
     /// computes their offsets in 32-bit registers, and `x - 4` and `x` at
     /// `x = 0` are one dword out of the view and its first one, where one
     /// call from `x - 4` on would read both out of it.
-    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32, offsets: Option<(V, u32)>) -> Vec<V> {
         let c = self.cur;
         let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::with_capacity(count as usize);
-        for first in (0..count).step_by(4) {
-            let n = (count - first).min(4);
+        let width = if Self::wide_loads() { 4 } else { 1 };
+        let zero = self.s.m.i32(0);
+        // SMEM adds its register and immediate offsets before the bounds check.
+        // An immediate can take even the first dword beyond a 32-bit host address.
+        let start_wrapped = offsets.map(|(so, imm)| {
+            let last = self.s.m.i32(u32::MAX - imm);
+            self.s.m.cmp(c, pred::IUGT, so, last)
+        });
+        for first in (0..count).step_by(width as usize) {
+            let n = (count - first).min(width);
             let off = self.s.m.i32(4 * first);
             let a = self.s.m.bin(c, Bin::Add, addr, off);
             let mask = self.s.m.i8((1u8 << n) - 1);
@@ -5687,9 +5695,24 @@ impl<'a> Lower<'a> {
                 139,
                 &[h, a, u, mask, al],
             );
+            // Each host load bounds-checks its components. A later call whose
+            // starting offset wrapped would instead read from the start of the view.
+            let wrapped = if first == 0 {
+                start_wrapped
+            } else {
+                let carry = self.s.m.cmp(c, pred::IULT, a, addr);
+                Some(match start_wrapped {
+                    Some(start) => self.s.m.bin(c, Bin::Or, start, carry),
+                    None => carry,
+                })
+            };
             for k in 0..n {
                 let x = self.s.m.extract(c, r, k);
-                out.push(self.as_int(x));
+                let x = self.as_int(x);
+                out.push(match wrapped {
+                    Some(wrapped) => self.s.m.select(c, wrapped, zero, x),
+                    None => x,
+                });
             }
         }
         out
@@ -5734,15 +5757,18 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        let constant_offset = (*offset as u32).wrapping_add(base);
+        let mut addr = self.s.m.i32(constant_offset);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+        let offsets = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            None
+        } else {
             let so = self.operand(inst, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
+            (*offset > 0).then_some((so, *offset as u32))
+        };
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -5775,30 +5801,11 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            let wide = Self::wide_loads();
-            if wide {
-                let dwords = self.raw_dwords(h, addr, count);
-                raw.extend(dwords.into_iter().map(|x| (x, zero)));
-            }
-            for k in 0..if wide { 0 } else { count } {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
-            }
+            let raw: Vec<_> = self
+                .raw_dwords(h, addr, count, offsets)
+                .into_iter()
+                .map(|x| (x, zero))
+                .collect();
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
@@ -5819,27 +5826,7 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            if Self::wide_loads() {
-                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
-                    self.write(inst, Reg::S(code + k as u8), x, None);
-                }
-                return Ok(());
-            }
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+            for (k, x) in self.raw_dwords(h, addr, count, offsets).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -5849,7 +5836,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(constant_offset)
             }
             _ => None,
         };

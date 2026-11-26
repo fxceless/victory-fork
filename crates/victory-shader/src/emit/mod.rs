@@ -1487,7 +1487,19 @@ mod tests {
         let dword = |byte: u64| -> u32 {
             if byte.is_multiple_of(4) && byte + 4 <= 4 * data.len() as u64 { data[(byte / 4) as usize] } else { 0 }
         };
-        for (s0, s1) in [(0u32, 0u32), (16, 0), (24, 4), (40, 28), (48, 44), (8, 12)] {
+        // Also cover a carry in the starting offset and loads just below 4 GiB.
+        // Every dword past the end of the address range must read zero.
+        for (s0, s1) in [
+            (0u32, 0u32),
+            (16, 0),
+            (24, 4),
+            (40, 28),
+            (48, 44),
+            (8, 12),
+            (0xffff_fffc, 0xffff_fff8),
+            (0xffff_fff0, 0xffff_ffdc),
+            (0, 0xffff_fffc),
+        ] {
             let out = host
                 .dispatch(
                     &root,
