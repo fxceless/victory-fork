@@ -523,13 +523,18 @@ fn changed_slots(
 /// the heap a list's slots came from, and a later heap can be made at the
 /// same address before the list is reset.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(id, first, n);
+pub(crate) fn release_dynamic(spans: &[(usize, u64, u32, u32)]) {
+    for group in spans.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        let (heap, id, ..) = group[0];
+        for chunk in group.chunks(16) {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            if heaps.iter().any(|&(_, _, h)| h == heap)
+                // SAFETY: registered heaps are live (removed when dropped).
+                && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+            {
+                host.release_many(id, chunk.iter().map(|&(_, _, first, count)| (first, count)));
+            }
+        }
     }
 }
 
