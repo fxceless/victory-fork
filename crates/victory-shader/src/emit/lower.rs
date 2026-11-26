@@ -3209,6 +3209,17 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if self.mask_data == MaskData::Host && !self.x.p.wave64 {
+                    // A console 32-lane pixel or vertex program may run as a
+                    // 64-lane wave on AMD hosts: each 32-lane half takes its
+                    // own ballot dword so lanes 32..63 do not read lanes 0..31.
+                    let lane = self
+                        .s
+                        .op(at, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+                    let k32 = self.s.m.i32(32);
+                    let upper = self.s.m.cmp(at, pred::IUGE, lane, k32);
+                    xy = (self.s.m.select(at, upper, xy.1, xy.0), self.s.m.i32(0));
+                }
                 if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
@@ -4393,6 +4404,27 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
         let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        if self.mask_data == MaskData::Host && !self.x.p.wave64 {
+            // A console 32-lane pixel or vertex program may run as a 64-lane
+            // host wave: pick the first active lane within this 32-lane half.
+            let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let r = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+            let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+            let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let (z, k32, base_mask) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(!31));
+            let upper = self.s.m.cmp(c, pred::IUGE, me, k32);
+            let half = self.s.m.select(c, upper, hi, lo);
+            let any = self.s.m.cmp(c, pred::NE, half, z);
+            let base = self.s.m.bin(c, Bin::And, me, base_mask);
+            let bit_lo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[half]);
+            let target = self.s.m.bin(c, Bin::Or, base, bit_lo);
+            let lane = self.s.m.select(c, any, target, me);
+            let at = self.read_lane(x, lane);
+            return (self.s.m.select(c, any, at, first), any);
+        }
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
         };
@@ -7678,6 +7710,17 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     return int(self, r);
                 }
+                let lane = if self.mask_data == MaskData::Host && !self.x.p.wave64 {
+                    // Keep lane reads inside this thread's 32-lane half when a
+                    // console wave32 pixel or vertex shader runs as wave64.
+                    let me = self.lane_index();
+                    let (k31, base_mask) = (self.s.m.i32(31), self.s.m.i32(!31));
+                    let base = self.s.m.bin(self.cur, Bin::And, me, base_mask);
+                    let low = self.s.m.bin(self.cur, Bin::And, lane, k31);
+                    self.s.m.bin(self.cur, Bin::Or, base, low)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -8987,6 +9030,12 @@ impl<'a> Lower<'a> {
                     self.cross_lane(false)?;
                 }
                 let lane = self.console_lane();
+                let lane = if self.mask_data == MaskData::Host && !self.x.p.wave64 {
+                    let k31 = k(self, 31);
+                    self.s.m.bin(c, Bin::And, lane, k31)
+                } else {
+                    lane
+                };
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
