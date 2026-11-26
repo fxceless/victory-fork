@@ -2276,8 +2276,25 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+/// The most bytes of chunks kept while no list holds them, scaled from total
+/// system RAM and bounded by remaining OS commit headroom (`ullAvailPageFile`)
+/// so hosts with tight pagefile headroom do not hold oversized idle pools.
+fn spare_most(total_ram_bytes: Option<u64>, avail_commit_bytes: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    let by_ram = match total_ram_bytes {
+        Some(ram) if ram <= 16 * GIB => 64 << 20,
+        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
+        // `ullTotalPhys` after firmware/hardware reservations.
+        Some(ram) if ram >= 30 * GIB => 256 << 20,
+        _ => 128 << 20,
+    };
+    let by_commit = match avail_commit_bytes {
+        Some(avail) if avail < 4 * GIB => 64 << 20,
+        Some(avail) if avail < 8 * GIB => 128 << 20,
+        _ => 256 << 20,
+    };
+    by_ram.min(by_commit)
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -2350,18 +2367,23 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    let most = if scratch_pool() {
+        spare_most(crate::total_system_ram_bytes(), crate::available_commit_bytes())
+    } else {
+        0
+    };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, most)
             } else {
                 Some(chunk)
             };
@@ -10737,6 +10759,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn spare_most_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(super::spare_most(None, None), 128 * MIB);
+        assert_eq!(super::spare_most(Some(8 * GIB), None), 64 * MIB);
+        assert_eq!(super::spare_most(Some(16 * GIB), Some(16 * GIB)), 64 * MIB);
+        assert_eq!(super::spare_most(Some(24 * GIB), Some(12 * GIB)), 128 * MIB);
+        assert_eq!(super::spare_most(Some(31 * GIB), Some(12 * GIB)), 256 * MIB);
+        assert_eq!(super::spare_most(Some(32 * GIB), Some(8 * GIB)), 256 * MIB);
+        assert_eq!(super::spare_most(Some(64 * GIB), None), 256 * MIB);
+        // Tight Windows commit headroom clamps 32+ GB hosts back to baseline / floor.
+        assert_eq!(super::spare_most(Some(32 * GIB), Some(6 * GIB)), 128 * MIB);
+        assert_eq!(super::spare_most(Some(32 * GIB), Some(4 * GIB)), 128 * MIB);
+        assert_eq!(super::spare_most(Some(32 * GIB), Some(3 * GIB)), 64 * MIB);
+        assert_eq!(super::spare_most(Some(24 * GIB), Some(2 * GIB)), 64 * MIB);
     }
 
     /// The hashing a submission does for textures in physical-page memory,

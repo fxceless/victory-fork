@@ -1372,10 +1372,30 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Snapshot buffer pool byte cap scaled from total system RAM and bounded by
+/// remaining OS commit headroom (`ullAvailPageFile`).
+fn snapshot_pool_cap(total_ram_bytes: Option<u64>, avail_commit_bytes: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const FALLBACK: u64 = 512 << 20;
+    const MIN: u64 = 128 << 20;
+    const MAX: u64 = 1024 << 20;
+    let by_ram = match total_ram_bytes {
+        Some(ram) => (ram / 32).clamp(MIN, MAX),
+        None => FALLBACK,
+    };
+    let by_commit = match avail_commit_bytes {
+        Some(avail) if avail < 4 * GIB => MIN,
+        Some(avail) if avail < 8 * GIB => FALLBACK,
+        _ => MAX,
+    };
+    by_ram.min(by_commit) as usize
+}
+
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`snapshot_pool_cap`]
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept = snapshot_pool_cap(crate::total_system_ram_bytes(), crate::available_commit_bytes());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1384,7 +1404,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept
     });
 }
 
@@ -4912,6 +4932,23 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn snapshot_pool_cap_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        const MIB: usize = 1 << 20;
+        assert_eq!(super::snapshot_pool_cap(None, None), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(2 * GIB), None), 128 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(8 * GIB), Some(16 * GIB)), 256 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(16 * GIB), Some(16 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB), Some(8 * GIB)), 1024 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(64 * GIB), None), 1024 * MIB);
+        // Tight Windows commit headroom clamps 32+ GB hosts back to baseline / floor.
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB), Some(6 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB), Some(4 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB), Some(3 * GIB)), 128 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(16 * GIB), Some(2 * GIB)), 128 * MIB);
     }
 }
 
