@@ -16,12 +16,42 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline, TargetFormats};
+
+/// `VICTORY_DENY_PIPELINES=<16-hex shader hash>,...` (off unless set): the
+/// hash of a shader of `shaders` that is listed there. Such a pipeline is
+/// never built (no driver compile) and counts as refused, so its draws and
+/// dispatches are dropped: a test of whether building a pipeline, rather
+/// than running it, is what loses the card (runs 281 and 318: the removal
+/// 32 and 81 ms after the 3-second build of `CS_RaytracingResolve` of the
+/// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
+/// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
+fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DENY_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    shaders.iter().find(|s| list.contains(&s.hash)).map(|s| s.hash.as_str())
+}
+
+/// The shaders of `p` (for logs).
+pub(crate) fn shaders(p: &Pending) -> &[Arc<Shader>] {
+    &p.shaders
+}
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -73,8 +103,26 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.make_with(|| {
+            if let Some(hash) = denied(&self.shaders) {
+                tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
+                return None;
+            }
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            // A failed translation must complete this queue entry and wake its waiters.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            }
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -426,6 +474,24 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
