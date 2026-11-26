@@ -4,6 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(windows)]
+use crate::frame_why::{self, Phase};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -510,11 +512,13 @@ fn wake() {
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
+    frame_why::worker(frame_why::Worker::Submit);
     crate::framelog::keep_on_fast_cores("victory-submit");
     loop {
         {
             let mut work = lock(&WORK.0);
             while !*work {
+                let _idle = frame_why::span(Phase::Idle);
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
             *work = false;
@@ -1043,6 +1047,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 }
 
 fn execute_now(this: This, count: u32, lists: *const This) {
+    #[cfg(windows)]
+    let _submit = frame_why::span(Phase::Submit);
     if lists.is_null() {
         return;
     }
@@ -1293,6 +1299,8 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    #[cfg(windows)]
+    let present = frame_why::span(Phase::Present);
     let hr = present_now(this, planes, plane_parameters);
     #[cfg(windows)]
     {
@@ -1300,6 +1308,8 @@ extern "system" fn present(
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
+        drop(present);
+        frame_why::frame();
     }
     hr
 }
