@@ -5573,6 +5573,9 @@ impl<'a> Lower<'a> {
                 139,
                 &[h, a, u, mask, al],
             );
+            if n > 1 {
+                self.s.m.grouped_raw_loads.push((r, n));
+            }
             for k in 0..n {
                 let x = self.s.m.extract(c, r, k);
                 out.push(self.as_int(x));

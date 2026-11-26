@@ -213,6 +213,8 @@ enum MdDef {
 
 #[derive(Default)]
 pub(crate) struct Module {
+    /// Calls made by WIDE for multiple dwords of one console load, and their widths.
+    pub(super) grouped_raw_loads: Vec<(V, u32)>,
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
     consts: Vec<(Ty, Const)>,

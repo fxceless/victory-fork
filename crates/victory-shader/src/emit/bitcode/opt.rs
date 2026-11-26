@@ -52,13 +52,11 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
-/// Not a pass over the module either: the lowering reads the dwords of one
-/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
-/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
-/// by a call each (`lower.rs`, `raw_dwords`). NOT the same result on the card in every case: run 277
-/// had the water black with it (lead: a four-dword load whose last dwords
-/// lie past the view's end, which the card may answer with zeros for the
-/// whole call), so it stays off unless asked for.
+/// Reads up to four dwords per call for `s_buffer_load_dwordx2` to `x16`
+/// from an SRV and `global_load_dwordx2` to `x4` (`lower.rs`, `raw_dwords`).
+/// With [`DEAD`], a grouped scalar load reads through its last used dword.
+/// Run 277 had black water with grouped loads. A four-dword read extending
+/// past the end of its view is a suspected cause. WIDE remains opt-in.
 pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
@@ -243,6 +241,41 @@ impl Module {
         }
         if passes & DEAD != 0 {
             self.drop_dead();
+            if !self.grouped_raw_loads.is_empty() {
+                self.trim_raw_loads();
+            }
+        }
+    }
+
+    /// A grouped load needs only the prefix through its last live component.
+    /// A user of the whole result or its mapped-status field needs the original
+    /// access. Walk the remaining blocks, as dead extracts still exist in `insts`.
+    fn trim_raw_loads(&mut self) {
+        let mut widths = vec![0u8; self.insts.len()];
+        for blk in &self.blocks {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                let op = &self.insts[i as usize].op;
+                let width = match op {
+                    Op::Extract(_, k @ 0..=2) => *k as u8 + 1,
+                    _ => 4,
+                };
+                for_each_operand(op, |v| {
+                    if let V::Inst(src) = v {
+                        let w = &mut widths[src as usize];
+                        *w = (*w).max(width);
+                    }
+                });
+            }
+        }
+        for (load, count) in std::mem::take(&mut self.grouped_raw_loads) {
+            let V::Inst(i) = load else { unreachable!() };
+            let width = widths[i as usize];
+            if width == 0 || u32::from(width) >= count {
+                continue;
+            }
+            let mask = self.i8((1 << width) - 1);
+            let Op::Call(_, args) = &mut self.insts[i as usize].op else { unreachable!() };
+            args[4] = mask;
         }
     }
 
@@ -1170,6 +1203,53 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
+    }
+
+    #[test]
+    fn grouped_raw_loads_request_only_the_live_prefix() {
+        use crate::emit::shader::Shader;
+        // Dwords, consumed fields (bit 4 is status), whole result, grouped by WIDE, final mask.
+        for (count, fields, whole, grouped, want) in [
+            (4, 0b00111, false, true, 7),
+            (4, 0b00100, false, true, 7),
+            (3, 0b00010, false, true, 3),
+            (2, 0b00001, false, true, 1),
+            (4, 0b01001, false, true, 15),
+            (4, 0b10001, false, true, 15),
+            (4, 0b00001, true, true, 15),
+            (4, 0b00111, false, false, 15),
+        ] {
+            let mut s = Shader::new(false);
+            let b = s.entry;
+            let h = s.m.undef(s.t.handle);
+            let offset = s.m.i32(328);
+            let u = s.m.undef(s.t.i32);
+            let align = s.m.i32(4);
+            let mask = s.m.i8((1 << count) - 1);
+            let r = s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, s.t.res_ret, 139, &[h, offset, u, mask, align]);
+            if grouped {
+                s.m.grouped_raw_loads.push((r, count));
+            }
+            let use_block = s.m.new_block();
+            s.m.terminate(b, Term::Br(use_block));
+            for field in 0..5 {
+                let x = s.m.extract(use_block, r, field);
+                if fields & (1 << field) != 0 {
+                    let dst = s.m.global(&format!("out{field}"), s.m.type_of(x), 3);
+                    s.m.store(use_block, dst, x);
+                }
+            }
+            if whole {
+                let dst = s.m.global("whole", s.t.res_ret, 3);
+                s.m.store(use_block, dst, r);
+            }
+            s.m.terminate(use_block, Term::Ret);
+            s.m.optimise(DEFAULT);
+            let V::Inst(i) = r else { unreachable!() };
+            assert!(s.m.blocks[b].body.contains(&i));
+            let Op::Call(_, args) = &s.m.insts[i as usize].op else { unreachable!() };
+            assert_eq!(s.m.int_k(args[4]), Some((8, want)), "fields={fields:#07b} whole={whole}");
+        }
     }
 
     #[test]
