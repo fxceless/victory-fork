@@ -1618,6 +1618,149 @@ mod tests {
             );
         }
     }
+
+    /// A structured buffer accessed with `idxen` and whose record count
+    /// (descriptor dword 2) is read as data: `victory-gpu` backs structured
+    /// views with raw views (`raw_window`), so `getDimensions` must query a
+    /// raw handle and divide bytes by `stride`.
+    #[test]
+    fn structured_buffer_record_count_matches_raw_host_view() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0x340E_0083, // v_lshlrev_b32 v7, 3, v0
+            0xE074_1000,
+            0x8003_0107, // buffer_store_dwordx2 v[1:2], v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 16,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [4, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            // 32 dwords = 128 bytes = 8 elements of stride 16.
+            let data: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = super::host::Host::new(warp) else {
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                            views: &[
+                                super::host::View::Buffer {
+                                    data: &data,
+                                    stride: super::host::Stride::Raw,
+                                },
+                                super::host::View::RawUav(16),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                // Lane k reads dword 0 of element k (1000 + 4*k) and record count 8.
+                for k in 0..4usize {
+                    assert_eq!(out[0][2 * k], 1000 + (4 * k) as u32, "{label} lane {k} data");
+                    assert_eq!(out[0][2 * k + 1], 8, "{label} lane {k} record count");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
