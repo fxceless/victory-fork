@@ -840,6 +840,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT_CS=<n>` | the same limit for compute programs only (unset: they follow `VICTORY_SHADER_LOOP_LIMIT`). A lane that reaches the limit leaves without its writes, so a low general limit also breaks genuine compute loops: with 32 the hair simulation's per-vertex constraint pass never stores and strands scatter around heads. `VICTORY_SHADER_LOOP_LIMIT=32 VICTORY_SHADER_LOOP_LIMIT_CS=128` keeps the low limit for the other stages (on an RTX 2080 SUPER 1024 also kept the hair in place but showed a smeared copy of the character along the bottom of the screen; 128 did not) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
