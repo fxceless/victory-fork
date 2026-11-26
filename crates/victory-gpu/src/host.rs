@@ -1273,7 +1273,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let adapter = chosen_adapter()?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -1362,6 +1363,206 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The adapter to render on. Two cards with the same name (two 3090 Tis)
+/// are told apart by the PCIe link: the widest link wins, so the card on
+/// an x1 link is not used just because DXGI lists it first.
+/// `VICTORY_ADAPTER` still filters by a case-insensitive part of the name.
+/// `VICTORY_ADAPTER_BUS` pins one PCI bus number.
+fn chosen_adapter() -> windows::core::Result<IDXGIAdapter> {
+    let want = std::env::var("VICTORY_ADAPTER")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase());
+    let bus_pin = std::env::var("VICTORY_ADAPTER_BUS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    // SAFETY: plain DXGI and display-driver queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut best: Option<(u32, usize, IDXGIAdapter1, String, u32)> = None;
+        let mut i = 0u32;
+        let mut saw_name = false;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let desc = adapter.GetDesc1()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let named = want.as_ref().is_none_or(|w| name.to_lowercase().contains(w));
+            if named {
+                saw_name = true;
+            }
+            let bus = adapter_bus(desc.AdapterLuid);
+            let width = bus.map(pci_link_width).unwrap_or(0);
+            let mb = desc.DedicatedVideoMemory / (1024 * 1024);
+            tracing::warn!(
+                index = i - 1,
+                adapter = %name,
+                pci_bus = bus.unwrap_or(u32::MAX),
+                link_width = width,
+                dedicated_mb = mb,
+                "host adapter"
+            );
+            if !named || bus_pin.is_some_and(|b| bus != Some(b)) {
+                continue;
+            }
+            let better = best.as_ref().is_none_or(|(w, mem, _, _, _)| {
+                width > *w || width == *w && desc.DedicatedVideoMemory > *mem
+            });
+            if better {
+                best = Some((width, desc.DedicatedVideoMemory, adapter, name, bus.unwrap_or(u32::MAX)));
+            }
+        }
+        if want.is_some() && !saw_name {
+            tracing::error!(want = want.unwrap_or_default(), "no adapter matches VICTORY_ADAPTER");
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_INVALIDARG,
+            ));
+        }
+        let Some((width, mem, adapter, name, bus)) = best else {
+            tracing::error!(?bus_pin, "no host adapter to render on");
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        };
+        tracing::warn!(
+            adapter = %name,
+            pci_bus = bus,
+            link_width = width,
+            dedicated_mb = mem / (1024 * 1024),
+            "host device on the widest PCIe link"
+        );
+        adapter.cast()
+    }
+}
+
+/// PCI bus of a DXGI adapter, from the display driver's own record.
+fn adapter_bus(luid: windows::Win32::Foundation::LUID) -> Option<u32> {
+    #[repr(C)]
+    struct Open {
+        luid: windows::Win32::Foundation::LUID,
+        handle: u32,
+    }
+    #[repr(C)]
+    struct Addr {
+        bus: u32,
+        device: u32,
+        function: u32,
+    }
+    #[repr(C)]
+    struct Query {
+        handle: u32,
+        kind: i32,
+        data: *mut Addr,
+        size: u32,
+    }
+    #[repr(C)]
+    struct Close {
+        handle: u32,
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn D3DKMTOpenAdapterFromLuid(open: *mut Open) -> i32;
+        fn D3DKMTQueryAdapterInfo(query: *const Query) -> i32;
+        fn D3DKMTCloseAdapter(close: *const Close) -> i32;
+    }
+    // SAFETY: the structs match the WDDM layout; the handle is closed.
+    unsafe {
+        let mut open = Open { luid, handle: 0 };
+        if D3DKMTOpenAdapterFromLuid(&mut open) != 0 {
+            return None;
+        }
+        let mut addr = Addr { bus: 0, device: 0, function: 0 };
+        let query = Query {
+            handle: open.handle,
+            kind: 6, // KMTQAITYPE_ADAPTERADDRESS
+            data: &mut addr,
+            size: std::mem::size_of::<Addr>() as u32,
+        };
+        let ok = D3DKMTQueryAdapterInfo(&query) == 0;
+        let _ = D3DKMTCloseAdapter(&Close { handle: open.handle });
+        ok.then_some(addr.bus)
+    }
+}
+
+/// Current PCIe link width of the device on PCI `bus` (16, 8, 1, …). 0 if
+/// the bus has no such property.
+fn pci_link_width(bus: u32) -> u32 {
+    #[repr(C)]
+    struct Key {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+        pid: u32,
+    }
+    #[link(name = "cfgmgr32")]
+    unsafe extern "system" {
+        fn CM_Get_Device_ID_List_SizeW(len: *mut u32, filter: *const u16, flags: u32) -> u32;
+        fn CM_Get_Device_ID_ListW(filter: *const u16, buf: *mut u16, len: u32, flags: u32) -> u32;
+        fn CM_Locate_DevNodeW(node: *mut u32, id: *const u16, flags: u32) -> u32;
+        fn CM_Get_DevNode_PropertyW(
+            node: u32,
+            key: *const Key,
+            ty: *mut u32,
+            buf: *mut u8,
+            len: *mut u32,
+            flags: u32,
+        ) -> u32;
+    }
+    const FILTER: u32 = 0x0000_0001 | 0x0000_0100;
+    const BUS: Key = Key {
+        data1: 0xa45c_254e,
+        data2: 0xdf1c,
+        data3: 0x4efd,
+        data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+        pid: 23,
+    };
+    const LINK: Key = Key {
+        data1: 0x3ab2_2e31,
+        data2: 0x8264,
+        data3: 0x4b4e,
+        data4: [0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62],
+        pid: 10,
+    };
+    let prop = |node: u32, key: &Key| -> Option<u32> {
+        let mut ty = 0u32;
+        let mut len = 4u32;
+        let mut value = 0u32;
+        // SAFETY: `node` came from Locate; the buffer is 4 bytes.
+        let rc = unsafe {
+            CM_Get_DevNode_PropertyW(node, key, &mut ty, (&mut value as *mut u32).cast(), &mut len, 0)
+        };
+        (rc == 0 && ty == 7).then_some(value)
+    };
+    // SAFETY: the list buffer is the size the call asked for.
+    unsafe {
+        let filter: Vec<u16> = "PCI".encode_utf16().chain([0]).collect();
+        let mut chars = 0u32;
+        if CM_Get_Device_ID_List_SizeW(&mut chars, filter.as_ptr(), FILTER) != 0 || chars < 2 {
+            return 0;
+        }
+        let mut buf = vec![0u16; chars as usize + 8];
+        if CM_Get_Device_ID_ListW(filter.as_ptr(), buf.as_mut_ptr(), chars, FILTER) != 0 {
+            return 0;
+        }
+        let mut widest = 0u32;
+        let mut at = 0usize;
+        while at < buf.len() && buf[at] != 0 {
+            let mut node = 0u32;
+            if CM_Locate_DevNodeW(&mut node, buf[at..].as_ptr(), 0) == 0
+                && prop(node, &BUS) == Some(bus)
+            {
+                widest = widest.max(prop(node, &LINK).unwrap_or(0));
+            }
+            at += buf[at..].iter().position(|&c| c == 0).unwrap_or(0) + 1;
+        }
+        widest
     }
 }
 
@@ -10545,6 +10746,9 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        if let Some(adapter) = &self.adapter {
+            place_on_render_gpu(hwnd, adapter);
+        }
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
@@ -10582,6 +10786,47 @@ impl Host {
         }
     }
 }
+
+/// Puts `hwnd` on a monitor plugged into `adapter`, so the picture is not
+/// copied across to another GPU for scan-out. Left alone when its monitor
+/// already is one: the window is the title's, and resizing it from this
+/// thread sends the title's thread size messages it is not ready for (a
+/// null write in the title at startup). Moved, never resized, otherwise.
+fn place_on_render_gpu(hwnd: HWND, adapter: &IDXGIAdapter3) {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    // SAFETY: output enumeration and a window move.
+    unsafe {
+        let current = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut first = None;
+        let mut i = 0;
+        while let Ok(output) = adapter.EnumOutputs(i) {
+            i += 1;
+            let Ok(desc) = output.GetDesc() else {
+                continue;
+            };
+            if desc.Monitor == current {
+                tracing::warn!(output = i - 1, "window already on a monitor of the render GPU");
+                return;
+            }
+            first.get_or_insert(desc.DesktopCoordinates);
+        }
+        let Some(r) = first else {
+            tracing::warn!("render GPU has no monitor; the window stays on whichever display is plugged in");
+            return;
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.left,
+            r.top,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+        tracing::warn!(left = r.left, top = r.top, "window moved onto the render GPU's monitor");
+    }
+}
+
 
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
