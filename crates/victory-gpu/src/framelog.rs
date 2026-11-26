@@ -750,6 +750,13 @@ pub fn frame() {
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }
+    // Exact CPU present-call intervals, batched to avoid per-frame log I/O.
+    // These are not compositor/display timestamps.
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXACT.get_or_init(|| std::env::var_os("VICTORY_FRAME_EXACT").is_some_and(|v| v == "1")) {
+        let each = frames.iter().map(|f| format!("{:.0}", f.us)).collect::<Vec<_>>().join(",");
+        tracing::info!("frame_intervals_us first={} last={} values={each}", frames[0].number, frames.last().unwrap().number);
+    }
     tracing::info!("{}", kinds(&frames));
 }
 
