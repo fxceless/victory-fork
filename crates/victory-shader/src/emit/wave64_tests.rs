@@ -530,3 +530,118 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A 64-lane `v_add_f64` whole-wave sum lowered on a 32-lane host:
+/// - for a group of 32 threads (`e.1 == true`), one host wave holds the whole group so no
+///   cross-half exchange is needed;
+/// - inside a per-lane branch under `with_local_waves_any` (`self.local == true`), each
+///   host wave takes its own 32-lane sum instead of failing with
+///   `"a wave reduction where not every lane runs"`.
+#[test]
+fn wave64_f64_sum_on_wave32_host_respects_small_groups_and_local_waves() {
+    let vop1 = |op: u16, vdst: u8, src0: u16| {
+        (0x3Fu32 << 25) | (u32::from(vdst) << 17) | (u32::from(op) << 9) | u32::from(src0)
+    };
+    let vop3 = |op: u16, vdst: u8, src0: u16, src1: u16, src2: u16| {
+        [
+            (0x35u32 << 26) | (u32::from(op) << 16) | u32::from(vdst),
+            u32::from(src0) | (u32::from(src1) << 9) | (u32::from(src2) << 18),
+        ]
+    };
+    let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), u32::from(vsrc) | (sel << 8)];
+    let v_mov_row_mirror = |vdst: u8, vsrc: u8| {
+        [
+            vop1(0x001, vdst, 0xFA),
+            u32::from(vsrc) | (0x140 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+        ]
+    };
+    let vgpr = |n: u8| 256u16 + u16::from(n);
+    let sgpr = |n: u8| u16::from(n);
+
+    // Whole-wave f64 sum of per-lane (s0, s1) inside `if (v0 < s2)`.
+    let mut words = vec![
+        vop1(0x001, 6, sgpr(0)), // v_mov_b32 v6, s0
+        vop1(0x001, 7, sgpr(1)), // v_mov_b32 v7, s1
+        0x7D88_0002,             // v_cmp_gt_u32 vcc, s2, v0
+        0xBE92_246A,             // s_and_saveexec_b64 s[18:19], vcc
+    ];
+    let skip_at = words.len();
+    words.push(0xBF88_0000); // s_cbranch_execz (patched below)
+    let body_start = words.len();
+    words.push(0xBE8C_25C1); // s_or_saveexec_b64 s[12:13], -1
+    words.extend_from_slice(&vop3(0x101, 2, 0x80, vgpr(6), sgpr(12))); // v_cndmask_b32 v2, 0, v6, s[12:13]
+    words.extend_from_slice(&vop3(0x101, 3, 0x80, vgpr(7), sgpr(12))); // v_cndmask_b32 v3, 0, v7, s[12:13]
+    for sel in [14570689u32, 9658386, 2340] {
+        words.extend_from_slice(&v_mov_dpp8(4, 2, sel));
+        words.extend_from_slice(&v_mov_dpp8(5, 3, sel));
+        words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0)); // v_add_f64
+    }
+    words.extend_from_slice(&v_mov_row_mirror(4, 2));
+    words.extend_from_slice(&v_mov_row_mirror(5, 3));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&vop3(0x378, 4, vgpr(2), 0x80, 0x80)); // v_permlanex16_b32
+    words.extend_from_slice(&vop3(0x378, 5, vgpr(3), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&vop3(0x360, 14, vgpr(2), 0x80, 0)); // v_readlane_b32 s14, v2, 0
+    words.extend_from_slice(&vop3(0x360, 15, vgpr(3), 0x80, 0)); // v_readlane_b32 s15, v3, 0
+    words.extend_from_slice(&vop3(0x164, 2, sgpr(14), vgpr(2), 0)); // v_add_f64 v[2:3], s[14:15], v[2:3]
+    words.extend_from_slice(&vop3(0x360, 16, vgpr(2), 0xA0, 0)); // v_readlane_b32 s16, v2, 32
+    words.extend_from_slice(&vop3(0x360, 17, vgpr(3), 0xA0, 0)); // v_readlane_b32 s17, v3, 32
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    words.push(vop1(0x00F, 0, sgpr(16))); // v_cvt_f32_f64 v0, s[16:17]
+    words.extend_from_slice(&[0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16]); // buffer_store_dword v0, off, s[8:11], 0
+    let body_words = (words.len() - body_start) as u32;
+    words[skip_at] = 0xBF88_0000 | body_words;
+    words.push(0xBEFE_0412); // s_mov_b64 exec, s[18:19]
+
+    // 1. 64-thread group: fails without local waves, succeeds under `with_local_waves_any`.
+    let n64 = native_of(&words, true, 64);
+    let p64 = ir::build(&n64.code, n64.wave64, n64.vgprs).expect("ir::build");
+    let err = lowered(&n64, &p64, &HashSet::new());
+    assert!(
+        matches!(&err, Err(ShaderError::Unsupported { what, .. }) if *what == "a wave reduction where not every lane runs"),
+        "expected divergent reduction error without local waves, got {:?}",
+        err.err(),
+    );
+    let shader64 = lower::with_local_waves_any(|| lowered(&n64, &p64, &HashSet::new())).expect("local waves f64 sum");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader64.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed (64-thread local)");
+    }
+
+    // 2. 32-thread group (wave64 on wave32 host, `e.1 == true`): no other half to exchange with.
+    let n32 = native_of(&words, true, 32);
+    let p32 = ir::build(&n32.code, n32.wave64, n32.vgprs).expect("ir::build");
+    let shader32 = lowered(&n32, &p32, &HashSet::new()).expect("32-thread wave64 f64 sum");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader32.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed (32-thread)");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader32) else { return };
+    let b = 1.25f64.to_bits();
+    let inputs = [b as u32, (b >> 32) as u32, 4u32, 0u32];
+    let mut ud = vec![0u32; shader32.user_data_dwords().max(1) as usize];
+    for u in &shader32.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    assert_eq!(out[0][0], 5.0f32.to_bits(), "32-thread wave64 f64 sum of 4 lanes * 1.25");
+}
