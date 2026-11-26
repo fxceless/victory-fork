@@ -246,7 +246,7 @@ fn display_size() -> (u32, u32) {
 /// a title paces by them.
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -268,7 +268,7 @@ extern "system" fn modes(
         width,
         height,
         refresh: [60, 1],
-        format: 0,
+        format,
         scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
@@ -337,5 +337,16 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<Modes>(output, 0xa8);
+        let mut count = 0;
+        assert_eq!(get_modes(output, 28, 0, &mut count, std::ptr::null_mut()), S_OK);
+        assert_eq!(count, 1);
+        let mut mode = std::mem::MaybeUninit::<Mode>::uninit();
+        assert_eq!(get_modes(output, 28, 0, &mut count, mode.as_mut_ptr()), S_OK);
+        // SAFETY: `get_modes` returned `S_OK` and populated `mode`.
+        let mode = unsafe { mode.assume_init() };
+        assert_eq!(mode.format, 28);
     }
 }

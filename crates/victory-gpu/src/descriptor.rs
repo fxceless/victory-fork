@@ -1369,6 +1369,95 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     (record.tag == tag).then_some(record)
 }
 
+/// Checks via `VirtualQuery` that every byte of `[addr, addr + len)` lies in
+/// committed readable (or writable) memory without guard/no-access pages.
+#[cfg(windows)]
+fn memory_accessible(addr: usize, len: usize, writable: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY, VirtualQuery,
+    };
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    if len == 0 {
+        return true;
+    }
+    let mut cur = addr;
+    while cur < end {
+        // SAFETY: zeroed output struct filled by `VirtualQuery`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying memory state without dereferencing `cur`.
+        if unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return false;
+        }
+        if info.State != MEM_COMMIT
+            || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+            || info.RegionSize == 0
+        {
+            return false;
+        }
+        let base_prot = info.Protect & 0xFF;
+        let ok = if writable {
+            matches!(
+                base_prot,
+                PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+            )
+        } else {
+            matches!(
+                base_prot,
+                PAGE_READONLY
+                    | PAGE_READWRITE
+                    | PAGE_WRITECOPY
+                    | PAGE_EXECUTE_READ
+                    | PAGE_EXECUTE_READWRITE
+                    | PAGE_EXECUTE_WRITECOPY
+            )
+        };
+        if !ok {
+            return false;
+        }
+        let Some(region_end) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if region_end <= cur {
+            return false;
+        }
+        cur = region_end;
+    }
+    true
+}
+
+/// Probes the optional `Placement` trailer immediately following `desc_ptr`.
+/// On Windows, verifies that both the trailer and the claimed backing range
+/// are committed accessible memory so a plain 16-byte `HeapDesc` at a page
+/// boundary cannot fault and stack garbage cannot masquerade as a placement.
+fn probe_placement(desc_ptr: *const HeapDesc, size: u64) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let trailer = (desc_ptr as usize).checked_add(size_of::<HeapDesc>())?;
+        if !memory_accessible(trailer, size_of::<Placement>(), false) {
+            return None;
+        }
+        // SAFETY: `VirtualQuery` confirmed `trailer..trailer + size_of::<Placement>()`
+        // is committed readable memory.
+        let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
+        if placement.address == 0 || placement.size != size {
+            return None;
+        }
+        let addr = usize::try_from(placement.address).ok()?;
+        let len = usize::try_from(size).ok()?;
+        memory_accessible(addr, len, true).then_some(placement.address)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: non-Windows builds only run unit tests passing `Extended`.
+        let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
+        (placement.address != 0 && placement.size == size).then_some(placement.address)
+    }
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_heap(
     _: This,
@@ -1384,17 +1473,15 @@ pub(crate) extern "system" fn create_heap(
     else {
         return E_INVALIDARG;
     };
-    // SAFETY: read only as a hint: a title that passes the plain
-    // description has its own stack or data after it.
-    let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
     // shortcut: a placement is recognised by its size matching the count,
     // since the plain and extended descriptions share the slot and the
     // interface version; find the flag that tells them apart if a title
     // trips over this.
-    let placed = placement.address != 0 && placement.size == size;
+    let placed_addr = probe_placement(desc_ptr, size);
+    let placed = placed_addr.is_some();
     tracing::debug!(?desc, placed, "descriptor heap");
-    let (start, memory) = if placed {
-        (placement.address, None)
+    let (start, memory) = if let Some(address) = placed_addr {
+        (address, None)
     } else {
         match Memory::zeroed(size, 64) {
             Ok(memory) => (memory.address(), Some(memory)),
@@ -1833,5 +1920,72 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plain_heap_desc_at_page_boundary_and_wild_trailer_do_not_fault_or_alias() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const PAGE: usize = 0x1000;
+        // SAFETY: allocating two private pages with page 2 inaccessible.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: protecting page 2 as PAGE_NOACCESS.
+        unsafe {
+            assert_ne!(
+                VirtualProtect(base.byte_add(PAGE), PAGE, PAGE_NOACCESS, &mut old),
+                0
+            );
+        }
+        // Place a plain 16-byte HeapDesc right against the PAGE_NOACCESS boundary.
+        let desc_ptr = (base as usize + PAGE - size_of::<HeapDesc>()) as *mut HeapDesc;
+        // SAFETY: last 16 bytes of readable page 1.
+        unsafe {
+            desc_ptr.write(HeapDesc {
+                kind: 0,
+                count: 1,
+                flags: 0,
+                nodes: 1,
+            });
+        }
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), desc_ptr, &HEAP_IIDS[0], &mut h),
+            S_OK
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        // SAFETY: freeing our test allocation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+
+        // Unmapped stack/heap garbage after a plain 1-descriptor HeapDesc whose
+        // second u64 happens to equal `size` (32) must NOT be accepted as a placement.
+        let desc = HeapDesc {
+            kind: 0,
+            count: 1,
+            flags: 0,
+            nodes: 1,
+        };
+        let bogus = Placement {
+            address: 0x0000_0000_0000_1234,
+            size: 32,
+        };
+        let mut h2 = std::ptr::null();
+        assert_eq!(create(desc, bogus, &mut h2), S_OK);
+        assert_ne!(
+            slot::<extern "system" fn(This) -> u64>(h2, 0x48)(h2),
+            bogus.address
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h2, 0x10)(h2), 0);
     }
 }
