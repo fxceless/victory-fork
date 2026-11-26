@@ -776,6 +776,14 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+`cargo test --workspace` writes to the Windows temp directory: tests create
+their files there, and the `tests/fixtures/hle-probe` build script links
+through it. In a sandboxed shell that blocks writes to `%TEMP%`, that link
+step fails with `LNK1104` on `%TEMP%\lnk*.tmp` and the tests fail with
+`PermissionDenied` creating their temp files — the sandbox, not the build.
+Point `TMP`/`TEMP` at a writable folder outside the repository and the
+suite passes (#117).
+
 Run the title:
 
 ```powershell
