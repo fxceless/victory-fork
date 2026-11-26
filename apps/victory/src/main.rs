@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 mod run;
@@ -129,6 +130,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // LOCAL-ONLY (branch local/win10-agility): keep the Agility exports.
+    std::hint::black_box(agility::D3D12SDKVersion);
+    std::hint::black_box(&agility::D3D12SDKPath);
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
