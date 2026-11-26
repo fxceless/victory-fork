@@ -21,6 +21,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - name: Display-capture validator regression
+        shell: pwsh
+        run: ./scripts/Test-Measure-DisplayCapture.ps1
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
