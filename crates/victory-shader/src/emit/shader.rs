@@ -151,6 +151,16 @@ pub(crate) fn heap_guard(props0: u32) -> u32 {
     at(kind).or_else(|| at(2)).unwrap_or(0) as u32
 }
 
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program that reads its group id x: dword 0 the groups per row of
+/// a dispatch spread across z (0: not spread), dword 1 the x group count
+/// the title asked for. A dispatch of more than 65,535 groups in x (the
+/// most Direct3D 12 runs) runs as `(row, y, rows)`; the program takes group
+/// `(x + z * row, y, 0)` and leaves at once past the asked count. (After
+/// upstream VIctory pull request #2312, Xvania7; run 319 measured indirect
+/// compute records asking 115,200 groups, clamped to 65,535 before.)
+pub const USER_DISPATCH_SPREAD: u32 = 0x104;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
