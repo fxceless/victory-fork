@@ -662,6 +662,12 @@ use):
   room can be kept for the card copies of title buffers
   (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off).
 
+- `VICTORY_GPU_UPLOAD_STRIDES=1` places persistent descriptor-stride tables
+  in CPU-visible VRAM on supported discrete GPUs. Each table is 8 MiB.
+  The runtime checks GPU upload heap support and the local memory budget,
+  and falls back to system-memory upload on refusal. This experiment is off
+  by default.
+
 Tools and diagnostics:
 - `victory translate <shader file> --warm all --jobs N` translates every
   shader ahead of a run, on the processor only (about 4.5 to 6.5 minutes
