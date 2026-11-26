@@ -1083,6 +1083,14 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;

@@ -959,6 +959,19 @@ static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ra
 /// keeps (`VICTORY_HEAP_PASS_MARKED`; nothing while that is unset).
 type Marked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
 static MARKED: std::sync::Mutex<Option<std::collections::HashMap<usize, Marked>>> = std::sync::Mutex::new(None);
+
+/// Both passes key their retained copies by the address of the host heap.
+/// Remove them before that address can belong to another heap.
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner())
+        .as_mut().and_then(|heaps| heaps.remove(&key));
+    let marked = MARKED.lock().unwrap_or_else(|e| e.into_inner())
+        .as_mut().and_then(|heaps| heaps.remove(&key));
+    // Dropping a shadow can release GPU resources. Keep that outside the locks.
+    drop((ranges, marked));
+}
+
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Where the pass over textures picked by index records its uploads: into
 /// a list of the title's, or into lists of the thread that runs it ahead.
@@ -5286,6 +5299,37 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_descriptor_heap_releases_both_buffer_pass_caches() {
+        use crate::descriptor::host::HostHeap;
+        use crate::resource::Memory;
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let memory = Memory::zeroed(4096, 4096).expect("test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("host copy");
+        crate::shadow::unregister(start as usize, start);
+        let weak = Arc::downgrade(&copy);
+
+        let mut ranges = Ranges::new();
+        ranges.insert(0, (copy.clone(), start, start + 4096));
+        RANGES.lock().unwrap().get_or_insert_with(Default::default).insert(key, (1, ranges));
+        let mut picked = Marked::new(false);
+        picked.keep(0, Arc::as_ptr(&copy) as usize, &copy, start, start + 4096, [0; 3], None);
+        MARKED.lock().unwrap().get_or_insert_with(Default::default).insert(key, picked);
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "a freed descriptor heap still owns the buffer copy");
+    }
 
     #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {
