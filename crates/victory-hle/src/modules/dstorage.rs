@@ -8,7 +8,7 @@
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
 //! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
+//! file source bytes in flight. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
 //! destination (an address, or physical pages). Completion is what stays
 //! in order: a status entry is written once every request enqueued before
@@ -794,12 +794,12 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Source bytes a request reserves while running. Compressed file reads
+/// stage their input; raw file reads can bounce through a buffer too (to
+/// avoid a kernel write into a protected title address, or to scatter to
+/// physical pages). Memory sources do not need a separate input buffer.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    if request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
@@ -1641,12 +1641,12 @@ mod tests {
     }
 
     #[test]
-    fn staging_bounds_compressed_bytes_in_flight() {
+    fn staging_bounds_file_source_bytes_in_flight() {
         let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64));
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
-        read(&mut l, 0, 0, 1000); // raw: straight to its destination
+        read(&mut l, 0, MEMORY_SOURCE, 1000); // borrowed, no input buffer
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
@@ -1660,6 +1660,21 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn raw_file_bounce_buffers_share_the_staging_budget() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, 0, 60);
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+
+        let raw = l.start().unwrap();
+        assert_eq!(raw.staging, 60);
+        assert!(l.start().is_none(), "only 40 bytes of staging remain");
+        l.finish(&raw, Ok(()));
+        assert_eq!(l.start().unwrap().staging, 60);
     }
 
     #[test]
