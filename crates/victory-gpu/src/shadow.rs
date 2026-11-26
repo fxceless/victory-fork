@@ -3181,73 +3181,88 @@ impl Shadow {
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
-    /// what a merge made of title memory `[at, at + bytes.len())` (inside
-    /// one 64 KiB page, as every merged stretch is) through a view of our
-    /// own, tells the journal, and notes the page current for this copy if
-    /// it was current before: the copy holds the same bytes (the merge put
-    /// them into both), so the next refresh need not take the page again.
+    /// what a merge made of title memory `[at, at + bytes.len())` through a
+    /// view of our own, tells the journal, and notes the page current for
+    /// this copy and any current sibling copy of the same backing if it was
+    /// current and clean before: those copies hold the same bytes (the merge
+    /// put them into title memory and into current siblings), so the next
+    /// refresh need not take the page again. Stale siblings remain stale.
     /// The guards are not touched: a title write to the page still faults
-    /// and is reported at a later asking, which every copy then takes,
-    /// this one too. False with nothing done if the switch is off or the
-    /// memory cannot be written that way (the caller writes as before).
+    /// and is reported at a later asking, which every copy then takes, this
+    /// one too. False with nothing done if the switch is off or the memory
+    /// cannot be written that way (the caller writes as before).
     fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+        crate::inplace::back_own() && self.put_back_own_always(at, bytes)
+    }
+
+    fn put_back_own_always(&self, at: usize, bytes: &[u8]) -> bool {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
         /// address did not show afterwards, pages noted current whose
         /// CPU side in the copy differs from title memory, and those of
-        /// them whose guard was clean (a hole in the rule: a title write
-        /// on its way leaves the guard open).
+        /// them whose guard was clean.
         static OWN_WRITES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let check = *CHECK.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"));
-        if !crate::inplace::back_own() {
-            return false;
+        if bytes.is_empty() {
+            return true;
         }
-        let Some(shown) = crate::inplace::write_own(at, bytes) else {
-            OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        if check {
-            // The title's own address must show what went in through ours.
-            let mut back = vec![0u8; bytes.len()];
-            if crate::host::read_into(at as *const u8, &mut back) && back != bytes {
-                OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let chunk_at = at + offset;
+            let page = chunk_at / PAGE;
+            let in_page = chunk_at % PAGE;
+            let chunk_len = (PAGE - in_page).min(bytes.len() - offset);
+            let chunk = &bytes[offset..offset + chunk_len];
+            let Some(shown) = crate::inplace::write_own(chunk_at, chunk) else {
+                OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            if check {
+                // The title's own address must show what went in through ours.
+                let mut back = vec![0u8; chunk.len()];
+                if crate::host::read_into(chunk_at as *const u8, &mut back) && back != chunk {
+                    OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
-        let page = at / PAGE;
-        let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
-        let (before, now) = crate::watch::wrote_own(page, &others);
-        // A placed texture there changed with no descriptor written (what
-        // `crate::watch::writing` tells the texture table on the old way).
-        crate::descriptor::host::remapped(at, bytes.len());
-        let base = self.start as usize / PAGE;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
-                && *taken != 0
-                && *taken >= before
-            {
-                *taken = (*taken).max(now);
-                OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
-                // A copy in the card's memory only: its CPU side is never
-                // written by the card, so it must equal title memory now.
-                if check && self.card.is_some() {
-                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                    let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
-                    if lo < hi {
-                        let mut title = vec![0u8; hi - lo];
-                        // SAFETY: inside the copy's mapping; read only.
-                        let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), hi - lo) };
-                        if crate::host::read_into(lo as *const u8, &mut title) && title != held {
-                            OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
-                            if crate::watch::clean(page) {
-                                OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
+            let mut pages: Vec<usize> = Vec::with_capacity(shown.len() + 1);
+            pages.push(page);
+            pages.extend(shown.iter().map(|&a| a / PAGE));
+            let (now, pre_stamps) = crate::watch::wrote_own(&pages);
+            // A placed texture there changed with no descriptor written (what
+            // `crate::watch::writing` tells the texture table on the old way).
+            crate::descriptor::host::remapped(chunk_at, chunk.len());
+            let base = self.start as usize / PAGE;
+            if let Some(&(_, Some(before))) = pre_stamps.iter().find(|&&(p, _)| p == page) {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                    && *taken != 0
+                    && *taken >= before
+                {
+                    *taken = (*taken).max(now);
+                    OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
+                    // A copy in the card's memory only: its CPU side is never
+                    // written by the card, so it must equal title memory now.
+                    if check && self.card.is_some() {
+                        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                        let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                        if lo < hi {
+                            let mut title = vec![0u8; hi - lo];
+                            // SAFETY: inside the copy's mapping; read only.
+                            let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), hi - lo) };
+                            if crate::host::read_into(lo as *const u8, &mut title) && title != held {
+                                OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
+                                if crate::watch::clean(page) {
+                                    OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
                 }
             }
+            self.propagate_to_siblings(page, in_page, chunk, now, &pre_stamps);
+            offset += chunk_len;
         }
         OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
@@ -3263,6 +3278,74 @@ impl Shadow {
             );
         }
         true
+    }
+
+    /// Propagates merged `chunk` bytes (at `in_page` within a 64 KiB physical
+    /// page) to current, non-pending sibling shadows covering any alias page
+    /// whose guard was clean before the write, advancing their page stamps only
+    /// when their pre-merge stamp matches.
+    fn propagate_to_siblings(
+        &self,
+        owner_page: usize,
+        in_page: usize,
+        chunk: &[u8],
+        now: u64,
+        pre_stamps: &[(usize, Option<u64>)],
+    ) {
+        let mut ranges: Vec<(usize, u64, usize, usize)> = Vec::new();
+        let (mut min_from, mut max_to) = (usize::MAX, 0usize);
+        for &(p, stamp) in pre_stamps {
+            let Some(before) = stamp else { continue };
+            let v_from = p * PAGE + in_page;
+            let v_to = v_from + chunk.len();
+            min_from = min_from.min(v_from);
+            max_to = max_to.max(v_to);
+            ranges.push((p, before, v_from, v_to));
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        for s in overlapping_shadows(min_from as u64, max_to as u64) {
+            if s.place.is_some() || s.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+                continue;
+            }
+            let (s_start, s_end) = (s.start as usize, (s.start + s.len) as usize);
+            let s_base = s_start / PAGE;
+            for &(p, before, v_from, v_to) in &ranges {
+                if s.id == self.id && p == owner_page {
+                    continue;
+                }
+                let ov_from = v_from.max(s_start);
+                let ov_to = v_to.min(s_end);
+                if ov_from >= ov_to {
+                    continue;
+                }
+                let Ok(pending) = s.pending.try_lock() else { continue };
+                if pending.iter().any(|&(a, e)| a < ov_to && e > ov_from) {
+                    continue;
+                }
+                let mut copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(taken) = p.checked_sub(s_base).and_then(|i| copied.get_mut(i)) else {
+                    continue;
+                };
+                if *taken == 0 || *taken < before {
+                    continue;
+                }
+                // SAFETY: `[ov_from, ov_to)` lies within `[s_start, s_end)`,
+                // `s.pending` has no overlapping GPU write, and `s.copied` is
+                // held across the copy and stamp advance.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.as_ptr().add(ov_from - v_from),
+                        s.data.add(ov_from - s_start),
+                        ov_to - ov_from,
+                    );
+                }
+                s.changed(ov_from - s_start, ov_to - s_start);
+                s.card_changed(ov_from - s_start, ov_to - s_start);
+                *taken = (*taken).max(now);
+            }
+        }
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -4174,6 +4257,41 @@ impl Shadow {
     }
 }
 
+/// Live shadows from `BUFFERS`, `LOOSE`, and `EXACT` whose title-address
+/// range overlaps `[min_from, max_to)`.
+fn overlapping_shadows(min_from: u64, max_to: u64) -> Vec<Arc<Shadow>> {
+    let mut out = Vec::new();
+    {
+        let map = buffers();
+        for (_, entry) in map.range(..(max_to, 0)) {
+            if entry.end > min_from
+                && let Some(shadow) = &entry.shadow
+            {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (&(start, len), shadow) in map.range(..(max_to, 0)) {
+            if start + len > min_from {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        for (&(start, len), (shadow, _)) in guard.1.range(..(max_to, 0)) {
+            if start + len > min_from {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    out.sort_unstable_by_key(|s| s.id);
+    out.dedup_by_key(|s| s.id);
+    out
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -5053,6 +5171,193 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    struct MappedSection {
+        section: usize,
+        views: Vec<(usize, usize)>,
+    }
+
+    impl MappedSection {
+        fn new(bytes: usize, mappings: &[(u64, usize)]) -> Self {
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+            // SAFETY: fresh pagefile section for test views, cleaned up on Drop.
+            let section = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    bytes as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+            let section_id = section as usize;
+            crate::inplace::title_memory_section(section_id, bytes as u64, true);
+            let mut views = Vec::with_capacity(mappings.len());
+            for &(offset, len) in mappings {
+                // SAFETY: `offset + len <= bytes` in the section just created.
+                let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, len) };
+                assert!(!view.Value.is_null());
+                let addr = view.Value as usize;
+                crate::inplace::title_memory_view(addr, len, section_id, offset);
+                views.push((addr, len));
+            }
+            Self { section: section_id, views }
+        }
+    }
+
+    impl Drop for MappedSection {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            for &(addr, len) in &self.views {
+                crate::watch::title_memory_remapped(addr, len);
+                // SAFETY: mapped in `MappedSection::new` and no shadow uses it anymore.
+                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: addr as *mut _ }) };
+            }
+            // SAFETY: handle created by `CreateFileMappingW` in `MappedSection::new`.
+            unsafe { CloseHandle(self.section as HANDLE) };
+        }
+    }
+
+    struct RegisteredShadow {
+        resource: usize,
+        start: u64,
+        shadow: std::sync::Arc<Shadow>,
+        _backing: Vec<u8>,
+    }
+
+    impl RegisteredShadow {
+        fn new(buffer: &ID3D12Resource, resource: usize, start: u64, len: usize) -> Self {
+            let mut backing = vec![0u8; len];
+            let shadow = std::sync::Arc::new(Shadow::new(buffer.clone(), backing.as_mut_ptr(), 0, start, len as u64));
+            super::register(resource, start, len as u64);
+            super::buffers().get_mut(&(start, resource)).unwrap().shadow = Some(shadow.clone());
+            Self {
+                resource,
+                start,
+                shadow,
+                _backing: backing,
+            }
+        }
+
+        fn bytes(&self) -> &[u8] {
+            &self._backing
+        }
+    }
+
+    impl Drop for RegisteredShadow {
+        fn drop(&mut self) {
+            super::unregister(self.resource, self.start);
+        }
+    }
+
+    /// A relay merge updates current siblings (including across non-zero view
+    /// offsets) with only the merged bytes and advances their page stamps,
+    /// while leaving stale siblings stale so their next refresh reloads from
+    /// title memory.
+    #[test]
+    fn relay_merge_updates_current_sibling_across_view_offsets_and_leaves_stale_sibling_stale() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const PAGE: usize = super::PAGE;
+        let mapped = MappedSection::new(2 * PAGE, &[(0, 2 * PAGE), (PAGE as u64, PAGE), (0, 2 * PAGE)]);
+        let (v_owner, v_offset, v_stale) = (mapped.views[0].0, mapped.views[1].0, mapped.views[2].0);
+
+        // Seed physical page 1 via `v_owner` before guarding.
+        // SAFETY: `v_owner` is a writable 2-page view.
+        unsafe {
+            std::ptr::write_bytes((v_owner + PAGE) as *mut u8, 0x11, PAGE);
+        }
+
+        let owner = RegisteredShadow::new(&buffer, 0xA001, v_owner as u64, 2 * PAGE);
+        // `cur` starts at offset +64 inside `v_offset` (which itself is mapped at section offset `PAGE`).
+        let cur = RegisteredShadow::new(&buffer, 0xA002, (v_offset + 64) as u64, PAGE - 128);
+        let stale = RegisteredShadow::new(&buffer, 0xA003, v_stale as u64, 2 * PAGE);
+
+        // Refresh `owner` and `cur` so both are current; leave `stale` never refreshed.
+        owner.shadow.update(v_owner, 2 * PAGE);
+        cur.shadow.update(v_offset + 64, PAGE - 128);
+        assert_eq!(cur.bytes()[64..80], [0x11; 16]);
+
+        // Also test an outdated stale sibling: refresh `stale2`, then fault-write
+        // the backing, then refresh only `cur` so `stale2` has an older non-zero stamp.
+        let stale2 = RegisteredShadow::new(&buffer, 0xA004, (v_stale + PAGE) as u64, PAGE);
+        stale2.shadow.update(v_stale + PAGE, PAGE);
+        // SAFETY: title write at offset 300 in page 1 faults and dirties the page.
+        unsafe { ((v_stale + PAGE + 300) as *mut u8).write(0x22) };
+        owner.shadow.update(v_owner + PAGE, PAGE);
+        cur.shadow.update(v_offset + 64, PAGE - 128);
+        assert_eq!(cur.bytes()[300 - 64], 0x22);
+
+        // Relay merge on `owner` writes merged bytes into `v_owner + PAGE + 128..144`.
+        let merged = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x42, 0x99];
+        assert!(owner.shadow.put_back_own_always(v_owner + PAGE + 128, &merged));
+
+        // `cur` received just the merged bytes at its view-offset position and stays current.
+        assert_eq!(&cur.bytes()[128 - 64..144 - 64], &merged);
+        assert_eq!(cur.shadow.update(v_offset + 64, PAGE - 128), 0);
+
+        // Both stale siblings remained stale and refresh the full page from title memory.
+        assert_eq!(stale.shadow.update(v_stale + PAGE, PAGE), PAGE);
+        assert_eq!(&stale.bytes()[PAGE + 128..PAGE + 144], &merged);
+        assert_eq!(stale2.shadow.update(v_stale + PAGE, PAGE), PAGE);
+        assert_eq!(&stale2.bytes()[128..144], &merged);
+        assert_eq!(stale2.bytes()[300], 0x22);
+    }
+
+    /// Boundary crossing across two 64 KiB pages updates only the current page(s)
+    /// of a sibling, and a concurrent title write opening the guard prevents stamp
+    /// advancement so the next refresh picks up both writes.
+    #[test]
+    fn relay_merge_handles_boundary_crossing_and_concurrent_title_write() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const PAGE: usize = super::PAGE;
+        let mapped = MappedSection::new(2 * PAGE, &[(0, 2 * PAGE), (0, 2 * PAGE)]);
+        let (v_owner, v_sib) = (mapped.views[0].0, mapped.views[1].0);
+
+        // SAFETY: writable 2-page title view.
+        unsafe {
+            std::ptr::write_bytes(v_owner as *mut u8, 0x33, 2 * PAGE);
+        }
+
+        let owner = RegisteredShadow::new(&buffer, 0xB001, v_owner as u64, 2 * PAGE);
+        // Sibling crosses the `page 0 | page 1` boundary: `[PAGE - 16, PAGE + 32)`.
+        let sib = RegisteredShadow::new(&buffer, 0xB002, (v_sib + PAGE - 16) as u64, 48);
+
+        // Refresh `owner` on both pages, and `sib` on page 0 only (page 1 stays stale).
+        owner.shadow.update(v_owner, 2 * PAGE);
+        sib.shadow.update(v_sib + PAGE - 16, 16);
+
+        let cross1 = [0x5Au8; 16];
+        assert!(owner.shadow.put_back_own_always(v_owner + PAGE - 8, &cross1));
+        assert_eq!(&sib.bytes()[8..16], &cross1[..8]);
+        assert_eq!(sib.shadow.update(v_sib + PAGE - 16, 16), 0);
+        // Page 1 of `sib` remained stale and reloads on refresh.
+        assert_eq!(sib.shadow.update(v_sib + PAGE, 32), 32);
+        assert_eq!(&sib.bytes()[16..24], &cross1[8..16]);
+
+        // Now `sib` is current on both pages; another cross-boundary merge updates both.
+        let cross2 = [0x7Cu8; 16];
+        assert!(owner.shadow.put_back_own_always(v_owner + PAGE - 8, &cross2));
+        assert_eq!(&sib.bytes()[8..24], &cross2);
+        assert_eq!(sib.shadow.update(v_sib + PAGE - 16, 48), 0);
+
+        // Concurrent title write opens page 1's guard before `put_back_own_always`:
+        // neither `owner` nor `sib` may advance page 1's stamp, and refresh sees both writes.
+        // SAFETY: title write in page 1 triggers guard fault and opens page 1.
+        unsafe { ((v_sib + PAGE + 24) as *mut u8).write(0xE1) };
+        let after_write = [0x44u8; 8];
+        assert!(owner.shadow.put_back_own_always(v_owner + PAGE + 4, &after_write));
+        assert_eq!(sib.shadow.update(v_sib + PAGE, 32), 32);
+        assert_eq!(&sib.bytes()[20..28], &after_write);
+        assert_eq!(sib.bytes()[40], 0xE1);
     }
 }
 

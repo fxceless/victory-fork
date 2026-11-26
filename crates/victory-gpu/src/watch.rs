@@ -297,17 +297,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
-/// We wrote the 64 KiB page numbered `page` of title memory through a
-/// view of our own (`crate::inplace::write_own`): no guard was opened and
-/// no kernel write-watch bit set, so the journal is told here. The page,
-/// and the same physical page at its other title addresses (`others`,
-/// page numbers), count as written at a new asking, which every host copy
-/// that holds them takes at its next refresh. Returns the asking that had
-/// last found `page` written (0: never) and the new one, for the copy
-/// that wrote to note itself current.
-pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+/// We wrote 64 KiB pages of title memory through a view of our own
+/// (`crate::inplace::write_own`): no guard was opened and no kernel
+/// write-watch bit set, so the journal is told here. Every unique page in
+/// `pages` (the written page and the same physical page at its other title
+/// addresses) counts as written at a new asking, which every host copy that
+/// holds it takes at its next refresh. Returns the new asking and, for each
+/// unique page, `(page, pre_merge_stamp)` where `pre_merge_stamp` is
+/// `Some(before)` only while that page's guard is still clean (no
+/// concurrent title write opened it).
+pub(crate) fn wrote_own(pages: &[usize]) -> (u64, Vec<(usize, Option<u64>)>) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    let g = guards();
     j.asked += 1;
     let now = j.asked;
     // As in [`wrote`]: an asking that stands for a submission, or for a
@@ -316,15 +318,17 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
-    j.sub.remove(&page);
-    for &other in others {
-        if other != page {
-            j.written.insert(other, now);
-            j.sub.remove(&other);
+    let mut seen = Vec::with_capacity(pages.len());
+    for &page in pages {
+        if seen.iter().any(|&(p, _)| p == page) {
+            continue;
         }
+        let clean = g.clean.contains(&page);
+        let before = j.written.insert(page, now).unwrap_or(0);
+        j.sub.remove(&page);
+        seen.push((page, clean.then_some(before)));
     }
-    (before, now)
+    (now, seen)
 }
 
 /// The asking that last found the 64 KiB page numbered `page` written (0:
