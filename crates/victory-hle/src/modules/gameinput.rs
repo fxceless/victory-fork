@@ -1208,33 +1208,290 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key_code(key)?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        for vk in live::held() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// A key name of `VICTORY_KEYS` / `VICTORY_KEYS_LIVE` as a virtual key.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            "Space" => 0x20,
+            "Shift" => 0xA0,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid for driving a run from outside:
+    /// `VICTORY_KEYS_LIVE=<file>`. Lines appended to the file while the
+    /// title runs are pressed in order, one after the other: `<keys>[:<ms>]`,
+    /// where `<keys>` is one key name of `VICTORY_KEYS` or several joined
+    /// by `+` (held together, e.g. `W+J:1500` walks and turns), held
+    /// `<ms>` milliseconds (200 unless said), with 150 ms of nothing held
+    /// after each. `wait:<ms>` holds nothing. Lines already in the file
+    /// when the run starts are not pressed, and a line is taken only once
+    /// its newline is written. With or without focus.
+    ///
+    /// `VICTORY_KEYS` needs every press timed before the run starts; menus
+    /// whose screens come at different times from run to run (first boot,
+    /// legal pages with a countdown, a shader cache warm or cold) need the
+    /// next press decided after the last screen was seen.
+    #[cfg(feature = "diagnostics")]
+    mod live {
+        use std::collections::VecDeque;
+        use std::sync::{LazyLock, Mutex};
+        use std::time::{Duration, Instant};
+
+        /// The gap after each line, so that the same key twice is two presses.
+        const GAP: Duration = Duration::from_millis(150);
+
+        /// One line of the file: the keys held together and for how long.
+        /// `None` for a blank line or a key name `VICTORY_KEYS` does not know.
+        pub(super) fn parse(line: &str) -> Option<(Vec<u8>, Duration)> {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (keys, ms) = match line.rsplit_once(':') {
+                Some((keys, ms)) => (keys, ms.trim().parse().ok()?),
+                None => (line, 200),
+            };
+            let codes = if keys.trim().eq_ignore_ascii_case("wait") {
+                Vec::new()
+            } else {
+                keys.split('+')
+                    .map(super::key_code)
+                    .collect::<Option<Vec<u8>>>()?
+            };
+            if !codes.is_empty() && ms == 0 {
+                // A press held 0 ms could never be seen by the title.
+                return None;
+            }
+            Some((codes, Duration::from_millis(ms)))
+        }
+
+        /// Lines waiting their turn, and the one being held.
+        #[derive(Default)]
+        pub(super) struct Queue {
+            waiting: VecDeque<(Vec<u8>, Duration)>,
+            current: Option<(Vec<u8>, Instant)>,
+        }
+
+        impl Queue {
+            pub(super) fn push(&mut self, keys: Vec<u8>, hold: Duration) {
+                self.waiting.push_back((keys, hold));
+                self.waiting.push_back((Vec::new(), GAP));
+            }
+
+            /// The keys held at `now`; a line's time starts when it is first
+            /// asked for, so a title that polls late still sees every press.
+            pub(super) fn held(&mut self, now: Instant) -> Vec<u8> {
+                loop {
+                    if let Some((keys, until)) = &self.current
+                        && now < *until
+                    {
+                        return keys.clone();
+                    }
+                    let Some((keys, hold)) = self.waiting.pop_front() else {
+                        self.current = None;
+                        return Vec::new();
+                    };
+                    self.current = Some((keys, now + hold));
+                }
+            }
+        }
+
+        static QUEUE: LazyLock<Option<Mutex<Queue>>> = LazyLock::new(|| {
+            let path = std::path::PathBuf::from(std::env::var_os("VICTORY_KEYS_LIVE")?);
+            let start = std::fs::metadata(&path).map_or(0, |m| m.len());
+            std::thread::Builder::new()
+                .name("keys-live".into())
+                .spawn(move || follow(&path, start))
+                .ok()?;
+            Some(Mutex::new(Queue::default()))
+        });
+
+        /// Appends `fresh` to `partial` (the bytes read so far that do not
+        /// end a line yet) and takes out the complete lines.
+        pub(super) fn complete_lines(partial: &mut Vec<u8>, fresh: &[u8]) -> Vec<String> {
+            partial.extend_from_slice(fresh);
+            let Some(end) = partial.iter().rposition(|&b| b == b'\n') else {
+                return Vec::new();
+            };
+            let lines = String::from_utf8_lossy(&partial[..end])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            partial.drain(..=end);
+            lines
+        }
+
+        /// Reads what is appended to `path` from byte `offset` on, every
+        /// 100 ms (only the new bytes), and queues each complete line. The
+        /// file is append-only: emptying it, or replacing it with a shorter
+        /// one, starts over from its beginning; a longer replacement between
+        /// two looks is read from the old offset on, as if appended.
+        fn follow(path: &std::path::Path, mut offset: u64) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut partial = Vec::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    continue;
+                };
+                let Ok(len) = file.metadata().map(|m| m.len()) else {
+                    continue;
+                };
+                if len < offset {
+                    offset = 0;
+                    partial.clear();
+                }
+                if len == offset {
+                    continue;
+                }
+                let mut fresh = Vec::new();
+                if file.seek(SeekFrom::Start(offset)).is_err()
+                    || file.take(len - offset).read_to_end(&mut fresh).is_err()
+                {
+                    continue;
+                }
+                offset += fresh.len() as u64;
+                let lines = complete_lines(&mut partial, &fresh);
+                if lines.is_empty() {
+                    continue;
+                }
+                let Some(queue) = QUEUE.as_ref() else { return };
+                let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+                for line in &lines {
+                    let line = line.as_str();
+                    match parse(line) {
+                        Some((keys, hold)) => {
+                            tracing::info!(line, "VICTORY_KEYS_LIVE: pressed");
+                            queue.push(keys, hold);
+                        }
+                        None if !line.trim().is_empty() => {
+                            tracing::warn!(
+                                line,
+                                "VICTORY_KEYS_LIVE: line not understood (keys[+keys][:ms] or wait:ms)"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        /// The keys the live file holds down now.
+        pub(super) fn held() -> Vec<u8> {
+            let Some(queue) = QUEUE.as_ref() else {
+                return Vec::new();
+            };
+            queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held(Instant::now())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn lines_name_keys_holds_and_waits() {
+                let ms = Duration::from_millis;
+                assert_eq!(parse("Enter"), Some((vec![0x0D], ms(200))));
+                assert_eq!(parse("  w+J:1500 "), Some((vec![b'W', b'J'], ms(1500))));
+                assert_eq!(parse("wait:300"), Some((vec![], ms(300))));
+                assert_eq!(parse(""), None);
+                assert_eq!(
+                    parse("Bogus"),
+                    None,
+                    "an unknown key is not pressed as nothing"
+                );
+                assert_eq!(parse("Enter:soon"), None);
+                assert_eq!(
+                    parse("Enter:0"),
+                    None,
+                    "a press held 0 ms could never be seen"
+                );
+                assert_eq!(parse("wait:0"), Some((vec![], ms(0))));
+            }
+
+            #[test]
+            fn polls_far_apart_lose_no_press() {
+                // However long between two polls, each press is seen by one
+                // poll at least, in order.
+                let t = Instant::now();
+                let ms = Duration::from_millis;
+                let mut q = Queue::default();
+                for vk in [0x0D, 0x28, b'W'] {
+                    q.push(vec![vk], ms(200));
+                }
+                let seen: Vec<Vec<u8>> = (0..6)
+                    .map(|i| q.held(t + ms(10_000 * i)))
+                    .filter(|k| !k.is_empty())
+                    .collect();
+                assert_eq!(seen, [vec![0x0D], vec![0x28], vec![b'W']]);
+            }
+
+            #[test]
+            fn lines_are_taken_only_once_complete() {
+                let mut partial = Vec::new();
+                assert_eq!(complete_lines(&mut partial, b"Enter\nDo"), ["Enter"]);
+                assert_eq!(partial, b"Do", "the incomplete line waits");
+                assert_eq!(
+                    complete_lines(&mut partial, b"wn:300\r\nwait:5\n"),
+                    ["Down:300", "wait:5"]
+                );
+                assert!(partial.is_empty());
+            }
+
+            #[test]
+            fn lines_are_held_one_after_the_other_with_a_gap() {
+                let t = Instant::now();
+                let ms = Duration::from_millis;
+                let mut q = Queue::default();
+                q.push(vec![0x0D], ms(200));
+                q.push(vec![0x0D], ms(200));
+                // The first line's time starts when it is first asked for.
+                assert_eq!(q.held(t + ms(1000)), vec![0x0D]);
+                assert_eq!(q.held(t + ms(1199)), vec![0x0D]);
+                // Then the gap, so the second Enter is a press of its own.
+                assert_eq!(q.held(t + ms(1200)), Vec::<u8>::new());
+                assert_eq!(q.held(t + ms(1350)), vec![0x0D]);
+                assert_eq!(q.held(t + ms(1550)), Vec::<u8>::new());
+                assert_eq!(q.held(t + ms(5000)), Vec::<u8>::new(), "nothing left");
+            }
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
