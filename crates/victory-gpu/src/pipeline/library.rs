@@ -439,6 +439,8 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// The title pipelines a pre-build put in the library, after a first line
 /// naming the library file and translator they hold for ([`tag`]).
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
+/// Who last saved the library and when ([`stamp_text`]).
+const STAMP_FILE: &str = "host-pipelines.stamp";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -481,6 +483,9 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+                if let Some(dir) = DIR.get() {
+                    check_stamp(dir);
+                }
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
@@ -647,6 +652,9 @@ pub(crate) fn save(now: bool) {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
         }
+        if let Err(e) = write_atomically(&dir.join(STAMP_FILE), stamp_text(&namer(), now_secs()).as_bytes()) {
+            tracing::warn!(error = %e, "host pipeline library's stamp not written");
+        }
         crate::host::trail(|| {
             format!(
                 "pipeline library: saved {bytes} bytes, {}",
@@ -737,18 +745,82 @@ fn tag(file: &std::path::Path) -> Option<String> {
     let meta = std::fs::metadata(file).ok()?;
     let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
     let mut h = blake3::Hasher::new();
-    for part in [
-        &meta.len().to_le_bytes()[..],
-        &time.to_le_bytes(),
-        &victory_shader::emit::translation_fingerprint(),
-        include_bytes!("../shader_cache.rs"),
-        include_bytes!("host.rs"),
-        include_bytes!("library.rs"),
-    ] {
+    for part in [&meta.len().to_le_bytes()[..], &time.to_le_bytes(), namer().as_bytes()] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
     Some(h.finalize().to_hex().to_string())
+}
+
+/// What names the library's pipelines in this build and environment: the
+/// translator's fingerprint (with the host facts and switches it reads),
+/// the shader cache's and the host description's code. Pipelines saved
+/// under another namer are not found by this run's names: their loads miss
+/// and they are made again.
+fn namer() -> String {
+    static NAMER: OnceLock<String> = OnceLock::new();
+    NAMER
+        .get_or_init(|| {
+            let mut h = blake3::Hasher::new();
+            for part in [
+                &victory_shader::emit::translation_fingerprint()[..],
+                include_bytes!("../shader_cache.rs"),
+                include_bytes!("host.rs"),
+                include_bytes!("library.rs"),
+            ] {
+                h.update(&(part.len() as u64).to_le_bytes());
+                h.update(part);
+            }
+            h.finalize().to_hex()[..16].to_owned()
+        })
+        .clone()
+}
+
+/// The stamp a save leaves beside the library: the namer of the run or
+/// pre-build that saved it and when (seconds since 1970).
+fn stamp_text(namer: &str, secs: u64) -> String {
+    format!("{namer}
+{secs}
+")
+}
+
+/// The namer and save time in a stamp's text, if it is one.
+fn read_stamp(text: &str) -> Option<(&str, u64)> {
+    let mut lines = text.lines();
+    let namer = lines.next().filter(|n| !n.is_empty())?;
+    let secs = lines.next()?.trim().parse().ok()?;
+    Some((namer, secs))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Says at start whether the library was last saved under this run's
+/// namer: a library from another translator or other switches loads almost
+/// nothing (every load a miss that makes the pipeline again), which the
+/// counts alone only show at the end of a run.
+fn check_stamp(dir: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(dir.join(STAMP_FILE)) else {
+        tracing::info!(
+            "the host pipeline library has no stamp (saved by an older build): if most pipelines are made again rather than loaded, run `victory translate --cache --pipelines` with this run's environment"
+        );
+        return;
+    };
+    let Some((saved_by, secs)) = read_stamp(&text) else {
+        return;
+    };
+    let hours = now_secs().saturating_sub(secs) as f64 / 3600.0;
+    if saved_by == namer() {
+        tracing::info!(age_hours = format_args!("{hours:.1}"), namer = saved_by, "host pipeline library last saved under this run's translator and switches");
+    } else {
+        tracing::warn!(
+            age_hours = format_args!("{hours:.1}"),
+            saved_by,
+            this_run = namer(),
+            "host pipeline library last saved under another translator or other switches: most loads will miss and make the pipeline again; run `victory translate --cache --pipelines` with this run's environment"
+        );
+    }
 }
 
 /// The keys of a saved list, if it holds for `tag` (else none).
@@ -824,6 +896,17 @@ pub(crate) fn note_used(key: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_stamp_reads_back_and_odd_text_is_none() {
+        assert_eq!(read_stamp(&stamp_text("0123abcd", 1_790_000_000)), Some(("0123abcd", 1_790_000_000)));
+        assert_eq!(read_stamp(""), None);
+        assert_eq!(read_stamp("abc
+not a time
+"), None);
+        assert_eq!(namer(), namer());
+        assert_eq!(namer().len(), 16);
+    }
     use super::*;
 
     #[test]
