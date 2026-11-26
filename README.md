@@ -787,6 +787,20 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+To keep a test checkout and its runtime files in one parent directory, put
+the runtime directories beside the checkout. From the checkout root in
+PowerShell, set these before running the title or prebuilding pipelines:
+
+```powershell
+$testRoot = Split-Path -Parent (Get-Location).Path
+$env:VICTORY_CACHE_DIR = Join-Path $testRoot 'victory-cache'
+$env:VICTORY_DATA_DIR = Join-Path $testRoot 'victory-data'
+```
+
+These settings apply to the current PowerShell session. Change the directory
+names to give a test run its own cache and saves, or keep the same cache path
+when comparing warm-cache runs. Keep both directories outside the checkout.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

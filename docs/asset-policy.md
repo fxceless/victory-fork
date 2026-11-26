@@ -50,9 +50,11 @@ the title.
 
 ## Where data lives
 
-Outside the repository, configured in `victory.toml`: `game_dir` (the
-user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+Keep `game_dir` (the user's dump), `test_titles`, `cache_dir` (derived
+files), and `data_dir` (saves, settings, and logs) outside the repository.
+Set these paths in `victory.toml` or use the overrides listed in
+`victory.example.toml`. On Windows, the runtime directories default to
+`%LOCALAPPDATA%\victory\cache` and `%LOCALAPPDATA%\victory\data`.
 
 ## Enforcement
 
