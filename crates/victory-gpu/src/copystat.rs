@@ -3,7 +3,7 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -280,7 +280,9 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// hold the blocks under about half a megabyte of ours, of the graphics
 /// runtime and of the driver alike (3.5 GB in run 60's gameplay, growing by
 /// some 2 MB a frame, and nothing said whose): this says which part is
-/// ours. Bigger blocks are allocations of their own in the map.
+/// ours. Bigger blocks are allocations of their own in the map, and heaps
+/// other than the process heap (AMD's compiler keeps one) count apart, as
+/// "segments of other heaps".
 static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
@@ -411,6 +413,70 @@ mod command_tests {
 }
 
 #[cfg(test)]
+mod heap_tests {
+    use super::{other_heaps, segment_heap};
+    use std::collections::HashMap;
+    use windows_sys::Win32::System::Memory::{
+        GetProcessHeap, HeapAlloc, HeapCreate, HeapDestroy, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+
+    /// A 15.8 MB allocation whose header names no heap is counted apart, not
+    /// as a heap at 0x0 "in 0 segments", and is not counted as a heap.
+    #[test]
+    fn allocations_with_no_heap_header_are_counted_apart() {
+        let owner = HashMap::from([(0x1000, 0xa000), (0x2000, 0xa000), (0x3000, 0xb000)]);
+        let mb = 1 << 20;
+        let regions = [
+            (0x1000, 10 * mb),
+            (0x2000, 5 * mb),
+            (0x4000, 3 * mb),
+            (0x4000, mb),
+            (0x5000, mb),
+        ];
+        let (count, lines) = other_heaps(&owner, 0xb000, &regions);
+        assert_eq!(count, 1);
+        assert_eq!(
+            lines,
+            [
+                "heap 0xa000: 15 MB in 2 segments",
+                "5 MB in 2 allocations with no readable heap header"
+            ]
+        );
+    }
+
+    /// A segment names its heap: the process heap's first segment is the
+    /// heap itself, and a private heap filled past its first segment names
+    /// that heap (AMD's compiler grew a heap of its own past 30 GB, which
+    /// the memory map counted as the process heap's).
+    #[test]
+    fn segments_name_their_heap() {
+        // SAFETY: a heap of our own, destroyed at the end; the query only
+        // fills `m`.
+        unsafe {
+            let process = GetProcessHeap() as usize;
+            assert_eq!(segment_heap(process), Some(process));
+            let heap = HeapCreate(0, 0, 0);
+            assert!(!heap.is_null());
+            let mut last = std::ptr::null_mut();
+            for _ in 0..20_000 {
+                last = HeapAlloc(heap, 0, 4000);
+                assert!(!last.is_null());
+            }
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                VirtualQuery(last, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()),
+                0
+            );
+            let base = m.AllocationBase as usize;
+            assert_ne!(base, heap as usize, "the heap added no segment");
+            assert_eq!(segment_heap(base), Some(heap as usize));
+            assert_eq!(segment_heap(last as usize), None);
+            HeapDestroy(heap);
+        }
+    }
+}
+
+#[cfg(test)]
 mod own_tests {
     use super::{OWN, block_class};
     use std::sync::atomic::Ordering::Relaxed;
@@ -495,7 +561,7 @@ fn memory_map() -> bool {
 
 /// Asks which of the pages in `asked` (address, answer) are in physical
 /// memory and adds the bytes each stands for (kind, bytes) to its kind.
-fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
+fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 11]) {
     use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: our own process; `asked` holds that many entries of two
@@ -513,6 +579,74 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
     }
     asked.clear();
     stands.clear();
+}
+
+/// The memory map's line about the heaps other than the process heap: how
+/// many there are, and the five holding the most bytes, with their segments.
+/// `owner` maps each 15.8 MB allocation to the heap its header names;
+/// `regions` are the committed regions (allocation base, bytes) of those the
+/// process heap does not own. An allocation whose header could not be read
+/// names no heap: those are counted apart, not as a heap.
+fn other_heaps(
+    owner: &HashMap<usize, usize>,
+    process_heap: usize,
+    regions: &[(usize, usize)],
+) -> (usize, Vec<String>) {
+    let mut heaps: HashMap<usize, (u64, u64)> = HashMap::new();
+    for heap in owner.values().filter(|&&heap| heap != process_heap) {
+        heaps.entry(*heap).or_default().0 += 1;
+    }
+    let mut unread = HashSet::new();
+    for &(base, bytes) in regions {
+        let heap = owner.get(&base).copied().unwrap_or(0);
+        if heap == 0 {
+            unread.insert(base);
+        }
+        heaps.entry(heap).or_default().1 += bytes as u64;
+    }
+    if let Some(entry) = heaps.get_mut(&0) {
+        entry.0 = unread.len() as u64;
+    }
+    let count = heaps.keys().filter(|&&heap| heap != 0).count();
+    let mut heaps: Vec<(usize, (u64, u64))> = heaps.into_iter().collect();
+    heaps.sort_by_key(|h| std::cmp::Reverse(h.1.1));
+    let biggest = heaps
+        .iter()
+        .take(5)
+        .map(|&(heap, (n, bytes))| match heap {
+            0 => format!(
+                "{} MB in {n} allocations with no readable heap header",
+                bytes >> 20
+            ),
+            _ => format!("heap {heap:#x}: {} MB in {n} segments", bytes >> 20),
+        })
+        .collect();
+    (count, biggest)
+}
+
+/// The heap whose segment starts at `base`, from the segment's header (an
+/// NT heap's `HEAP_SEGMENT`, 64-bit layout: signature 0xffeeffee at +0x10,
+/// its heap at +0x28), or `None` if no heap segment starts there.
+fn segment_heap(base: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut header = [0u8; 0x30];
+    let mut done = 0usize;
+    // SAFETY: our own process, read through the kernel into `header`: an
+    // unreadable page fails the call instead of faulting.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            base as *const _,
+            header.as_mut_ptr().cast(),
+            header.len(),
+            &mut done,
+        )
+    } != 0;
+    if !ok || done != header.len() || header[0x10..0x14] != 0xffee_ffee_u32.to_le_bytes() {
+        return None;
+    }
+    Some(usize::from_le_bytes(header[0x28..0x30].try_into().ok()?))
 }
 
 /// Logs what the process has committed by kind, from a walk of its address
@@ -534,7 +668,7 @@ fn log_memory_map() {
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
         VirtualQuery,
     };
-    const KINDS: [&str; 10] = [
+    const KINDS: [&str; 11] = [
         "the title's heaps (private, console addresses)",
         "views of the title's pages (mapped, console addresses)",
         "the title's page pool (mapped, 1 GB and more)",
@@ -545,6 +679,7 @@ fn log_memory_map() {
         "other private allocations under 1 MB",
         "files and other mappings at host addresses",
         "programs and libraries",
+        "segments of other heaps (private, 15.8 MB each)",
     ];
     /// Console addresses lie below this.
     const HOST: usize = 1 << 40;
@@ -583,6 +718,20 @@ fn log_memory_map() {
     for r in &regions {
         *whole.entry(r.0).or_default() += r.2;
     }
+    // The heap each 15.8 MB allocation's segment header names, once per
+    // allocation: the process heap's segments are told from other heaps'
+    // (AMD's compiler kept a heap of its own that grew past 30 GB).
+    // SAFETY: a plain call.
+    let process_heap = unsafe { windows_sys::Win32::System::Memory::GetProcessHeap() } as usize;
+    let mut owner: HashMap<usize, usize> = HashMap::new();
+    for r in regions
+        .iter()
+        .filter(|r| r.0 == r.1 && r.3 && whole.get(&r.0) == Some(&0xfd_0000))
+    {
+        if let Some(heap) = segment_heap(r.0) {
+            owner.insert(r.0, heap);
+        }
+    }
     let kind = |r: &Region| -> usize {
         let size = whole.get(&r.0).copied().unwrap_or(0);
         let console = r.0 < HOST;
@@ -597,7 +746,11 @@ fn log_memory_map() {
         } else if console {
             0
         } else if size == 0xfd_0000 {
-            3
+            if owner.get(&r.0) == Some(&process_heap) {
+                3
+            } else {
+                10
+            }
         } else if size == 4 << 20 {
             4
         } else if r.5 & PAGE_WRITECOMBINE != 0 {
@@ -608,8 +761,8 @@ fn log_memory_map() {
             7
         }
     };
-    let mut committed = [0u64; 10];
-    let mut present = [0u64; 10];
+    let mut committed = [0u64; 11];
+    let mut present = [0u64; 11];
     let mut asked: Vec<[usize; 2]> = Vec::with_capacity(4096);
     let mut stands: Vec<(usize, u64)> = Vec::with_capacity(4096);
     for r in regions.iter().filter(|r| r.3) {
@@ -638,6 +791,18 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
+    let other: Vec<(usize, usize)> = regions
+        .iter()
+        .filter(|r| r.3 && kind(r) == 10)
+        .map(|r| (r.0, r.2))
+        .collect();
+    let (count, biggest) = other_heaps(&owner, process_heap, &other);
+    if !biggest.is_empty() {
+        tracing::info!(
+            "memory map, heaps other than the process heap ({count}, the biggest first): {}",
+            biggest.join("; ")
+        );
+    }
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer
