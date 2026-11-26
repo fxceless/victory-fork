@@ -799,6 +799,27 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+### Cross-build on x86-64 Linux with the Nix flake
+
+Run `nix develop` from the checkout, or `direnv allow` if you use direnv.
+The shell reads the Rust version and targets from `rust-toolchain.toml`.
+`cargo-xwin` downloads the pinned Microsoft CRT and Windows SDK into its
+user cache on the first cross-build.
+
+```sh
+cargo xtask install-hooks
+cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc
+cargo xwin run --locked --release -p victory --target x86_64-pc-windows-msvc -- --help
+cargo xwin test --locked --target x86_64-pc-windows-msvc -p victory --bin victory
+```
+
+The executable is at `target/x86_64-pc-windows-msvc/release/victory.exe`
+with Cargo's default target directory. The last two commands run in Wine,
+using `$XDG_STATE_HOME/victory-wine` (or `~/.local/state/victory-wine`) by
+default. Set `WINEPREFIX` or `XWIN_CACHE_DIR` in `.envrc.local` to reuse
+local caches. Run the Windows CI checks and validate D3D12 and gameplay on
+native Windows.
+
 ## Commands
 
 ```

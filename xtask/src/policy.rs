@@ -17,10 +17,12 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
+    ".envrc",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
     ".victory-root",
+    "flake.nix",
     "pre-commit",
     "LICENSE",
     "LICENSE-MIT",

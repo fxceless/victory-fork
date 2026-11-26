@@ -13,6 +13,9 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+/.direnv/
+/.envrc.local
+/.envrc.override
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/
