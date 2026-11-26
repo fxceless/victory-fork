@@ -333,6 +333,19 @@ impl Module {
         }
     }
 
+    /// Number of calls to function `name` across all blocks (for tests).
+    #[cfg(test)]
+    pub(crate) fn call_count(&self, name: &str) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .filter(|&&i| match self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[f as usize].name == name,
+                _ => false,
+            })
+            .count()
+    }
+
     /// A function declaration (or `main` with `body`), found by name.
     pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
         if let Some(&i) = self.func_ids.get(name) {

@@ -1622,3 +1622,178 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+#[test]
+fn v_permlane16_alone_sets_console_lanes_and_wave_size() {
+    // Only v_permlane16_b32 / v_permlanex16_b32 (no v_readlane_b32, DPP, or
+    // other cross-lane ops): must set console_lanes, emit WaveSize(32), and
+    // pass DXIL validation without tripping cross_lane's debug_assert!.
+    for op in [0x377u16, 0x378] {
+        let body = vop3(op, 0, vgpr(0), sgpr(0), sgpr(1));
+        let shader = build_cs(&body, 32, 0);
+        let parsed = crate::Container::parse(&shader.dxil).expect("container parse");
+        let psv0 = parsed.part(crate::FourCC::PSV0).expect("PSV0 part");
+        // PSV0 begins with 4-byte runtime_info_size, then PSVRuntimeInfo:
+        // min_wave at +16, max_wave at +20.
+        let min_wave = u32::from_le_bytes(psv0.data[20..24].try_into().unwrap());
+        let max_wave = u32::from_le_bytes(psv0.data[24..28].try_into().unwrap());
+        assert_eq!(
+            (min_wave, max_wave),
+            (32, 32),
+            "op {op:#x} must declare WaveSize(32) in PSV0"
+        );
+    }
+}
+
+#[test]
+fn active_f64_sum_small_group_on_wave32_skips_exchange() {
+    struct HostWaveGuard(Option<u32>);
+    impl Drop for HostWaveGuard {
+        fn drop(&mut self) {
+            lower::TEST_HOST_WAVE.set(self.0);
+        }
+    }
+    let _guard = HostWaveGuard(lower::TEST_HOST_WAVE.replace(Some(32)));
+
+    let s_or_saveexec_b64 =
+        |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x25 << 8 | src0 as u32;
+    let s_mov_b64 =
+        |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x04 << 8 | src0 as u32;
+    let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
+    let v_mov_row_mirror = |vdst: u8, vsrc: u8| {
+        [
+            vop1(0x001, vdst, 0xFA),
+            vsrc as u32 | (0x140 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+        ]
+    };
+
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop1(0x001, 6, sgpr(0)));
+    words.push(vop1(0x001, 7, sgpr(1)));
+    // Whole-wave f64 sum over Wave64 in a 32-thread group.
+    words.push(s_or_saveexec_b64(12, 0xC1));
+    words.extend_from_slice(&vop3(0x101, 2, 0x80, vgpr(6), sgpr(12)));
+    words.extend_from_slice(&vop3(0x101, 3, 0x80, vgpr(7), sgpr(12)));
+    for sel in [14570689u32, 9658386, 2340] {
+        words.extend_from_slice(&v_mov_dpp8(4, 2, sel));
+        words.extend_from_slice(&v_mov_dpp8(5, 3, sel));
+        words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    }
+    words.extend_from_slice(&v_mov_row_mirror(4, 2));
+    words.extend_from_slice(&v_mov_row_mirror(5, 3));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&vop3(0x378, 4, vgpr(2), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x378, 5, vgpr(3), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    // Combine lower 32 lanes (read from lane 0) with upper 32 lanes (in lanes 32..63).
+    words.extend_from_slice(&vop3(0x360, 14, vgpr(2), 0x80, 0)); // v_readlane_b32 s14, v2, 0
+    words.extend_from_slice(&vop3(0x360, 15, vgpr(3), 0x80, 0)); // v_readlane_b32 s15, v3, 0
+    words.extend_from_slice(&vop3(0x164, 2, sgpr(14), vgpr(2), 0)); // v_add_f64 v[2:3], s[14:15], v[2:3]
+    words.extend_from_slice(&vop3(0x360, 16, vgpr(2), 160, 0)); // v_readlane_b32 s16, v2, 32
+    words.extend_from_slice(&vop3(0x360, 17, vgpr(3), 160, 0)); // v_readlane_b32 s17, v3, 32
+    words.push(s_mov_b64(126, 12)); // restore exec
+    words.push(vop1(0x00f, 0, sgpr(16))); // v_cvt_f32_f64 v0, s[16:17]
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    assert_eq!(lowered.wave_size, Some(32));
+    // Only the single entry barrier from `wave_base()`; emitting `exchange_halves`
+    // for `ActiveF64` (lo + hi) would add 8 more barriers.
+    assert_eq!(
+        lowered.barriers, 1,
+        "a 32-thread wave64 group on a wave32 host has no second half to exchange with"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered.dxil).expect("DXIL validation failed");
+    }
+
+    // Same under local-wave mode with a 64-thread group: `self.local` must also
+    // skip the cross-half exchange.
+    let mut native64 = native;
+    native64.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1,
+        threads: [64, 1, 1],
+    });
+    let mut local = lower::with_local_waves(|| {
+        lower::lower(&lower::Parts {
+            native: &native64,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    })
+    .expect("local lower");
+    assert_eq!(local.wave_size, Some(32));
+    assert_eq!(
+        local.barriers, 1,
+        "local-wave mode must skip cross-half exchange in active_f64_sum"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut local.dxil).expect("DXIL validation failed");
+    }
+}

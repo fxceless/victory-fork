@@ -120,6 +120,12 @@ pub(crate) struct Geometry {
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// A test's view-heap null slot, for its thread only ([`set_view_heap_limit`] is the process's).
+    pub(super) static TEST_VIEW_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
@@ -127,6 +133,10 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_VIEW_LIMIT.get() {
+        return limit;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -402,16 +412,47 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.make_heap_handle(block, index, sampler, nonuniform, props, true)
+    }
+
+    /// Like [`Self::heap_handle`], for a view index the host already keeps in
+    /// bounds (the memory-copy directory `SLOT_MEMORY`), skipping the
+    /// `VIEW_LIMIT` clamp.
+    pub fn heap_handle_unclamped(
+        &mut self,
+        block: usize,
+        index: V,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
+        self.make_heap_handle(block, index, false, nonuniform, props, false)
+    }
+
+    fn make_heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        clamp: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
+        // An unsigned constant already within `[0, bound]` needs no runtime UMin.
+        let in_bounds_const = |bound: u32| {
+            self.m
+                .int_value(index)
+                .is_some_and(|k| (k as u32) <= bound)
+        };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
-        let index = if !sampler && limit != 0 {
+        let index = if !sampler && clamp && limit != 0 && !in_bounds_const(limit) {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
-        } else if sampler {
+        } else if sampler && !in_bounds_const(2047) {
             // A sampler heap has at most 2,048 samplers on any host: an
             // index past that (a number read from memory the host has not
             // got yet) stays inside the largest heap there is.
@@ -457,6 +498,7 @@ impl Shader {
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
@@ -886,5 +928,102 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::bitcode::Term;
+    use crate::emit::validator::Validator;
+    use crate::{Container, FourCC};
+
+    struct ViewLimitGuard(Option<u32>);
+    impl Drop for ViewLimitGuard {
+        fn drop(&mut self) {
+            TEST_VIEW_LIMIT.set(self.0);
+        }
+    }
+
+    fn with_view_limit(limit: u32) -> ViewLimitGuard {
+        let prev = TEST_VIEW_LIMIT.replace(Some(limit));
+        ViewLimitGuard(prev)
+    }
+
+    #[test]
+    fn dead_double_ops_clear_doubles_usage_and_flag() {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        let c = s.entry;
+        let f64t = s.m.double();
+        let i32t = s.t.i32;
+        let split_ty = s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let lo = s.m.i32(0);
+        let hi = s.m.i32(0x3FF0_0000);
+        let d = s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let (k0, k0b) = (s.m.i8(0), s.m.i8(0));
+        let sum = s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0b]);
+        let split = s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let _dead_lo = s.m.extract(c, split, 0);
+        s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        s.m.terminate(c, Term::Ret);
+
+        assert!(s.m.usage().doubles, "usage must see double ops before DEAD");
+        let mut dxil = s.finish();
+
+        let parsed = Container::parse(&dxil).expect("container parse");
+        let sfi0 = parsed.part(FourCC::SFI0).expect("SFI0 part");
+        let features = u64::from_le_bytes(sfi0.data[..8].try_into().unwrap());
+        assert_eq!(
+            features & 0x1,
+            0,
+            "SFI0 DOUBLES bit must be cleared when dead double ops are removed"
+        );
+        assert_eq!(
+            features & 0x4000,
+            0,
+            "SFI0 WAVE_OPS bit must be cleared when dead wave ops are removed"
+        );
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn heap_handle_skips_clamp_for_in_bounds_const_and_memory() {
+        let _guard = with_view_limit((1 << 21) - 1);
+        let mut s = Shader::new(false);
+        let c = s.entry;
+        let i32t = s.t.i32;
+
+        // In-bounds constant (5 and exact bound 2_097_151) skip UMin.
+        let k5 = s.m.i32(5);
+        s.heap_handle(c, k5, false, false, (11, 0));
+        let kmax = s.m.i32((1 << 21) - 1);
+        s.heap_handle(c, kmax, false, false, (11, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 0);
+
+        // Unclamped host memory handle skips UMin even for a dynamic index.
+        let tid = s.op(c, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        s.heap_handle_unclamped(c, tid, true, (11 | 0x1000, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 0);
+
+        // In-bounds sampler constant skips UMin.
+        let ks = s.m.i32(3);
+        s.heap_handle(c, ks, true, false, (14, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 0);
+
+        // Out-of-bounds constant view index still clamps.
+        let koob = s.m.i32(3_000_000);
+        s.heap_handle(c, koob, false, false, (11, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 1);
+
+        // Dynamic title view index still clamps.
+        s.heap_handle(c, tid, false, true, (11, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 2);
+
+        // Dynamic sampler index still clamps.
+        s.heap_handle(c, tid, true, false, (14, 0));
+        assert_eq!(s.m.call_count("dx.op.binary.i32"), 3);
     }
 }

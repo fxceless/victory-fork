@@ -62,6 +62,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Barrier calls emitted before optimisation.
+    #[cfg(test)]
+    pub barriers: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1282,6 +1285,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -2037,7 +2041,7 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        if !self.local && self.exchange.as_ref().is_some_and(|e| !e.1) {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -2293,6 +2297,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barriers: self.s.m.call_count("dx.op.barrier"),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -2858,7 +2864,7 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let h = self.s.heap_handle_unclamped(c, slot, true, (11 | 0x1000, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
