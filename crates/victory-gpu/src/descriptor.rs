@@ -353,6 +353,13 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// The title resource identity and original description (including the
+    /// distinction between an explicit view and a format inferred at use).
+    #[cfg(windows)]
+    pub(crate) fn binding_key(&self) -> (usize, u32, [u32; 6]) {
+        (self.resource as usize, self.described, self.desc)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

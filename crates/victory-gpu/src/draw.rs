@@ -24,6 +24,46 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+type TargetView<'a> = (Option<&'a ID3D12Resource>, crate::descriptor::RtvRecord);
+
+struct BoundTarget {
+    // Keep the host object's address from being reused while it is cached.
+    texture: Option<ID3D12Resource>,
+    key: (usize, u32, [u32; 6]),
+}
+
+impl BoundTarget {
+    fn new(view: &TargetView<'_>) -> Self {
+        Self { texture: view.0.cloned(), key: view.1.binding_key() }
+    }
+
+    fn matches(&self, view: &TargetView<'_>) -> bool {
+        self.texture.as_ref().map(Interface::as_raw) == view.0.map(Interface::as_raw)
+            && self.key == view.1.binding_key()
+    }
+}
+
+struct BoundTargets {
+    color: Vec<BoundTarget>,
+    depth: Option<BoundTarget>,
+}
+
+impl BoundTargets {
+    fn new(color: &[Option<TargetView<'_>>], depth: Option<&TargetView<'_>>) -> Self {
+        Self { color: color.iter().flatten().map(BoundTarget::new).collect(), depth: depth.map(BoundTarget::new) }
+    }
+
+    fn matches(&self, color: &[Option<TargetView<'_>>], depth: Option<&TargetView<'_>>) -> bool {
+        self.color.len() == color.len()
+            && self.color.iter().zip(color).all(|(a, b)| b.as_ref().is_some_and(|b| a.matches(b)))
+            && match (&self.depth, depth) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.matches(b),
+                _ => false,
+            }
+    }
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -361,6 +401,7 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    host_targets: Option<BoundTargets>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -750,15 +791,29 @@ impl State {
     }
 
     /// Render targets and depth, set on the host list at once.
+    /// VICTORY_REUSE_TARGET_BINDS=1 suppresses redundant bindings.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reuse = *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_REUSE_TARGET_BINDS").is_some_and(|v| v == "1")
+        });
+        self.bind_targets(list, handles, depth, reuse);
+    }
+
+    fn bind_targets(&mut self, list: &HostList, handles: &[u64], depth: u64, reuse: bool) -> bool {
         let Some(host) = crate::host::host() else {
-            return;
+            return false;
         };
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        // D3D12 supports up to eight simultaneous color targets. Keep the
+        // old path for an out-of-spec count rather than truncating it.
+        let reuse = reuse && handles.len() <= 8;
+        let mut views = [None; 8];
+        let mut view_count = 0;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -779,14 +834,24 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    if reuse {
+                        views[view_count] = Some((None, record));
+                        view_count += 1;
+                    } else {
+                        rtvs.push(host.rtv(None, Some(&desc)));
+                    }
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            if reuse {
+                views[view_count] = Some((Some(texture), record));
+                view_count += 1;
+            } else {
+                rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            }
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -799,8 +864,18 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((Some(texture), record))
         });
+        if reuse && self.host_targets.as_ref().is_some_and(|previous| {
+            previous.matches(&views[..view_count], dsv.as_ref())
+        }) {
+            return false;
+        }
+        self.host_targets = reuse.then(|| BoundTargets::new(&views[..view_count], dsv.as_ref()));
+        if reuse {
+            rtvs.extend(views[..view_count].iter().flatten().map(|(texture, record)| host.rtv(*texture, record.desc().as_ref())));
+        }
+        let dsv = dsv.and_then(|(texture, record)| Some(host.dsv(texture?, record.depth_desc().as_ref())));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -810,6 +885,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        true
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -870,6 +946,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -3768,5 +3845,80 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+}
+
+#[cfg(test)]
+mod target_bind_tests {
+    use super::*;
+
+    fn record_at(slot: &mut [u64; 16], format: DXGI_FORMAT) -> u64 {
+        let handle = slot.as_mut_ptr() as u64;
+        let desc = [format.0 as u32, D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32, 0, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), std::ptr::null(), &desc, handle);
+        handle
+    }
+
+    #[test]
+    fn target_binds_preserve_rewritten_handles_and_replay() {
+        let Some(host) = crate::host::host() else { return; };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
+        let mut first = [0u64; 16];
+        let mut second = [0u64; 16];
+        let a = record_at(&mut first, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let b = record_at(&mut second, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        assert!(state.bind_targets(&list, &[a], 0, true));
+        assert!(!state.bind_targets(&list, &[b], 0, true));
+        record_at(&mut second, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert!(state.bind_targets(&list, &[b], 0, true));
+        assert!(!state.bind_targets(&list, &[b], 0, true));
+        assert!(state.bind_targets(&list, &[], 0, true));
+        assert!(!state.bind_targets(&list, &[], 0, true));
+        assert!(state.bind_targets(&list, &[a, b], 0, true));
+        assert!(state.bind_targets(&list, &[b, a], 0, true));
+        list.close();
+        host.execute(&[&list]);
+        let continuation = host.new_list().unwrap();
+        state.replay(&continuation);
+        assert_eq!(state.target_handles, [b, a]);
+        // A replay on a fresh host list has the same title bindings when recorded again.
+        state.bind_targets(&continuation, &[b, a], 0, true);
+        continuation.close();
+        host.execute(&[&continuation]);
+    }
+
+    #[test]
+    #[ignore = "measure native target recording; run alone"]
+    fn target_binds_native_benchmark() {
+        let host = crate::host::host().expect("native D3D12");
+        let mut slot = [0u64; 16];
+        let handle = record_at(&mut slot, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        for count in [1, 1024, 16384] {
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..23 {
+                for mode in [round % 2, (round + 1) % 2] {
+                    state.reset(std::ptr::null());
+                    let mut binds = 0;
+                    let t = std::time::Instant::now();
+                    for _ in 0..count {
+                        binds += usize::from(state.bind_targets(&list, &[handle], 0, mode != 0));
+                    }
+                    list.close();
+                    host.execute(&[&list]);
+                    let ns = t.elapsed().as_nanos();
+                    assert_eq!(binds, if mode == 0 { count } else { 1 });
+                    list.reset();
+                    if round >= 3 { times[mode].push(ns); }
+                }
+            }
+            for (mode, samples) in times.iter_mut().enumerate() {
+                samples.sort_unstable();
+                println!("TARGET_BINDS_AB,{count},{mode},{:.4}", (samples[9] + samples[10]) as f64 / 2e6);
+            }
+        }
     }
 }
