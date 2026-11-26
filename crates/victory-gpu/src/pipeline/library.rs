@@ -508,8 +508,8 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // until they were built again).
     if rejected && let Some(dir) = DIR.get()
         && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
-        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
-    }
+            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
