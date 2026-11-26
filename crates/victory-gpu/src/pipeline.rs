@@ -67,6 +67,12 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// A mesh shader's link with its pixel shaders ([`Shader::mesh_link`]).
+    #[cfg(windows)]
+    mesh_link: OnceLock<Option<victory_shader::emit::Link>>,
+    /// The host code translated for each link ([`Shader::linked_dxil`]).
+    #[cfg(windows)]
+    linked: Mutex<HashMap<victory_shader::emit::Link, Option<Arc<Vec<u8>>>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +125,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_link: OnceLock::new(),
+                #[cfg(windows)]
+                linked: Mutex::new(HashMap::new()),
             })
         })
         .clone()
@@ -178,6 +188,57 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// For a mesh shader whose outputs pass the 32 KiB D3D12 allows (#283):
+    /// the link its pipelines translate it and their pixel shader with,
+    /// which packs its 16-bit outputs two per column. None for any other
+    /// shader; logged once.
+    pub(crate) fn mesh_link(&self) -> Option<&victory_shader::emit::Link> {
+        self.mesh_link
+            .get_or_init(|| {
+                if self.stage != "mesh" {
+                    return None;
+                }
+                let link = victory_shader::emit::mesh_link(&self.container);
+                if let Some(link) = &link {
+                    tracing::info!(
+                        hash = %self.hash,
+                        packed = link.packed.len(),
+                        "mesh shader outputs pass 32 KiB: its 16-bit outputs are packed with its pixel shaders' inputs"
+                    );
+                }
+                link
+            })
+            .as_ref()
+    }
+
+    /// The host code translated with `link`, made on first use. None if it
+    /// does not translate, or binds other than the plain translation (the
+    /// pipeline's root signature is made from that one).
+    pub(crate) fn linked_dxil(&self, link: &victory_shader::emit::Link) -> Option<Arc<Vec<u8>>> {
+        let mut linked = self.linked.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dxil) = linked.get(link) {
+            return dxil.clone();
+        }
+        let plain = &self.translated()?.host;
+        let unbound = |h: &victory_shader::emit::HostShader| victory_shader::emit::HostShader {
+            dxil: Vec::new(),
+            ..h.clone()
+        };
+        let made = match crate::shader_cache::host_shader_linked(&self.container, link) {
+            Ok(host) if unbound(&host) == unbound(plain) => Some(Arc::new(host.dxil)),
+            Ok(_) => {
+                tracing::warn!(stage = self.stage, hash = %self.hash, "linked translation binds other than the shader's own; not used");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(stage = self.stage, hash = %self.hash, error = %e, "shader does not translate linked; its own translation is used");
+                None
+            }
+        };
+        linked.insert(link.clone(), made.clone());
+        made
     }
 }
 

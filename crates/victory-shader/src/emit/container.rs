@@ -22,9 +22,52 @@ pub(crate) struct SigElement {
     pub usage: u8,
     /// 16-bit on the console (declared 32-bit here).
     pub half: bool,
+    /// A 16-bit element the host declares packed ([`SigElement::host`]):
+    /// a mesh shader and the pixel shader it feeds, translated together
+    /// (`emit::Link`), carry two of its channels per 32-bit column. While
+    /// lowering, `cols`, `usage` and the channels stores and reads name
+    /// stay the console's 16-bit ones.
+    pub packed: bool,
 }
 
 impl SigElement {
+    /// The columns the host declares: two 16-bit channels per column when
+    /// `packed`.
+    pub(crate) fn host_cols(&self) -> u8 {
+        if self.packed {
+            self.cols.div_ceil(2)
+        } else {
+            self.cols
+        }
+    }
+
+    /// The host column (relative to `col`, as `ch` is) that holds channel
+    /// `ch` of a packed element, and whether the channel is its high half.
+    pub(crate) fn packed_column(ch: u8) -> (u8, bool) {
+        (ch / 2, ch % 2 == 1)
+    }
+
+    /// The element as the host declares it: a packed one is an unsigned
+    /// integer, constant (each pixel weighs its three vertices' halves
+    /// itself), of half the columns.
+    pub(crate) fn host(&self) -> SigElement {
+        if !self.packed {
+            return self.clone();
+        }
+        let usage = (0..self.cols)
+            .filter(|c| self.usage >> c & 1 != 0)
+            .fold(0, |u, c| u | 1 << Self::packed_column(c).0);
+        SigElement {
+            comp: 5,
+            interp: 1,
+            cols: self.host_cols(),
+            usage,
+            half: false,
+            packed: false,
+            ..self.clone()
+        }
+    }
+
     fn system_value(&self) -> u32 {
         match self.kind {
             1 => 6,  // vertex id
@@ -121,13 +164,15 @@ pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
 /// A mesh shader's output size as the DXIL validator measures it against
 /// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
 /// and primitive element, times the maxima rounded up to multiples of 32.
+/// A 16-bit value costs the same 4 bytes (#283): only packing two per
+/// column ([`SigElement::packed`]) halves what they take.
 pub(crate) fn mesh_output_bytes(
     vertex: &[SigElement],
     primitive: &[SigElement],
     max_vertices: u32,
     max_primitives: u32,
 ) -> u64 {
-    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.host_cols())).sum::<u64>();
     let align = |n: u32| u64::from(n).next_multiple_of(32);
     4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
 }

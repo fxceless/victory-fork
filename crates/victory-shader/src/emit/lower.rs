@@ -295,6 +295,10 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// Packed outputs' host columns (element, column) an export stored:
+    /// a column holds two channels, so a second export that writes one of
+    /// them would overwrite the other.
+    packed_stored: HashSet<(usize, u8)>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -1626,6 +1630,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            packed_stored: HashSet::new(),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -2524,6 +2529,7 @@ impl<'a> Lower<'a> {
                     cols: 1,
                     usage: 0,
                     half: false,
+                    packed: false,
                 });
                 self.s.inputs.len() - 1
             }
@@ -2733,6 +2739,7 @@ impl<'a> Lower<'a> {
                     cols: 3,
                     usage: 0,
                     half: false,
+                    packed: false,
                 });
                 self.s.inputs.len() - 1
             }
@@ -4379,9 +4386,12 @@ impl<'a> Lower<'a> {
         if !fits(mesh) {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
+            // Outputs past the cap even at the lane count: the host
+            // translates the mesh shader and its pixel shader together, its
+            // 16-bit outputs packed (`emit::Link`, counted packed here),
+            // where that fits and the host reads barycentrics (#283).
+            // shortcut: otherwise they are still emitted with the lower
+            // maxima (drivers take them); refuse them here if one hangs.
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
             if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
@@ -9398,6 +9408,12 @@ impl<'a> Lower<'a> {
         // What the result adds to the evaluated channel (a second half's
         // first half, when the halves evaluate on their own).
         let mut add = None;
+        // The barycentrics an interpolation names: a packed input weighs its
+        // vertices with them (`eval_packed`).
+        let bary = match *interp {
+            Interp::Interpolated { barycentric, .. } => Some(barycentric),
+            _ => None,
+        };
         let (attribute, eval) = match *interp {
             Interp::Interpolated {
                 attribute,
@@ -9492,7 +9508,7 @@ impl<'a> Lower<'a> {
         let f16 = name.ends_with("_f16");
         // The evaluated channel plus `add`, as a float.
         let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let x = l.eval_channel(row, ch, eval)?;
+            let x = l.eval_channel(row, ch, eval, bary)?;
             let x = l.as_float(x);
             Ok(match add {
                 Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
@@ -9583,10 +9599,19 @@ impl<'a> Lower<'a> {
     }
 
     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
-    fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
+    fn eval_channel(
+        &mut self,
+        row: u8,
+        ch: u8,
+        eval: Eval,
+        bary: Option<Barycentric>,
+    ) -> Result<V, Why> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        if self.s.inputs[id].packed {
+            return self.eval_packed(id, col, eval, bary);
+        }
         let mode = match eval {
             Eval::Mode(mode) => mode,
             Eval::Weights { .. } => 1,
@@ -9650,6 +9675,91 @@ impl<'a> Lower<'a> {
         } else {
             v
         }
+    }
+
+    /// Channel `col` of packed input `id` ([`SigElement::packed`]) as
+    /// `eval` says, as raw f32 bits. Its host column is a constant dword
+    /// holding two of its f16 channels per vertex, so the pixel takes each
+    /// vertex's half and weighs them itself: with `bary`, the barycentrics
+    /// the interpolation names, or with the weights `eval` gives. A flat
+    /// read is the provoking vertex's half.
+    fn eval_packed(
+        &mut self,
+        id: usize,
+        col: u8,
+        eval: Eval,
+        bary: Option<Barycentric>,
+    ) -> Result<V, Why> {
+        let (column, high) = SigElement::packed_column(col);
+        // The usage stays in the console's channels until `SigElement::host`.
+        self.s.inputs[id].usage |= 1 << col;
+        let entry = self.s.entry;
+        // Vertex `k`'s half (None: the provoking vertex of the flat
+        // element), as a float.
+        let half = |l: &mut Self, k: Option<u8>| -> V {
+            let (i32t, f32t) = (l.s.t.i32, l.s.t.f32);
+            let mut args = vec![l.s.m.i32(id as u32), l.s.m.i32(0), l.s.m.i8(column)];
+            let dword = match k {
+                None => {
+                    args.push(l.s.m.undef(i32t));
+                    l.s.op(entry, "loadInput.i32", Attr::ReadNone, i32t, 4, &args)
+                }
+                Some(k) => {
+                    l.s.flags |= flags::BARYCENTRICS;
+                    args.push(l.s.m.i8(k));
+                    l.s.op(
+                        entry,
+                        "attributeAtVertex.i32",
+                        Attr::ReadNone,
+                        i32t,
+                        137,
+                        &args,
+                    )
+                }
+            };
+            let bits = if high {
+                let k16 = l.s.m.i32(16);
+                l.s.m.bin(entry, Bin::LShr, dword, k16)
+            } else {
+                dword
+            };
+            l.s.op(entry, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[bits])
+        };
+        let (p0, i, j) = match eval {
+            Eval::Mode(1) => {
+                let f = half(self, None);
+                return Ok(self.as_int(f));
+            }
+            Eval::Mode(_) => {
+                let b = bary.ok_or("a packed input interpolated without barycentrics")?;
+                let mut ij = [None; 2];
+                for (index, w) in ij.iter_mut().enumerate() {
+                    let x = match self.barycentric(b, index as u8) {
+                        Val::I32(x) => x,
+                        Val::Missing(w) => return Err(w),
+                        Val::Bit(_) => unreachable!(),
+                    };
+                    *w = Some(self.as_float(x));
+                }
+                (true, ij[0], ij[1])
+            }
+            Eval::Weights { p0, i, j } => (p0, i, j),
+        };
+        // P0 + i (P1 - P0) + j (P2 - P0), as `eval_channel` weighs them.
+        let v0 = half(self, Some(0));
+        let c = self.cur;
+        let mut acc = p0.then_some(v0);
+        for (k, w) in [(1, i), (2, j)] {
+            let Some(w) = w else { continue };
+            let vk = half(self, Some(k));
+            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            acc = Some(match acc {
+                Some(a) => self.fmad(w, d, a),
+                None => self.s.m.bin(c, Bin::Mul, w, d),
+            });
+        }
+        let acc = acc.ok_or("an interpolation")?;
+        Ok(self.as_int(acc))
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
@@ -11224,8 +11334,33 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Packed 16-bit outputs (`SigElement::packed`): the channels of each
+        // host column, gathered into its dword.
+        let mut packed: Vec<((usize, u8), V)> = Vec::new();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            if !primitive && elements(self, primitive)[id].packed {
+                let high = half.ok_or("a 16-bit output the stage data does not mark")?;
+                let c = self.cur;
+                x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    let low = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, x, low)
+                };
+                let (column, upper) = SigElement::packed_column(col);
+                if upper {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::Shl, x, k16);
+                }
+                elements(self, primitive)[id].usage |= 1 << col;
+                match packed.iter_mut().find(|(at, _)| *at == (id, column)) {
+                    Some((_, dword)) => *dword = self.s.m.bin(c, Bin::Or, *dword, x),
+                    None => packed.push(((id, column), x)),
+                }
+                continue;
+            }
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -11265,6 +11400,29 @@ impl<'a> Lower<'a> {
             self.s.op(
                 self.cur,
                 &format!("{name}{suffix}"),
+                Attr::NoUnwind,
+                void,
+                opcode,
+                &args,
+            );
+        }
+        for ((id, column), dword) in packed {
+            if !self.packed_stored.insert((id, column)) {
+                return Err("a packed 16-bit output column two exports write");
+            }
+            let mut args = vec![
+                self.s.m.i32(id as u32),
+                self.s.m.i32(0),
+                self.s.m.i8(column),
+                dword,
+            ];
+            if mesh {
+                args.push(self.mesh_thread());
+            }
+            let void = self.s.t.void;
+            self.s.op(
+                self.cur,
+                &format!("{name}.i32"),
                 Attr::NoUnwind,
                 void,
                 opcode,
@@ -11722,6 +11880,7 @@ mod tests {
             cols: 4,
             usage: 0,
             half: true,
+            packed: false,
         };
         // Rows 0 and 3 pack and leave their second row out; 5 names its
         // own (6). Unnamed 16-bit rows: 1, 4, 6, 7.
@@ -11756,6 +11915,7 @@ mod tests {
             cols,
             usage: 0,
             half: true,
+            packed: false,
         };
         // MS_VS_PedTransformPreSkinD_Packed 005fe88ec1bdc0c7 and its pixel
         // shader 93667197d3d05e1c: TEXCOORD6 is one value at register 4

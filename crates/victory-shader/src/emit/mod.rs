@@ -327,6 +327,117 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// What a mesh shader and the pixel shader it feeds, translated together,
+/// agree on beyond the console's signatures (#283): the 16-bit per-vertex
+/// outputs, by semantic name and index, that both declare packed, two
+/// channels per 32-bit column (`container::SigElement::packed`). The
+/// console gives each 16-bit value a 32-bit scalar of its own, and a mesh
+/// shader of 128 vertices with more than 64 of them passes the 32 KiB
+/// D3D12 allows its outputs. Empty (the default): each stage as the
+/// console declares it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Link {
+    pub packed: Vec<(String, u32)>,
+}
+
+impl Link {
+    /// Whether the link packs element `e`.
+    fn packs(&self, e: &container::SigElement) -> bool {
+        e.half
+            && e.kind == 0
+            && self
+                .packed
+                .iter()
+                .any(|(name, index)| *index == e.index && name.eq_ignore_ascii_case(&e.name))
+    }
+
+    /// The link as bytes, for a cache key.
+    pub fn key(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, index) in &self.packed {
+            out.extend(name.as_bytes());
+            out.push(0);
+            out.extend(index.to_le_bytes());
+        }
+        out
+    }
+}
+
+thread_local! {
+    /// The link the translation on this thread is made for
+    /// ([`translate_linked`]).
+    static LINK: std::cell::RefCell<Link> = std::cell::RefCell::default();
+}
+
+/// [`translate`], for a pipeline whose stages are translated together
+/// with `link` (from [`mesh_link`]): the mesh shader and the pixel shader
+/// both with it.
+pub fn translate_linked(container: &[u8], link: &Link) -> Result<HostShader, ShaderError> {
+    with_link(link, || translate(container))
+}
+
+/// `f`, translating for `link` ([`LINK`]).
+fn with_link<R>(link: &Link, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Link>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(old) = self.0.take() {
+                LINK.set(old);
+            }
+        }
+    }
+    let _restore = Restore(Some(LINK.replace(link.clone())));
+    f()
+}
+
+/// For a mesh shader whose outputs pass the 32 KiB D3D12 allows even with
+/// its maxima down at its lane count (`lower::mesh_prologue`), and fit with
+/// its 16-bit per-vertex outputs packed: the link that packs them, which
+/// it and its pixel shader are translated with ([`translate_linked`]).
+/// None for any other shader, or a container that does not parse.
+pub fn mesh_link(container: &[u8]) -> Option<Link> {
+    let c = Container::parse(container).ok()?;
+    let native = crate::native_programs(c.part(FourCC::DXIL)?.data)
+        .ok()?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)?;
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return None;
+    };
+    let outputs = signature(c.part(FourCC::OSG1)?.data).ok()?;
+    let mut prims = match c.part(FourCC::PSG1) {
+        Some(part) => signature(part.data).ok()?,
+        None => Vec::new(),
+    };
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    link_for(outputs, &prims, ms)
+}
+
+/// [`mesh_link`] for a mesh program's per-vertex and per-primitive
+/// signature elements.
+fn link_for(
+    mut outputs: Vec<container::SigElement>,
+    prims: &[container::SigElement],
+    ms: &crate::native::MeshIo,
+) -> Option<Link> {
+    use container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
+    let vertices = ms.max_vertices.min(ms.threads);
+    let primitives = ms.max_primitives.min(ms.threads);
+    if mesh_output_bytes(&outputs, prims, vertices, primitives) <= MESH_OUTPUT_LIMIT {
+        return None;
+    }
+    let mut link = Link::default();
+    for e in outputs.iter_mut().filter(|e| e.half && e.kind == 0) {
+        e.packed = true;
+        let key = (e.name.clone(), e.index);
+        if !link.packed.contains(&key) {
+            link.packed.push(key);
+        }
+    }
+    let fits = mesh_output_bytes(&outputs, prims, vertices, primitives) <= MESH_OUTPUT_LIMIT;
+    (fits && !link.packed.is_empty()).then_some(link)
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -751,6 +862,23 @@ fn emit_program(
     for e in &mut prims {
         e.interp = 1;
     }
+    // The 16-bit per-vertex elements a linked pair packs: a mesh shader's
+    // outputs, its pixel shader's inputs ([`Link`]).
+    LINK.with_borrow(|link| {
+        let linked = match native.stage {
+            HwStage::Ms => &mut outputs,
+            HwStage::Ps => &mut inputs,
+            _ => return,
+        };
+        for e in linked {
+            e.packed = link.packs(e);
+            if e.packed && native.stage == HwStage::Ps {
+                // Read as the dwords they are, per vertex (`Lower::eval_packed`).
+                e.comp = 5;
+                e.interp = 1;
+            }
+        }
+    });
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -893,6 +1021,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             cols: mask.count_ones().max(1) as u8,
             usage: 0,
             half: (4..=6).contains(&raw),
+            packed: false,
         });
     }
     Ok(out)
@@ -971,6 +1100,7 @@ mod tests {
             cols: 1,
             usage: 1,
             half: false,
+            packed: false,
         };
         let osg1 =
             container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
@@ -1147,6 +1277,7 @@ mod tests {
             cols: 4,
             usage: 15,
             half: false,
+            packed: false,
         });
         let b = s.entry;
         for (c, v) in [1.0f32, 0.5, 0.25, 1.0].into_iter().enumerate() {
@@ -1281,6 +1412,7 @@ mod tests {
                 cols: 4,
                 usage,
                 half: false,
+                packed: false,
             };
             let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
             let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
@@ -1353,6 +1485,7 @@ mod tests {
             cols: 1,
             usage: 0,
             half: false,
+            packed: false,
         };
         let isg1 = super::container::signature(&[w_only], true);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
@@ -1802,6 +1935,7 @@ mod barycentric_tests {
             cols: 4,
             usage: 0,
             half: false,
+            packed: false,
         }
     }
 
@@ -2039,5 +2173,360 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+/// Mesh shaders whose 16-bit outputs pass the 32 KiB D3D12 allows (#283),
+/// and the pixel shaders they feed, translated together ([`Link`]).
+#[cfg(test)]
+mod link_tests {
+    use super::container::{MESH_OUTPUT_LIMIT, SigElement, mesh_output_bytes};
+    use super::*;
+    use crate::native::{MeshIo, PsInput, StageIo, Usage, VsOutput};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    /// `SPI_PS_INPUT_ADDR` PERSP_CENTER.
+    const PERSP_CENTER: u32 = 1 << 1;
+    /// 16-bit rows of the mesh program: with its position, 68 scalars of
+    /// the 64 that fit 128 vertices.
+    const HALF_ROWS: u32 = 16;
+
+    fn element(name: &str, index: u32, kind: u8, row: u32, half: bool) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half,
+            packed: false,
+        }
+    }
+
+    /// A signature part as the console writes it: its 16-bit float rows
+    /// (`half`) of component type 6.
+    fn console_signature(elements: &[SigElement], input: bool) -> Vec<u8> {
+        let mut part = container::signature(elements, input);
+        for k in 0..elements.len() {
+            let at = 8 + 32 * k;
+            let register = u32::from_le_bytes(part[at + 20..at + 24].try_into().unwrap());
+            if elements.iter().any(|e| e.half && e.row == Some(register)) {
+                part[at + 16] = 6;
+            }
+        }
+        part
+    }
+
+    fn mesh_outputs() -> Vec<SigElement> {
+        let mut outputs = vec![element("SV_Position", 0, 3, 0, false)];
+        outputs.extend((0..HALF_ROWS).map(|n| element("TEXCOORD", n, 0, n + 1, true)));
+        outputs
+    }
+
+    fn mesh_io() -> MeshIo {
+        MeshIo {
+            // One entry per parameter: two 16-bit rows of four, two per
+            // dword (the second row the next one no entry names).
+            outputs: (0..HALF_ROWS / 2)
+                .map(|p| VsOutput {
+                    usage: Usage::Generic,
+                    row: (2 * p + 1) as u8,
+                    param: p as u8,
+                    fp16: true,
+                    pack2: true,
+                })
+                .collect(),
+            clip_cntl: 0,
+            threads: 128,
+            max_vertices: 128,
+            max_primitives: 128,
+            topology: 2,
+            lds_bytes: 0,
+        }
+    }
+
+    /// Translates, for `link`, a mesh program of 128 lanes that draws one
+    /// triangle over the whole target: lane n of a wave exports vertex n
+    /// at (-1, -1), (4, -1) or (-1, 4) (v0-v3), eight parameters of packed
+    /// 16-bit values (v10-v13: TEXCOORD0 is (1, 4, 1.5, 3) at vertex 1,
+    /// (1, 2, 1.5, 3) at the others) and, in its first lane, the
+    /// primitive (v9; the other lanes cull theirs).
+    fn mesh(link: &Link) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
+            0xD765_0014,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v20, -1, 0
+            0x7E3E_02F6, // v_mov_b32 v31, 4.0
+            0x7D84_2881, // v_cmp_eq_u32 vcc, 1, v20
+            0x0200_3EF3, // v_cndmask_b32 v0, -1.0, v31
+            0x7E2A_02FF,
+            0x4000_3C00, // v_mov_b32 v21, (y 2.0, x 1.0)
+            0x7E2C_02FF,
+            0x4400_3C00, // v_mov_b32 v22, (y 4.0, x 1.0)
+            0x0214_2D15, // v_cndmask_b32 v10, v21, v22
+            0x7D84_2882, // v_cmp_eq_u32 vcc, 2, v20
+            0x0202_3EF3, // v_cndmask_b32 v1, -1.0, v31
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_02F2, // v_mov_b32 v3, 1.0
+            0x7E16_02FF,
+            0x4200_3E00, // v_mov_b32 v11, (w 3.0, z 1.5)
+            0x7E18_0280, // v_mov_b32 v12, 0
+            0x7E1A_0280, // v_mov_b32 v13, 0
+            0x7D84_2880, // v_cmp_eq_u32 vcc, 0, v20
+            0x7E40_02FF,
+            0x0020_0400, // v_mov_b32 v32, indices 0, 1, 2
+            0x7E42_02FF,
+            0x8000_0000, // v_mov_b32 v33, culled
+            0x0212_4121, // v_cndmask_b32 v9, v33, v32
+            0xF800_00CF,
+            0x0302_0100, // exp pos0, v0, v1, v2, v3
+        ];
+        for p in 0..HALF_ROWS / 2 {
+            // exp param<p>, v10, v11, v12, v13 (v5 is the group input)
+            words.extend([0xF800_020F | p << 4, 0x0D0C_0B0A]);
+        }
+        words.extend([0xF800_0941, 0x0000_0009, S_ENDPGM]); // exp prim, v9 done
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 40,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(mesh_io()),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = console_signature(&mesh_outputs(), false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        with_link(link, || emit(&c, &native, &p, &st, &io, &res))
+    }
+
+    /// Translates, for `link`, a pixel program that interpolates the high
+    /// half of the first dword of a packed 16-bit attribute (TEXCOORD0.y,
+    /// of rows 1 and 2, where the mesh program writes them) and writes it
+    /// to its target.
+    fn pixel(link: &Link) -> Result<HostShader, ShaderError> {
+        let words = [
+            0xD742_0002,
+            0x0002_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
+            0xD75A_0003,
+            0x040A_0300, // v_interp_p2_f16 v3, v1, attr0.x high, v2
+            0x7E08_1703, // v_cvt_f32_f16 v4, v3
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: true,
+                    row2: 2,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 0, 16, 0, false);
+        target.usage = 15;
+        let inputs = [
+            element("TEXCOORD", 0, 0, 1, true),
+            element("TEXCOORD", 1, 0, 2, true),
+        ];
+        let isg1 = console_signature(&inputs, true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        with_link(link, || emit(&c, &native, &p, &st, &io, &res))
+    }
+
+    /// A translation's signature part, as the host declares it.
+    fn part(shader: &HostShader, fourcc: FourCC) -> Vec<SigElement> {
+        let c = Container::parse(&shader.dxil).unwrap();
+        signature(c.part(fourcc).unwrap().data).unwrap()
+    }
+
+    /// The validator's verdict, or None without `dxil.dll`.
+    fn validated(shader: &HostShader) -> Option<Result<(), String>> {
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            return Some(v.validate(&mut shader.dxil.clone()));
+        }
+        let _ = shader;
+        None
+    }
+
+    fn the_link() -> Link {
+        link_for(mesh_outputs(), &[], &mesh_io()).expect("the outputs pass 32 KiB")
+    }
+
+    /// The fixture's mesh program needs 34,816 bytes at 128 vertices; with
+    /// its 16 rows of halves packed two per column, 18,432.
+    #[test]
+    fn a_mesh_program_past_the_limit_gets_its_halves_packed() {
+        let outputs = mesh_outputs();
+        assert_eq!(mesh_output_bytes(&outputs, &[], 128, 128), 34_816);
+        let link = the_link();
+        assert_eq!(link.packed.len(), HALF_ROWS as usize);
+        assert!(link.packed.iter().all(|(name, _)| name == "TEXCOORD"));
+        let mut packed = outputs.clone();
+        for e in packed.iter_mut().filter(|e| e.half) {
+            e.packed = true;
+        }
+        assert_eq!(mesh_output_bytes(&packed, &[], 128, 128), 18_432);
+        // Within the limit already: nothing to pack.
+        let few: Vec<_> = outputs.into_iter().take(1 + 8).collect();
+        assert_eq!(link_for(few, &[], &mesh_io()), None);
+    }
+
+    /// As the console declares it, the mesh program passes the limit and
+    /// the validator refuses it (#283); packed, every vertex is kept and
+    /// it validates.
+    #[test]
+    fn packed_mesh_outputs_fit_the_limit_and_validate() {
+        let plain = mesh(&Link::default()).unwrap();
+        let outputs = part(&plain, FourCC::OSG1);
+        assert!(mesh_output_bytes(&outputs, &[], 128, 128) > MESH_OUTPUT_LIMIT);
+        assert!(
+            outputs
+                .iter()
+                .filter(|e| e.name == "TEXCOORD")
+                .all(|e| e.comp == 9)
+        );
+        if let Some(verdict) = validated(&plain) {
+            let e = verdict.expect_err("past 32 KiB");
+            assert!(e.contains("output size"), "{e}");
+        }
+        let packed = mesh(&the_link()).unwrap();
+        let outputs = part(&packed, FourCC::OSG1);
+        assert!(mesh_output_bytes(&outputs, &[], 128, 128) <= MESH_OUTPUT_LIMIT);
+        for e in outputs.iter().filter(|e| e.name == "TEXCOORD") {
+            // Unsigned, two columns of two halves each.
+            assert_eq!((e.comp, e.col, e.cols), (5, 0, 2), "{e:?}");
+        }
+        if let Some(verdict) = validated(&packed) {
+            verdict.unwrap();
+        }
+    }
+
+    /// The pixel program of a linked pair reads the packed attribute as
+    /// the dwords the mesh program writes: constant, unsigned, its three
+    /// vertices weighed with `SV_Barycentrics`.
+    #[test]
+    fn a_packed_pixel_input_is_weighed_per_vertex() {
+        let plain = pixel(&Link::default()).unwrap();
+        let inputs = part(&plain, FourCC::ISG1);
+        let t0 = inputs
+            .iter()
+            .find(|e| e.name == "TEXCOORD" && e.index == 0)
+            .unwrap();
+        assert_eq!((t0.comp, t0.cols), (9, 4));
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        if let Some(verdict) = validated(&plain) {
+            verdict.unwrap();
+        }
+        let packed = pixel(&the_link()).unwrap();
+        let inputs = part(&packed, FourCC::ISG1);
+        let t0 = inputs
+            .iter()
+            .find(|e| e.name == "TEXCOORD" && e.index == 0)
+            .unwrap();
+        assert_eq!((t0.comp, t0.col, t0.cols), (5, 0, 2), "{inputs:?}");
+        assert_eq!(
+            inputs.iter().filter(|e| e.kind == 28).count(),
+            1,
+            "{inputs:?}"
+        );
+        let c = Container::parse(&packed.dxil).unwrap();
+        let sfi0 = u64::from_le_bytes(c.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_ne!(sfi0 & 0x2_0000, 0, "no Barycentrics feature");
+        if let Some(verdict) = validated(&packed) {
+            verdict.unwrap();
+        }
+    }
+
+    /// Drawn on the host GPU (`VICTORY_WARP=1`: on WARP): the host links
+    /// the pair translated together, and each pixel gets TEXCOORD0.y
+    /// weighed between its vertices' 2 and 4, as the pair translated apart
+    /// draws it where the host takes outputs past 32 KiB.
+    #[cfg(windows)]
+    #[test]
+    fn a_linked_pair_draws_what_the_pair_apart_draws() {
+        use super::host::{Draw, Host};
+        let Ok(host) = Host::new(std::env::var_os("VICTORY_WARP").is_some()) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let draw = |ms: &HostShader, ps: &HostShader| -> Result<Vec<[f32; 4]>, String> {
+            let (root, pso) = host.mesh_pipeline(ms, ps)?;
+            host.draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (16, 16),
+                    mesh_groups: 1,
+                },
+            )
+        };
+        let link = the_link();
+        let together =
+            draw(&mesh(&link).unwrap(), &pixel(&link).unwrap()).expect("the linked pair draws");
+        let ys: Vec<f32> = together.iter().map(|t| t[0]).collect();
+        assert!(ys.iter().all(|&y| (2.0..=4.0).contains(&y)), "{ys:?}");
+        assert!(
+            ys.iter().any(|&y| y > 2.1),
+            "nothing weighed toward vertex 1: {ys:?}"
+        );
+        let plain = Link::default();
+        match draw(&mesh(&plain).unwrap(), &pixel(&plain).unwrap()) {
+            Ok(apart) => {
+                // Within one f16 step: the linked pixel program weighs the
+                // vertices itself (P0 + i P10 + j P20, as the console's
+                // f16 interpolation does), the host's interpolator for the
+                // pair apart; the f32 sums differ in their last bits, and
+                // the f16 the program rounds them to by one step at most
+                // (one texel in five, on an RTX card).
+                for (k, (a, b)) in together.iter().zip(&apart).enumerate() {
+                    let step = b[0].abs() / 1024.0;
+                    assert!(
+                        (a[0] - b[0]).abs() <= step,
+                        "texel {k}: {a:?} together, {b:?} apart"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("the pair translated apart is refused here ({e}): range checked only")
+            }
+        }
     }
 }

@@ -5130,6 +5130,30 @@ impl Host {
         })
     }
 
+    /// Whether the host's pixel shaders read `SV_Barycentrics` and each
+    /// vertex's attribute values (`GetAttributeAtVertex`), which a pixel
+    /// shader linked to a mesh shader whose outputs are packed needs
+    /// (`victory_shader::emit::Link`); logged once.
+    pub(crate) fn barycentrics(&self) -> bool {
+        static BARYCENTRICS: OnceLock<bool> = OnceLock::new();
+        *BARYCENTRICS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let barycentrics = ok && options.BarycentricsSupported.as_bool();
+            tracing::info!(barycentrics, "host barycentrics support");
+            barycentrics
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
