@@ -1401,6 +1401,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         }
     }
     #[cfg(windows)]
+    present_shape(frame, planes, plane_parameters);
+    #[cfg(windows)]
     if !sent_behind
         && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -1425,6 +1427,52 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+/// Logs what the title presents whenever it changes (in every build, a few
+/// lines a run): the number of planes, the first plane's resources, and the
+/// format and size of the one we show (its first resource; `format=-1`:
+/// none, or no host copy of it). For telling a black screen on one machine
+/// from a visible one on another.
+#[cfg(windows)]
+fn present_shape(frame: u64, planes: u32, plane_parameters: *const Plane) {
+    // Nothing is looked up when the line would not be written: finding the
+    // host resource takes the resource table's lock and notes a use of the
+    // texture, on every present (review of pull request #835).
+    if !tracing::enabled!(tracing::Level::INFO) {
+        return;
+    }
+    type Shape = (u32, u32, i32, u64, u32);
+    static LAST: std::sync::Mutex<Option<Shape>> = std::sync::Mutex::new(None);
+    // SAFETY: the title passes `planes` plane descriptions.
+    let first = if planes > 0 { unsafe { plane_parameters.as_ref() } } else { None };
+    let resources = first.map_or(0, |p| p.count);
+    let desc = first
+        .filter(|p| p.count > 0 && !p.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .and_then(|p| crate::resource::host_resource(unsafe { *p.resources }))
+        // SAFETY: a live resource.
+        .map(|t| unsafe { t.GetDesc() });
+    let shape: Shape = (
+        planes,
+        resources,
+        desc.as_ref().map_or(-1, |d| d.Format.0),
+        desc.as_ref().map_or(0, |d| d.Width),
+        desc.as_ref().map_or(0, |d| d.Height),
+    );
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != Some(shape) {
+        *last = Some(shape);
+        let (planes, resources, format, width, height) = shape;
+        tracing::info!(
+            frame,
+            planes,
+            resources,
+            format,
+            width,
+            height,
+            "what the title presents changed (we show the first plane's first resource)"
+        );
+    }
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
