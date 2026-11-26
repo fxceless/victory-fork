@@ -181,7 +181,14 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let console = match std::env::var("VICTORY_CONSOLE").as_deref() {
+                Ok("series-s") => Console::SeriesS,
+                Ok("series-x") => Console::SeriesX,
+                _ => console,
+            };
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
