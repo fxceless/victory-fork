@@ -498,7 +498,47 @@ fn split_late() -> bool {
 
 const PAGE: usize = 64 << 10;
 
+// Charge each successful section for the lifetime of the process. A mapped
+// view can keep its backing alive after the title frees the page numbers.
+static PHYSICAL_PAGEFILE_REMAINING: LazyLock<AtomicUsize> = LazyLock::new(|| {
+    let bytes = std::env::var("VICTORY_PHYSICAL_PAGEFILE_FIRST_MB")
+        .ok()
+        .and_then(|mib| mib.parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(MIB))
+        .unwrap_or(0);
+    AtomicUsize::new(bytes)
+});
+
+fn reserve_pagefile(remaining: &AtomicUsize, size: usize) -> bool {
+    remaining
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+            bytes.checked_sub(size)
+        })
+        .is_ok()
+}
+
 struct Section(HANDLE);
+
+impl Section {
+    fn create(size: usize, storage: HANDLE, protection: u32) -> std::io::Result<Self> {
+        // SAFETY: callers supply a live writable file or the pagefile
+        // sentinel. The new section holds its own reference to the storage.
+        let handle = unsafe {
+            CreateFileMappingW(
+                storage,
+                std::ptr::null(),
+                protection,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -553,6 +593,43 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Create a section whose views share the same physical pages. Under Wine a
+/// file in the optional backing directory lets Linux reclaim the data through
+/// the filesystem. The temporary file is deleted when its last handle closes.
+fn physical_section(size: usize) -> std::io::Result<Section> {
+    use std::os::windows::io::AsRawHandle;
+    let wine = on_wine();
+    if let Some(directory) = wine
+        .then(|| std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR"))
+        .flatten()
+    {
+        let directory = std::path::Path::new(&directory);
+        victory_core::ensure_outside_repo(directory).map_err(std::io::Error::other)?;
+        if reserve_pagefile(&PHYSICAL_PAGEFILE_REMAINING, size) {
+            match Section::create(size, INVALID_HANDLE_VALUE, PAGE_READWRITE | SEC_COMMIT) {
+                Ok(section) => {
+                    tracing::info!(bytes = size, "physical pages use budgeted pagefile backing");
+                    return Ok(section);
+                }
+                Err(error) => {
+                    PHYSICAL_PAGEFILE_REMAINING.fetch_add(size, Ordering::Relaxed);
+                    tracing::warn!(bytes = size, %error, "pagefile backing failed; using a temporary file");
+                }
+            }
+        }
+        let file = tempfile::tempfile_in(directory)?;
+        let section = Section::create(size, file.as_raw_handle(), PAGE_READWRITE)?;
+        tracing::info!(bytes = size, "physical pages use temporary file backing");
+        return Ok(section);
+    }
+    let protection = if wine {
+        PAGE_READWRITE | SEC_COMMIT
+    } else {
+        PAGE_READWRITE | SEC_RESERVE
+    };
+    Section::create(size, INVALID_HANDLE_VALUE, protection)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -567,31 +644,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let section = match physical_section(size) {
+        Ok(section) => section,
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null above.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
-    }
+    let handle = section.0;
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
@@ -600,7 +662,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(section);
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -1292,6 +1354,16 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_pagefile_sections_share_a_fixed_budget() {
+        let remaining = AtomicUsize::new(4 * PAGE);
+        assert!(!reserve_pagefile(&remaining, 5 * PAGE));
+        assert!(reserve_pagefile(&remaining, 3 * PAGE));
+        assert!(!reserve_pagefile(&remaining, 2 * PAGE));
+        assert!(reserve_pagefile(&remaining, PAGE));
+        assert!(!reserve_pagefile(&remaining, PAGE));
+    }
 
     #[test]
     fn commit_notifications_cover_both_blocks_of_an_unaligned_request() {
