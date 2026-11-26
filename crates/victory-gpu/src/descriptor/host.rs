@@ -401,11 +401,12 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
+        let key = crate::resource::placed_desc_key(desc);
+        if let Some(&known) = self.sizes.get(&key) {
             return known;
         }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
+        let bytes = crate::resource::placed_bytes(&key);
+        self.sizes.insert(key, bytes);
         bytes
     }
 
@@ -3814,7 +3815,10 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && crate::resource::placed_desc_key(resource)
+                    == crate::resource::placed_desc_key(other)
+                && desc[10..12] == other_desc[10..12]
         }
         _ => false,
     }
@@ -4375,6 +4379,15 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let low = view(texture, 3, 0x1000_0000);
         // more mips of the same texture
         assert!(same_placed_texture(&low, &view(texture, 0, 0x1000_0000)));
+        // different stack-filler words [1] and [13] still name the same texture
+        let mut with_filler = texture;
+        with_filler[1] = 0xDEAD_BEEF;
+        with_filler[13] = 0xCAFE_BABE;
+        assert!(same_placed_texture(&low, &view(with_filler, 0, 0x1000_0000)));
+        // Spans::bytes deduplicates descriptions differing only in filler words
+        let mut spans = Spans::default();
+        assert_eq!(spans.bytes(&texture), spans.bytes(&with_filler));
+        assert_eq!(spans.sizes.len(), 1);
         // another address, another description, a buffer, an unordered view
         assert!(!same_placed_texture(&low, &view(texture, 3, 0x2000_0000)));
         let mut wider = texture;

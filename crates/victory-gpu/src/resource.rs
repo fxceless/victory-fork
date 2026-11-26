@@ -2716,31 +2716,33 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// frame listing, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut key = *desc;
-    key[1] = 0;
-    key[13] = 0;
+    let key = placed_desc_key(desc);
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
+    let found = map.get(&(address, key))?;
     Some(*found as This)
+}
+
+/// Normalizes a placed resource description for keying: words 1 and 13 are
+/// struct padding (after `dimension`, and at the end) where the title leaves
+/// uninitialized stack values, so two views of the same texture can differ
+/// only there. `VICTORY_PLACED_FILLER=1` keeps them unchanged.
+#[cfg(windows)]
+pub(crate) fn placed_desc_key(desc: &[u32; 14]) -> [u32; 14] {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut key = *desc;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    key
 }
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    // Words 1 and 13 of the description are the filler of its layout
-    // (after the dimension, and at the end): the title leaves there what
-    // its stack held, and two views of one texture that differed only in
-    // them each got a resource and a host copy of their own, on a card
-    // that fills at world entry. They are not part of what a texture is.
-    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let raw = *desc;
-    let mut key = *desc;
-    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
-        key[1] = 0;
-        key[13] = 0;
-    }
+    let key = placed_desc_key(desc);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
