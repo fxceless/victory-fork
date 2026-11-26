@@ -546,9 +546,12 @@ pub extern "system" fn ReadFile(
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    let total = size.saturating_mul(count);
-    if buffer.is_null() || total == 0 {
-        // The CRT's own checks and answer (EINVAL, or nothing to read).
+    let Some(total) = size.checked_mul(count).filter(|&t| t > 0) else {
+        // The CRT's own checks and answer (overflow -> EINVAL, or nothing to read).
+        return read(buffer, size, count, stream);
+    };
+    if buffer.is_null() || stream.is_null() {
+        // The CRT's own checks and answer.
         return read(buffer, size, count, stream);
     }
     const CHUNK: usize = 1 << 20;
@@ -558,7 +561,17 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
+            let err = if n < want {
+                // SAFETY: thread-local Win32 last-error query.
+                Some(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+            } else {
+                None
+            };
             victory_gpu::kernel_will_write(buffer as usize + done, n);
+            if let Some(code) = err {
+                // SAFETY: restore Win32 last error after a short read.
+                unsafe { windows_sys::Win32::Foundation::SetLastError(code) };
+            }
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
@@ -1000,5 +1013,66 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn fread_reads_normal_and_rejects_size_count_overflow() {
+        type InvalidParamHandler = extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+        extern "C" fn ignore_invalid_param(
+            _: *const u16,
+            _: *const u16,
+            _: *const u16,
+            _: u32,
+            _: usize,
+        ) {
+        }
+        let set_handler = host!(
+            "ucrtbase.dll",
+            "_set_thread_local_invalid_parameter_handler":
+                extern "C" fn(Option<InvalidParamHandler>) -> Option<InvalidParamHandler>
+        );
+        let errno_ptr = host!("ucrtbase.dll", "_errno": extern "C" fn() -> *mut i32);
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let ftell = host!("ucrtbase.dll", "ftell": extern "C" fn(File) -> i32);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.bin");
+        let payload: Vec<u8> = (0u8..100).collect();
+        std::fs::write(&path, &payload).unwrap();
+        let cpath = format!("{}\0", path.display());
+        let f = fopen(cpath.as_ptr().cast(), c"rb".as_ptr());
+        assert!(!f.is_null());
+
+        // Overflowing size * count must delegate to UCRT's validation (EINVAL, 0)
+        // instead of saturating to usize::MAX and overflowing `buf`.
+        let mut buf = [0xAAu8; 16];
+        // SAFETY: setting and restoring the thread-local UCRT invalid-parameter handler.
+        unsafe { *errno_ptr() = 0 };
+        let prev = set_handler(Some(ignore_invalid_param));
+        let got = fread(buf.as_mut_ptr(), 16, usize::MAX, f);
+        set_handler(prev);
+        // SAFETY: reading thread-local UCRT errno.
+        let err = unsafe { *errno_ptr() };
+        assert_eq!(got, 0);
+        assert_eq!(err, 22, "expected EINVAL");
+        assert_eq!(buf, [0xAAu8; 16]);
+        assert_eq!(ftell(f), 0);
+
+        // Normal full read works and returns complete items.
+        let mut out = [0u8; 16];
+        let got = fread(out.as_mut_ptr(), 4, 4, f);
+        assert_eq!(got, 4);
+        assert_eq!(out, payload[..16]);
+
+        // Short read near EOF returns complete items and copies the partial tail.
+        let mut tail = [0u8; 100];
+        let got = fread(tail.as_mut_ptr(), 16, 6, f);
+        // 84 bytes remain -> 5 complete 16-byte items + 4 trailing bytes.
+        assert_eq!(got, 5);
+        assert_eq!(&tail[..84], &payload[16..100]);
+
+        // Zero-count read returns 0.
+        assert_eq!(fread(out.as_mut_ptr(), 4, 0, f), 0);
+
+        fclose(f);
     }
 }
