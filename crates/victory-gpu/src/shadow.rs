@@ -35,6 +35,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Per page index (`page - base`) that has only been copied in part:
+    /// sorted, non-overlapping byte spans `(lo, hi, stamp)` within the 64 KiB
+    /// page that are current as of `stamp`.
+    partial: Mutex<std::collections::HashMap<usize, Vec<(u32, u32, u64)>>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2609,6 +2613,194 @@ mod stale_tests {
         assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
     }
+
+    #[test]
+    fn partial_page_refresh_skips_unchanged_and_reuploads_written_spans() {
+        let base = 0x100usize;
+        let start = base * PAGE;
+        let len = 3 * PAGE;
+        let end = start + len;
+        let mut title = vec![0xAAu8; len];
+        let mut shadow = vec![0u8; len];
+        let mut copied = vec![0u64; 3];
+        let mut partial = std::collections::HashMap::new();
+
+        // Unaligned span crossing both a 4 KiB subpage boundary and the
+        // 64 KiB boundary between page 0x100 and page 0x101.
+        let from = start + 0xF500;
+        let to = start + PAGE + 0x1300;
+        let do_refresh = |copied: &mut [u64],
+                          partial: &mut std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+                          title: &[u8],
+                          shadow: &mut [u8],
+                          now: u64,
+                          written: &[(usize, u64)]| {
+            copy_stale_with(
+                start,
+                end,
+                copied,
+                partial,
+                from,
+                to,
+                now,
+                written,
+                &[],
+                false,
+                |_| {},
+                |lo, hi| {
+                    shadow[lo - start..hi - start].copy_from_slice(&title[lo - start..hi - start]);
+                    hi - lo
+                },
+            )
+        };
+
+        // 1st refresh: copies the entire unaligned span across the boundary.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 10, &[]), to - from);
+        assert_eq!(copied, [0, 0, 0]);
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 2nd refresh with no CPU writes: skips every already-covered byte.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 11, &[]), 0);
+
+        // CPU writes to the second page only; 3rd refresh uploads only that page's covered span.
+        title[PAGE + 0x200..PAGE + 0x400].fill(0x55);
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 13, &[(base + 1, 12)]), 0x1300);
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 4th refresh with no new write: skips again.
+        assert_eq!(do_refresh(&mut copied, &mut partial, &title, &mut shadow, 14, &[(base + 1, 12)]), 0);
+    }
+
+    #[test]
+    fn partial_page_refresh_handles_overlapping_extension_and_whole_promotion() {
+        let base = 0x200usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = vec![0u64; 1];
+        let mut partial = std::collections::HashMap::new();
+        let mut ranges = Vec::new();
+
+        // First partial refresh [0x100, 0x500).
+        let n1 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            start + 0x100,
+            start + 0x500,
+            10,
+            &[],
+            &[],
+            false,
+            |_| {},
+            |lo, hi| {
+                ranges.push((lo - start, hi - start));
+                hi - lo
+            },
+        );
+        assert_eq!(n1, 0x400);
+        assert_eq!(ranges, vec![(0x100, 0x500)]);
+        ranges.clear();
+
+        // Extended refresh [0x100, 0x800): copies only [0x500, 0x800).
+        let n2 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            start + 0x100,
+            start + 0x800,
+            11,
+            &[],
+            &[],
+            false,
+            |_| {},
+            |lo, hi| {
+                ranges.push((lo - start, hi - start));
+                hi - lo
+            },
+        );
+        assert_eq!(n2, 0x300);
+        assert_eq!(ranges, vec![(0x500, 0x800)]);
+        ranges.clear();
+
+        // Full-page refresh promotes to whole-page stamp and clears partial entry.
+        let n3 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            start,
+            end,
+            12,
+            &[],
+            &[],
+            false,
+            |_| {},
+            |lo, hi| {
+                ranges.push((lo - start, hi - start));
+                hi - lo
+            },
+        );
+        assert_eq!(n3, PAGE - 0x700);
+        assert_eq!(ranges, vec![(0, 0x100), (0x800, PAGE)]);
+        assert_eq!(copied[0], 12);
+        assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn partial_page_refresh_with_dirty4k_skips_clean_and_already_copied_subpages() {
+        let base = 0x300usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = vec![5u64; 1];
+        let mut partial = std::collections::HashMap::new();
+        let mut ranges = Vec::new();
+
+        // Whole page was copied at 5, then written at 12 (before=4 <= 5), with only 4 KiB page 1 (0x1000..0x2000) dirty.
+        let subs = [(base, 12u64, 4u64, 1u16 << 1)];
+        let n1 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            start + 0x0800,
+            start + 0x2400,
+            13,
+            &[(base, 12)],
+            &subs,
+            true,
+            |_| {},
+            |lo, hi| {
+                ranges.push((lo - start, hi - start));
+                hi - lo
+            },
+        );
+        assert_eq!(n1, 0x1000);
+        assert_eq!(ranges, vec![(0x1000, 0x2000)]);
+        ranges.clear();
+
+        // Second partial refresh of the same range with no new write skips it completely.
+        let n2 = copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            start + 0x0800,
+            start + 0x2400,
+            14,
+            &[(base, 12)],
+            &subs,
+            true,
+            |_| {},
+            |lo, hi| {
+                ranges.push((lo - start, hi - start));
+                hi - lo
+            },
+        );
+        assert_eq!(n2, 0);
+        assert!(ranges.is_empty());
+    }
 }
 
 /// Copies of windows outside buffers let go since the start, and their
@@ -2835,6 +3027,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            partial: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3224,6 +3417,14 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(spans) = page.checked_sub(base).and_then(|i| partial.get_mut(&i)) {
+                for (_, _, stamp) in spans.iter_mut() {
+                    if *stamp >= before {
+                        *stamp = (*stamp).max(now);
+                    }
+                }
+            }
             if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
                 && *taken != 0
                 && *taken >= before
@@ -3761,75 +3962,210 @@ impl Shadow {
     /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
     /// since it took them (`crate::watch::dirty4k`).
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], subs: &[(usize, u64, u64, u16)]) -> usize {
-        const KERNEL_PAGE: usize = 4096;
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
-        let base = self.start as usize / PAGE;
+        let kept = crate::watch::dirty4k_kept();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        let mut subs = subs.iter().peekable();
-        let (mut bytes, mut run): (_, Option<usize>) = (0, None);
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            while subs.peek().is_some_and(|s| s.0 < page) {
-                subs.next();
-            }
-            // The page's entry, if it stands for the asking the refresh was given for the page.
-            let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                let taken = *at;
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
-                // found it written came no later than the copy's taking.
-                let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
-                if crate::watch::dirty4k_kept() {
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        copy_stale_with(
+            start,
+            end,
+            &mut copied,
+            &mut partial,
+            from,
+            to,
+            now,
+            written,
+            subs,
+            narrow,
+            |found| {
+                if kept {
                     crate::watch::dirty4k_count(found, narrow && found.is_some());
                 }
-                if narrow && let Some(bits) = found {
-                    if let Some(first) = run.take() {
-                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-                    }
-                    let mut k = 0;
-                    while k < PAGE / KERNEL_PAGE {
-                        if bits & (1 << k) == 0 {
-                            k += 1;
-                            continue;
-                        }
-                        let a = k;
-                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
-                            k += 1;
-                        }
-                        let (lo, hi) = ((page * PAGE + a * KERNEL_PAGE).max(from), (page * PAGE + k * KERNEL_PAGE).min(to));
-                        if lo < hi {
-                            bytes += self.copy(lo, hi);
-                        }
-                    }
-                    continue;
-                }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-            }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
-        }
-        bytes
+            },
+            |lo, hi| self.copy(lo, hi),
+        )
     }
+}
 
+/// Inserts a disjoint byte span `(lo, hi, stamp)` into `spans` (kept sorted
+/// and non-overlapping), merging with an adjacent span that shares `stamp`.
+fn insert_partial_span(spans: &mut Vec<(u32, u32, u64)>, lo: u32, hi: u32, stamp: u64) {
+    if lo >= hi {
+        return;
+    }
+    let pos = spans.partition_point(|&(a, _, _)| a < lo);
+    spans.insert(pos, (lo, hi, stamp));
+    if pos + 1 < spans.len() && spans[pos].1 == spans[pos + 1].0 && spans[pos].2 == spans[pos + 1].2 {
+        spans[pos].1 = spans[pos + 1].1;
+        spans.remove(pos + 1);
+    }
+    if pos > 0 && spans[pos - 1].1 == spans[pos].0 && spans[pos - 1].2 == spans[pos].2 {
+        spans[pos - 1].1 = spans[pos].1;
+        spans.remove(pos);
+    }
+}
+
+/// Prunes partial spans invalidated by `write` (`stamp < write`) and returns
+/// the sorted gaps inside `[req_lo, req_hi)` not covered by remaining spans.
+fn stale_gaps_in_page(spans: &mut Vec<(u32, u32, u64)>, write: u64, req_lo: u32, req_hi: u32) -> Vec<(u32, u32)> {
+    spans.retain(|&(_, _, stamp)| write <= stamp);
+    let mut gaps = Vec::new();
+    let mut cursor = req_lo;
+    for &(a, b, _) in spans.iter() {
+        if b <= cursor {
+            continue;
+        }
+        if a >= req_hi {
+            break;
+        }
+        if a > cursor {
+            gaps.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+        if cursor >= req_hi {
+            break;
+        }
+    }
+    if cursor < req_hi {
+        gaps.push((cursor, req_hi));
+    }
+    gaps
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_stale_with(
+    start: usize,
+    end: usize,
+    copied: &mut [u64],
+    partial: &mut std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+    from: usize,
+    to: usize,
+    now: u64,
+    written: &[(usize, u64)],
+    subs: &[(usize, u64, u64, u16)],
+    narrow: bool,
+    mut on_sub: impl FnMut(Option<u16>),
+    mut copy_range: impl FnMut(usize, usize) -> usize,
+) -> usize {
+    const KERNEL_PAGE: usize = 4096;
+    if from >= to {
+        return 0;
+    }
+    let base = start / PAGE;
+    let mut writes = written.iter().peekable();
+    let mut subs = subs.iter().peekable();
+    let (mut bytes, mut run): (_, Option<usize>) = (0, None);
+    let last = (to - 1) / PAGE;
+    for page in from / PAGE..=last {
+        let write = match writes.peek() {
+            Some(&&(p, w)) if p == page => {
+                writes.next();
+                w
+            }
+            _ => 0,
+        };
+        while subs.peek().is_some_and(|s| s.0 < page) {
+            subs.next();
+        }
+        // The page's entry, if it stands for the asking the refresh was given for the page.
+        let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
+        let idx = page - base;
+        let at = &mut copied[idx];
+        if *at == 0 || write > *at {
+            let taken = *at;
+            let page_base = page * PAGE;
+            let page_lo = page_base.max(start);
+            let page_hi = (page_base + PAGE).min(end);
+            let req_lo = page_lo.max(from);
+            let req_hi = page_hi.min(to);
+            let r_lo = (req_lo - page_base) as u32;
+            let r_hi = (req_hi - page_base) as u32;
+            let full_page = req_lo == page_lo && req_hi == page_hi;
+
+            let gaps = match partial.get_mut(&idx) {
+                Some(spans) => {
+                    let g = stale_gaps_in_page(spans, write, r_lo, r_hi);
+                    if spans.is_empty() {
+                        partial.remove(&idx);
+                    }
+                    g
+                }
+                None => vec![(r_lo, r_hi)],
+            };
+            if gaps.is_empty() {
+                if let Some(first) = run.take() {
+                    bytes += copy_range((first * PAGE).max(from), page_base.min(to));
+                }
+                continue;
+            }
+
+            if full_page {
+                *at = now;
+                partial.remove(&idx);
+            }
+            // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
+            // found it written came no later than the copy's taking.
+            let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
+            on_sub(found);
+            if narrow && let Some(bits) = found {
+                if let Some(first) = run.take() {
+                    bytes += copy_range((first * PAGE).max(from), page_base.min(to));
+                }
+                let mut k = 0;
+                while k < PAGE / KERNEL_PAGE {
+                    if bits & (1 << k) == 0 {
+                        k += 1;
+                        continue;
+                    }
+                    let a = k;
+                    while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                        k += 1;
+                    }
+                    let sub_lo = (a * KERNEL_PAGE) as u32;
+                    let sub_hi = (k * KERNEL_PAGE) as u32;
+                    for &(g_lo, g_hi) in &gaps {
+                        let lo = g_lo.max(sub_lo);
+                        let hi = g_hi.min(sub_hi);
+                        if lo < hi {
+                            bytes += copy_range(page_base + lo as usize, page_base + hi as usize);
+                            if !full_page {
+                                insert_partial_span(partial.entry(idx).or_default(), lo, hi, now);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+                run.get_or_insert(page);
+            } else {
+                if let Some(first) = run.take() {
+                    bytes += copy_range((first * PAGE).max(from), page_base.min(to));
+                }
+                for &(g_lo, g_hi) in &gaps {
+                    bytes += copy_range(page_base + g_lo as usize, page_base + g_hi as usize);
+                }
+            }
+            if !full_page {
+                let spans = partial.entry(idx).or_default();
+                for (g_lo, g_hi) in gaps {
+                    insert_partial_span(spans, g_lo, g_hi, now);
+                }
+            }
+        } else if let Some(first) = run.take() {
+            bytes += copy_range((first * PAGE).max(from), (page * PAGE).min(to));
+        }
+    }
+    // Cut to the range: next to it shaders may be writing the copy.
+    if let Some(first) = run {
+        bytes += copy_range((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+    }
+    bytes
+}
+
+impl Shadow {
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
