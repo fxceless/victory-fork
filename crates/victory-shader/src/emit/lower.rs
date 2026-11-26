@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Post-optimisation title-memory IR stats.
+    #[cfg(test)]
+    pub memory_ir: super::bitcode::MemoryIrStats,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2285,6 +2288,14 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        #[cfg(test)]
+        let (dxil, memory_ir) = self.s.finish_with_memory_ir();
+        #[cfg(not(test))]
+        let dxil = self.s.finish();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2292,10 +2303,12 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            #[cfg(test)]
+            memory_ir,
+            dxil,
             user_data,
             samplers: self.samplers,
         })
@@ -2796,11 +2809,12 @@ impl<'a> Lower<'a> {
     }
 
     /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
-    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
-    /// it and the byte in that view. A page without a copy reads zeros
-    /// (and drops writes) through the null view at the first slot, and its
-    /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+    /// `SLOT_MEMORY`): the view-heap slot of the host copy holding it and
+    /// the byte in that view. A page without a copy resolves to the null
+    /// view at the base slot (reads zeros, drops writes) and records its
+    /// page number in `SLOT_FAULTS` only when an active lane (`guard`)
+    /// misses.
+    fn memory_slot(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2831,37 +2845,50 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // A page without a copy: record its number for the host only on an
+        // active miss (steady-state hits skip the modulo and fault store).
         let zero = k(self, 0);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
+        let fault_gate = self.begin_guarded(Some(missing));
+        let fb = self.cur;
         let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let place = self.s.m.bin(fb, Bin::URem, page, places);
         let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let place = self.s.m.bin(fb, Bin::Add, place, one);
         let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let place = self.s.m.bin(fb, Bin::Shl, place, k2);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
-            c,
+            fb,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.end_guarded(fault_gate, &[]);
+        let done = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let slot = self.s.m.bin(done, Bin::Add, base, copy);
         let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        let within = self.s.m.bin(done, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(done, Bin::Add, start, within);
+        (slot, byte)
+    }
+
+    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
+    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
+    /// it and the byte in that view. A page without a copy reads zeros
+    /// (and drops writes) through the null view at the first slot, and its
+    /// number is left for the host, for lanes that run (`guard`).
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (slot, byte) = self.memory_slot(lo, hi, guard);
+        let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
         (h, byte)
     }
 
@@ -2894,7 +2921,6 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -2912,6 +2938,7 @@ impl<'a> Lower<'a> {
                 return Err("a global load result");
             };
             let (h, byte) = self.memory(lo, hi, guard);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2966,7 +2993,7 @@ impl<'a> Lower<'a> {
             "add" => Some((0, v)),
             "sub" => {
                 let zero = self.s.m.i32(0);
-                Some((0, self.s.m.bin(c, Bin::Sub, zero, v)))
+                Some((0, self.s.m.bin(self.cur, Bin::Sub, zero, v)))
             }
             "and" => Some((1, v)),
             "or" => Some((2, v)),
@@ -3094,6 +3121,7 @@ impl<'a> Lower<'a> {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
             let (h, byte) = self.memory(lo, hi, None);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,

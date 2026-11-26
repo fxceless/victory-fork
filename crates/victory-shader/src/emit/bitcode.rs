@@ -386,6 +386,76 @@ impl Module {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory_ir_stats(
+        &self,
+        faults: Option<V>,
+        directory: Option<V>,
+    ) -> MemoryIrStats {
+        let mut stats = MemoryIrStats::default();
+        let n = self.blocks.len();
+        let mut pred_count = vec![0usize; n];
+        let mut pred_cond = vec![false; n];
+        for b in &self.blocks {
+            match b.term {
+                Some(Term::Br(t)) => pred_count[t] += 1,
+                Some(Term::CondBr(_, t, f)) => {
+                    pred_count[t] += 1;
+                    pred_cond[t] = true;
+                    pred_count[f] += 1;
+                    pred_cond[f] = true;
+                }
+                _ => {}
+            }
+        }
+        let is_i32_const = |v: V, want: u32| -> bool {
+            matches!(
+                v,
+                V::Const(i) if matches!(self.consts[i as usize].1, Const::Int(x) if (x as u32) == want)
+            )
+        };
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let guarded = bi != 0 && pred_count[bi] == 1 && pred_cond[bi];
+            for &id in &b.body {
+                match &self.insts[id as usize].op {
+                    Op::Bin(Bin::URem, _, rhs)
+                        if is_i32_const(*rhs, super::shader::MEMORY_FAULTS - 1) =>
+                    {
+                        stats.fault_urems_total += 1;
+                        if guarded {
+                            stats.fault_urems_guarded += 1;
+                        }
+                    }
+                    Op::Cmp(pred::IUGE, _, rhs) if is_i32_const(*rhs, 0xFFC0) => {
+                        stats.straddle_cmps += 1;
+                    }
+                    Op::Call(f, args) => {
+                        let name = self.funcs[*f as usize].name.as_str();
+                        if name == "dx.op.rawBufferStore.i32"
+                            && faults.is_some()
+                            && args.get(1) == faults.as_ref()
+                        {
+                            stats.fault_stores_total += 1;
+                            if guarded {
+                                stats.fault_stores_guarded += 1;
+                            }
+                        } else if name == "dx.op.rawBufferLoad.f32"
+                            && directory.is_some()
+                            && args.get(1) == directory.as_ref()
+                        {
+                            stats.dir_loads_total += 1;
+                            if guarded {
+                                stats.dir_loads_guarded += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        stats
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -926,6 +996,18 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             idx.iter().copied().for_each(f);
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryIrStats {
+    pub fault_stores_total: usize,
+    pub fault_stores_guarded: usize,
+    pub fault_urems_total: usize,
+    pub fault_urems_guarded: usize,
+    pub dir_loads_total: usize,
+    pub dir_loads_guarded: usize,
+    pub straddle_cmps: usize,
 }
 
 /// A block's successors (at most two), without allocating.

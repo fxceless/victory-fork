@@ -10,7 +10,8 @@
 //!
 //! The title's nodes are in title memory, named by address: they are read
 //! through the host's copies of title memory ([`Lower::memory`]), one look
-//! in its directory per node (two for a 128-byte box node).
+//! in its directory per node (a second only when a 128-byte box node
+//! straddles a 64 KiB page boundary).
 //!
 //! Shape of the code, under the instruction's lane guard:
 //!
@@ -72,9 +73,16 @@ enum NodeAt {
     /// At this byte of a raw buffer of the host.
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
-    /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
-    /// and the node's address, for the second half of a 128-byte node.
-    Memory { handle: V, byte: V, low: V, high: V },
+    /// first 64 bytes, its view-heap slot, and the node's byte in it
+    /// ([`Lower::bvh_memory_slot`]), plus the node's address for the second
+    /// half of a 128-byte node when it straddles a 64 KiB page boundary.
+    Memory {
+        handle: V,
+        slot: V,
+        byte: V,
+        low: V,
+        high: V,
+    },
 }
 
 /// The ray operands, as floats.
@@ -206,9 +214,11 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                let (slot, byte) = self.bvh_memory_slot(low, high, guard);
+                let handle = self.bvh_heap_handle(self.cur, slot);
                 NodeAt::Memory {
                     handle,
+                    slot,
                     byte,
                     low,
                     high,
@@ -264,11 +274,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Title memory at `low`/`high` for a node's bytes: the raw view of the
-    /// host copy holding the address and the byte in that view
-    /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
-    /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
+    /// Title memory at `low`/`high` for a node's bytes: the view-heap slot
+    /// of the host copy holding the address and the byte in that view
+    /// ([`Lower::memory_slot`]: a page the host has no copy of resolves to
+    /// the null view and is left for the host to fetch, for lanes that run).
+    fn bvh_memory_slot(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -276,7 +286,6 @@ impl<'a> Lower<'a> {
             // which is zeros.
             let c = self.cur;
             let slot = self.s.m.i32(slot);
-            let handle = self.s.heap_handle(c, slot, false, false, (11, 0));
             let (base_low, base_high) =
                 (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
             let at = self.s.m.bin(c, Bin::Sub, low, base_low);
@@ -285,19 +294,27 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at);
+            return (slot, at);
         }
-        self.memory(low, high, guard)
+        self.memory_slot(low, high, guard)
+    }
+
+    fn bvh_heap_handle(&mut self, block: usize, slot: V) -> V {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            return self.s.heap_handle(block, slot, false, false, (11, 0));
+        }
+        self.s.heap_handle(block, slot, false, true, (11 | 0x1000, 0))
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        // The second half of a 128-byte node may lie in the next 64 KiB
-        // page, which may be in another copy: its own look, made once.
+        // The second half of a 128-byte node only lies in the next 64 KiB
+        // page when `(low & 0xffff) >= 0xffc0` (nodes are 64-byte aligned,
+        // so 1023 of 1024 positions stay in the first half's page).
         let mut second = None;
         let mut out = Vec::with_capacity(count as usize);
         for start in (0..count).step_by(4) {
@@ -306,14 +323,42 @@ impl<'a> Lower<'a> {
             let (handle, mut byte) = match at {
                 NodeAt::Buffer { handle, byte } => (handle, byte),
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
-                NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
-                    let (low, high) = self.address_plus(low, high, 64);
+                NodeAt::Memory {
+                    slot,
+                    byte,
+                    low,
+                    high,
+                    ..
+                } => *second.get_or_insert_with(|| {
+                    let head = self.cur;
+                    let (k64k, kstraddle) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFC0));
+                    let within = self.s.m.bin(head, Bin::And, low, k64k);
+                    let straddles = self.s.m.cmp(head, pred::IUGE, within, kstraddle);
+                    let (slow, join) = (self.s.m.new_block(), self.s.m.new_block());
+                    self.s.m.terminate(head, Term::CondBr(straddles, slow, join));
+                    self.cur = slow;
+                    let (low2, high2) = self.address_plus(low, high, 64);
                     // Every lane in this block runs the instruction.
-                    let (handle, byte) = self.bvh_memory(low, high, None);
+                    let (slot2, byte2) = self.bvh_memory_slot(low2, high2, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    let slow_end = self.cur;
+                    let byte2 = self.s.m.bin(slow_end, Bin::Sub, byte2, k64);
+                    self.s.m.terminate(slow_end, Term::Br(join));
+                    self.cur = join;
+                    let i32t = self.s.t.i32;
+                    let slot_phi = self.s.m.phi(join, i32t);
+                    self.s
+                        .m
+                        .set_phi(slot_phi, vec![(slot2, slow_end), (slot, head)]);
+                    let byte_phi = self.s.m.phi(join, i32t);
+                    self.s
+                        .m
+                        .set_phi(byte_phi, vec![(byte2, slow_end), (byte, head)]);
+                    let handle2 = self.bvh_heap_handle(join, slot_phi);
+                    (handle2, byte_phi)
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -359,8 +404,8 @@ impl<'a> Lower<'a> {
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
-        let head = self.cur;
         let children = self.bvh_node_words(at, None, 0, 4);
+        let head = self.cur;
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -373,21 +418,23 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
         let words = self.bvh_node_words(at, None, 16, 12);
+        let half_cur = self.cur;
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
             let mut h = words[n / 2];
             if n % 2 == 1 {
-                h = self.s.m.bin(half_block, Bin::LShr, h, k16);
+                h = self.s.m.bin(half_cur, Bin::LShr, h, k16);
             }
             // The conversion reads the low 16 bits.
             halves.push(self.s.op(
-                half_block,
+                half_cur,
                 "legacyF16ToF32",
                 Attr::ReadNone,
                 f32t,
@@ -395,14 +442,15 @@ impl<'a> Lower<'a> {
                 &[h],
             ));
         }
-        self.s.m.terminate(half_block, Term::Br(join));
+        let half_end = self.cur;
+        self.s.m.terminate(half_end, Term::Br(join));
         self.cur = join;
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_end)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

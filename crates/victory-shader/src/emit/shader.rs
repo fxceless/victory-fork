@@ -444,29 +444,71 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        #[cfg(test)]
+        {
+            self.finish_with_memory_ir().0
+        }
+        #[cfg(not(test))]
+        {
+            self.finish_inner()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_with_memory_ir(mut self) -> (Vec<u8>, super::bitcode::MemoryIrStats) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.optimise_and_trim_flags(passes);
+        }
+        let faults = self
+            .root_uavs
+            .iter()
+            .find(|r| r.0 == SLOT_FAULTS)
+            .map(|r| r.1);
+        let directory = self
+            .root_srvs
+            .iter()
+            .find(|r| r.0 == SLOT_MEMORY)
+            .map(|r| r.1);
+        let stats = self.m.memory_ir_stats(faults, directory);
+        (self.package_container(ud_size), stats)
+    }
+
+    #[cfg(not(test))]
+    fn finish_inner(mut self) -> Vec<u8> {
+        let ud_size = (self.user_data * 4).next_multiple_of(16);
+        self.fix_user_data_size(ud_size);
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.optimise_and_trim_flags(passes);
+        }
+        self.package_container(ud_size)
+    }
+
+    fn optimise_and_trim_flags(&mut self, passes: u32) {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
-        if passes != 0 {
-            self.m.optimise(passes);
-            let used = self.m.usage();
-            for (flag, used) in [
-                (flags::WAVE_OPS, used.wave_ops),
-                (flags::INT64, used.int64),
-                (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
-                (flags::RESOURCE_HEAP, used.heap_views),
-                (flags::SAMPLER_HEAP, used.heap_samplers),
-                (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
-            ] {
-                if !used {
-                    self.flags &= !flag;
-                }
+        self.m.optimise(passes);
+        let used = self.m.usage();
+        for (flag, used) in [
+            (flags::WAVE_OPS, used.wave_ops),
+            (flags::INT64, used.int64),
+            (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+            (flags::RESOURCE_HEAP, used.heap_views),
+            (flags::SAMPLER_HEAP, used.heap_samplers),
+            (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+        ] {
+            if !used {
+                self.flags &= !flag;
             }
         }
+    }
+
+    fn package_container(mut self, ud_size: u32) -> Vec<u8> {
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
