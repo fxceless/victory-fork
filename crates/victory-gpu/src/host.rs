@@ -8571,7 +8571,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -8594,7 +8594,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -8604,13 +8604,14 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
+    static ZEROS: [u8; 4 << 10] = [0; 4 << 10];
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -8621,8 +8622,15 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        // Title destinations may be read-only or unmapped
+                        // concurrently; write zeros through the kernel so
+                        // non-writable pages fail cleanly instead of faulting.
+                        write_mapped(to, ZEROS.as_ptr(), n);
+                    } else {
+                        // SAFETY: host staging buffer, mapped and writable.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }

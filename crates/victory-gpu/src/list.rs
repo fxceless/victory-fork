@@ -1005,24 +1005,61 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(host) = crate::host::host() else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let Some((host_fp, [host_bytes, row, lines, title_pitch])) = src.footprint.host_rows()
+            else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some(title_bytes) = title_pitch
+                .checked_mul(lines - 1)
+                .and_then(|n| n.checked_add(row))
+            else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            let Some(data) = buffer_range(src.resource, src.footprint.offset, title_bytes) else {
+                return;
+            };
+            let direct = title_pitch >= row && title_pitch > 0 && title_pitch.is_multiple_of(256);
+            let upload_bytes = if direct { title_bytes } else { host_bytes };
+            let Some((buffer, staging)) = list.upload(host, upload_bytes) else {
+                return;
+            };
+            if direct {
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, title_bytes as usize);
+                from.footprint.offset = 0;
+            } else {
+                // Console footprints can use a 64-byte row pitch (or other
+                // non-256-byte pitch); repack row-by-row into a host-aligned
+                // upload buffer at submission.
+                let staging_addr = staging as usize;
+                let data_addr = data as usize;
+                let (row_len, rows_count, src_pitch, dst_pitch) = (
+                    row as usize,
+                    lines as usize,
+                    title_pitch as usize,
+                    host_fp.row_pitch as usize,
+                );
+                list.defer_host(move || {
+                    for r in 0..rows_count {
+                        crate::host::copy_mapped(
+                            (staging_addr + r * dst_pitch) as *mut u8,
+                            (data_addr + r * src_pitch) as *const u8,
+                            row_len,
+                            false,
+                        );
+                    }
+                });
+                from.footprint = host_fp;
+            }
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, upload_bytes));
             }
             _upload = buffer;
         } else {
@@ -1130,10 +1167,16 @@ fn read_back(
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
     }
+    if crate::resource::stands_in(src.resource) {
+        return Err("a stand-in target");
+    }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
     // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
+    let bytes = pitch
+        .checked_mul(rows - 1)
+        .and_then(|n| n.checked_add(row))
+        .ok_or("footprint size overflows")?;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
@@ -1182,6 +1225,16 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Dimensions `(width, height)` of subresource `sub` of a texture whose mip 0
+/// is `width x height` with `mip_levels` mips per array slice.
+fn subresource_size(width: u64, height: u32, mip_levels: u16, sub: u32) -> (u64, u32) {
+    let mips = u32::from(mip_levels).max(1);
+    let mip = (sub % mips).min(63);
+    let w = (width >> mip).max(1);
+    let h = (u64::from(height) >> mip).max(1) as u32;
+    (w, h)
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -1222,7 +1275,9 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let (aw, ah) = subresource_size(a.Width, a.Height, a.MipLevels, dst_sub);
+            let (bw, bh) = subresource_size(b.Width, b.Height, b.MipLevels, src_sub);
+            if (aw, ah) == (bw, bh) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1230,8 +1285,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: aw.min(bw).min(i32::MAX as u64) as i32,
+                    bottom: ah.min(bh).min(i32::MAX as u32) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -1359,16 +1414,35 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
+        && dst != src
+        && dst.checked_add(len).is_some()
+        && src.checked_add(len).is_some()
+        && let Ok(len_usize) = usize::try_from(len)
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        if dst.abs_diff(src) >= len {
+            list.defer_copy(dst as *mut u8, src as *const u8, len_usize);
+        } else {
+            list.defer(move || {
+                // Overlapping title ranges: read through the kernel into a
+                // temporary buffer so forward copies cannot clobber unread
+                // source bytes, then write through `write_mapped` (which fails
+                // cleanly on read-only or concurrently unmapped destinations
+                // instead of faulting).
+                if !crate::texture::committed(dst as *const u8, len_usize) {
+                    return;
+                }
+                let mut staging = Vec::new();
+                if staging.try_reserve_exact(len_usize).is_err() {
+                    return;
+                }
+                staging.resize(len_usize, 0);
+                crate::host::copy_mapped(staging.as_mut_ptr(), src as *const u8, len_usize, false);
+                crate::watch::writing(dst as usize, len_usize);
+                crate::host::write_mapped(dst as *mut u8, staging.as_ptr(), len_usize);
+                crate::watch::wrote(dst as usize, len_usize);
+            });
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -2272,6 +2346,288 @@ mod tests {
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn subresource_size_tracks_mips_and_array_slices() {
+        assert_eq!(subresource_size(1024, 512, 10, 0), (1024, 512));
+        assert_eq!(subresource_size(1024, 512, 10, 1), (512, 256));
+        assert_eq!(subresource_size(1024, 512, 10, 2), (256, 128));
+        // Array slice 1, mip 1 (subresource = 1 * 10 + 1 = 11).
+        assert_eq!(subresource_size(1024, 512, 10, 11), (512, 256));
+        // Clamped at 1x1 on deep mips and safe when mip_levels == 0.
+        assert_eq!(subresource_size(1024, 512, 11, 10), (1, 1));
+        assert_eq!(subresource_size(64, 32, 0, 5), (64, 32));
+    }
+
+    #[test]
+    fn footprint_rejects_zero_and_overflow_and_aligns_console_pitch() {
+        use crate::resource::PlacedFootprint;
+        // Format 28 = R8G8B8A8_UNORM (4 bytes per pixel).
+        let console_64 = PlacedFootprint::new(128, 28, 8, 4, 1, 64);
+        let (host_fp, [size, row, lines, title_pitch]) = console_64.host_rows().unwrap();
+        assert_eq!(host_fp.offset, 0);
+        assert_eq!(host_fp.row_pitch, 256);
+        assert_eq!([size, row, lines, title_pitch], [1024, 32, 4, 64]);
+        assert_eq!(console_64.bytes(), Some(64 * 3 + 32));
+
+        // Zero dimensions are rejected.
+        assert_eq!(PlacedFootprint::new(0, 28, 0, 4, 1, 256).host_rows(), None);
+        assert_eq!(PlacedFootprint::new(0, 28, 4, 0, 1, 256).host_rows(), None);
+        assert_eq!(PlacedFootprint::new(0, 28, 4, 4, 0, 256).host_rows(), None);
+        assert_eq!(PlacedFootprint::new(0, 28, 0, 4, 1, 256).bytes(), None);
+
+        // Overflowing dimensions are rejected cleanly.
+        assert_eq!(
+            PlacedFootprint::new(0, 28, u32::MAX, u32::MAX, 1, u32::MAX).host_rows(),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_memory_handles_disjoint_overlap_and_readonly_destinations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let src = vec![0x41u8; 32];
+        let mut dst = vec![0u8; 32];
+        let mut overlap_fwd: Vec<u8> = (0u8..32).collect();
+        let mut overlap_bwd: Vec<u8> = (100u8..132).collect();
+
+        // Allocate a real PAGE_READONLY page to verify no AV happens on write.
+        // SAFETY: private allocation owned by this test.
+        let ro = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!p.is_null());
+            p.write_bytes(0xCC, 4096);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(p.cast(), 4096, PAGE_READONLY, &mut old), 0);
+            p
+        };
+
+        // 1. Disjoint copy.
+        copy_memory(list, dst.as_mut_ptr() as u64, src.as_ptr() as u64, 32, 0);
+        // 2. Overlapping forward copy (dst > src): shift [0..24] -> [8..32].
+        copy_memory(
+            list,
+            overlap_fwd.as_mut_ptr().wrapping_add(8) as u64,
+            overlap_fwd.as_ptr() as u64,
+            24,
+            0,
+        );
+        // 3. Overlapping backward copy (dst < src): shift [8..32] -> [0..24].
+        copy_memory(
+            list,
+            overlap_bwd.as_mut_ptr() as u64,
+            overlap_bwd.as_ptr().wrapping_add(8) as u64,
+            24,
+            0,
+        );
+        // 4. Disjoint & overlapping copies into a PAGE_READONLY page must not fault.
+        copy_memory(list, ro as u64, src.as_ptr() as u64, 32, 0);
+        copy_memory(list, ro.wrapping_add(4) as u64, ro as u64, 16, 0);
+
+        assert_eq!(close(list), S_OK);
+        let hl = host_list(list).expect("host list");
+        host.execute(&[hl]);
+
+        assert_eq!(dst, src);
+        let expected_fwd: Vec<u8> = (0u8..8).chain(0u8..24).collect();
+        assert_eq!(overlap_fwd, expected_fwd);
+        let expected_bwd: Vec<u8> = (108u8..132).chain(124u8..132).collect();
+        assert_eq!(overlap_bwd, expected_bwd);
+        // SAFETY: `ro` is a committed read-only page of 4096 bytes.
+        let ro_slice = unsafe { std::slice::from_raw_parts(ro, 32) };
+        assert!(ro_slice.iter().all(|&b| b == 0xCC));
+
+        // SAFETY: freeing the test's VirtualAlloc allocation.
+        unsafe { assert_ne!(VirtualFree(ro.cast(), 0, MEM_RELEASE), 0) };
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_texture_region_repacks_console_64_byte_row_pitch() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Props {
+            kind: u32,
+            cpu: u32,
+            pool: u32,
+            creation: u32,
+            visible: u32,
+        }
+        #[repr(C)]
+        struct Desc {
+            dim: u32,
+            align: u64,
+            width: u64,
+            height: u32,
+            depth: u16,
+            mips: u16,
+            format: u32,
+            samples: u32,
+            quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let resource_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let props = Props {
+            kind: 1, // DEFAULT
+            cpu: 0,
+            pool: 0,
+            creation: 1,
+            visible: 1,
+        };
+        let buf_desc = Desc {
+            dim: 1, // BUFFER
+            align: 0,
+            width: 512,
+            height: 1,
+            depth: 1,
+            mips: 1,
+            format: 0,
+            samples: 1,
+            quality: 0,
+            layout: 1, // ROW_MAJOR
+            flags: 0,
+        };
+        let tex_desc = Desc {
+            dim: 3, // TEXTURE2D
+            align: 0,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            format: 28, // R8G8B8A8_UNORM
+            samples: 1,
+            quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET -> backed by a host texture
+        };
+
+        let (mut src_buf, mut dst_buf, mut tex) = (null, null, null);
+        for (desc, out) in [
+            (&buf_desc, &mut src_buf),
+            (&buf_desc, &mut dst_buf),
+            (&tex_desc, &mut tex),
+        ] {
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const props).cast(),
+                    0,
+                    (desc as *const Desc).cast(),
+                    0,
+                    null.cast(),
+                    &resource_iid,
+                    out,
+                ),
+                S_OK
+            );
+        }
+
+        // Fill 4 rows of 4 RGBA8 pixels (16 bytes/row) spaced at console 64-byte pitch.
+        let (src_ptr, _) = crate::resource::buffer_bytes(src_buf).unwrap();
+        let (dst_ptr, _) = crate::resource::buffer_bytes(dst_buf).unwrap();
+        // SAFETY: both title buffers are 512 bytes of writable memory.
+        unsafe {
+            for r in 0..4usize {
+                for b in 0..16usize {
+                    src_ptr.add(r * 64 + b).write(((r + 1) * 16 + b) as u8);
+                }
+            }
+            dst_ptr.write_bytes(0, 512);
+        }
+
+        let fp = crate::resource::PlacedFootprint::new(0, 28, 4, 4, 1, 64);
+        let buf_src = CopyLocation {
+            resource: src_buf,
+            kind: 1,
+            footprint: fp,
+        };
+        let tex_sub = CopyLocation {
+            resource: tex,
+            kind: 0,
+            footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0, 0),
+        };
+        let buf_dst = CopyLocation {
+            resource: dst_buf,
+            kind: 1,
+            footprint: fp,
+        };
+
+        // Upload from 64-byte pitched buffer -> host texture, then read back into 64-byte pitched buffer.
+        copy_texture_region(list, &tex_sub, 0, 0, 0, &buf_src, std::ptr::null());
+        copy_texture_region(list, &buf_dst, 0, 0, 0, &tex_sub, std::ptr::null());
+
+        assert_eq!(close(list), S_OK);
+        let hl = host_list(list).expect("host list");
+        host.execute(&[hl]);
+
+        // Verify all 4 rows round-tripped cleanly with exact 64-byte pitch layout.
+        // SAFETY: `dst_ptr` is 512 bytes of readable test buffer.
+        unsafe {
+            for r in 0..4usize {
+                for b in 0..16usize {
+                    let expected = ((r + 1) * 16 + b) as u8;
+                    let got = dst_ptr.add(r * 64 + b).read();
+                    assert_eq!(got, expected, "mismatch at row {r} byte {b}");
+                }
+            }
+        }
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(src_buf), 0);
+        assert_eq!(release(dst_buf), 0);
+        assert_eq!(release(tex), 0);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }

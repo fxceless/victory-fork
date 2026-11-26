@@ -657,16 +657,42 @@ pub(crate) struct PlacedFootprint {
     width: u32,
     height: u32,
     depth: u32,
-    row_pitch: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
+    #[cfg(test)]
+    pub(crate) const fn new(
+        offset: u64,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        row_pitch: u32,
+    ) -> Self {
+        Self {
+            offset,
+            format,
+            width,
+            height,
+            depth,
+            row_pitch,
+        }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
     }
 
     /// For a read back through a host buffer: this footprint at offset 0
@@ -674,16 +700,22 @@ impl PlacedFootprint {
     /// bytes), then the bytes that buffer needs, the bytes of a row, the
     /// rows, and the title's own pitch.
     pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
-        let pitch = row.max(1).next_multiple_of(256);
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let row = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        let pitch = row.max(1).checked_next_multiple_of(256)?;
+        let size = pitch.checked_mul(lines)?;
         let host = PlacedFootprint {
             offset: 0,
             row_pitch: u32::try_from(pitch).ok()?,
             ..*self
         };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        Some((host, [size, row, lines, u64::from(self.row_pitch)]))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
