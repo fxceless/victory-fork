@@ -1356,7 +1356,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                if wave == 64 && crate::env::env_flag("VICTORY_WAVE_WHY") {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
                         let n = i.name();
@@ -1550,7 +1550,7 @@ impl<'a> Lower<'a> {
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
-                    super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
+                    super::own_bits::find(p, x.st, crate::env::env_flag("VICTORY_WAVE_WHY"))
                 }
                 _ => Default::default(),
             },
@@ -4275,7 +4275,7 @@ impl<'a> Lower<'a> {
             // still emitted with the lower maxima (drivers take them);
             // refuse them here if one hangs.
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
+            if !fits(mesh) && crate::env::env_flag("VICTORY_MESH_OUTPUT_STRICT") {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -5899,7 +5899,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+            if crate::env::env_flag("VICTORY_DESC_WHY") {
                 eprintln!(
                     "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
                     inst.machine.offset,
@@ -11309,7 +11309,7 @@ impl<'a> Lower<'a> {
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = *STRICT.get_or_init(|| crate::env::env_flag("VICTORY_STRICT_JOINS"));
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {

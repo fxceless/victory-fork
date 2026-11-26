@@ -1216,8 +1216,7 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -1228,7 +1227,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if env_flag("VICTORY_D3D12_GBV")
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -1268,7 +1267,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -2117,10 +2116,40 @@ pub(crate) fn dred_mode() -> Dred {
             None => Dred::Off,
             Some(v) if v == "light" => Dred::Light,
             Some(v) if v == "faults" => Dred::Faults,
+            // A falsey spelling is off: `0`, `false`, `no`, `off`, empty.
+            Some(v) if !parse_env_flag(Some(&v)) => Dred::Off,
             // Any other value, as before the two above were known.
             Some(_) => Dred::Full,
         }
     })
+}
+
+/// Parses an opt-in boolean environment variable. Unset, empty/whitespace,
+/// `"0"`, `"false"`, `"no"`, and `"off"` (ASCII case-insensitive) disable
+/// the flag; any other value enables it so `FLAG=1` / `FLAG=true` keep
+/// working while `FLAG=0` / `FLAG=false` actually turn it off.
+pub(crate) fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether the opt-in boolean environment variable `name` is enabled.
+///
+/// Re-exported crate-wide so the rest of the tree ([`crate::env_flag`]) asks
+/// the same question `0`, `false`, `no` and `off` the same way, instead of
+/// `var_os(..).is_some()` answering only "was it set at all".
+pub fn env_flag(name: &str) -> bool {
+    parse_env_flag(std::env::var_os(name).as_deref())
 }
 
 /// Whether device-removed data is on in its full form (`VICTORY_D3D12_DRED`
@@ -2173,7 +2202,7 @@ fn card_budget() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| env_flag("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -2969,7 +2998,8 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        #[cfg(feature = "diagnostics")]
+        if timing() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -10812,6 +10842,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn parse_env_flag_treats_explicit_falsey_values_as_off() {
+        use std::ffi::OsStr;
+        assert!(!super::parse_env_flag(None));
+        for off in ["", "   ", "0", " 0 ", "false", "FALSE", "False", "no", "NO", "off", "OFF"] {
+            assert!(
+                !super::parse_env_flag(Some(OsStr::new(off))),
+                "{off:?} must disable flag"
+            );
+        }
+        for on in ["1", " 1 ", "true", "TRUE", "yes", "YES", "on", "ON", "2"] {
+            assert!(
+                super::parse_env_flag(Some(OsStr::new(on))),
+                "{on:?} must enable flag"
+            );
+        }
     }
 }
 

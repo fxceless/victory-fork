@@ -1,5 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+#[cfg(test)]
+mod envflags;
 mod policy;
 
 use std::path::{Path, PathBuf};
