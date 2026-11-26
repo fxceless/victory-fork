@@ -72,6 +72,15 @@ if ($Safe) {
     $env:VICTORY_THIN_THREADS = '6'
     $env:VICTORY_JOIN_PARTS = '8'
     $env:VICTORY_UPLOAD_AHEAD = '1'
+    # NVIDIA RTX 5070 fixes from run-v7 log analysis:
+    # - WAIT_RESIDENT=0 eliminates 162,000 synchronous residency stalls (~75.5 s in 4.5 min)
+    # - CARD_BUFFERS_MIN_MB=1 offloads ~224 MB/frame of >=1 MiB buffer compares to GPU
+    # - Safe renderer ports 1/6/7 (CONSTANTS/GUARD/JOURNAL); PORT_DESCRIPTORS stays opt-in via -Ports
+    $env:VICTORY_WAIT_RESIDENT = '0'
+    $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    $env:VICTORY_PORT_GUARD = '1'
+    $env:VICTORY_PORT_JOURNAL = '1'
+    $env:VICTORY_PORT_CONSTANTS = '1'
 }
 
 if ($Ports) {
@@ -79,7 +88,7 @@ if ($Ports) {
     $env:VICTORY_PORT_JOURNAL = '1'
     $env:VICTORY_PORT_CONSTANTS = '1'
     $env:VICTORY_PORT_DESCRIPTORS = '1'
-    $mode = "$mode + PORT_*"
+    $mode = "$mode + PORT_DESCRIPTORS"
 }
 
 if ($PortCbv) {
@@ -110,7 +119,6 @@ if (-not (Test-Path -LiteralPath $game)) {
 
 $logDir = Join-Path $PSScriptRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHMMSS'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $logDir "run-v7-$stamp.log"
 New-Item -ItemType Directory -Force -Path $env:VICTORY_CACHE_DIR | Out-Null
@@ -126,7 +134,8 @@ VIctory rework v7 launch
   hud:      VICTORY_PANEL=1
   stack:    RELAY=2 JOIN_PARTS=$(if ($Safe) { 'off' } else { '8' }) UPLOAD_AHEAD=$(if ($Safe) { 'off' } else { '1' }) CARD_STEPS=2 TEXTURE_NO_WAIT=1 SHOW_AFTER=1
   thin:     $(if ($Safe) { 'off' } else { 'VICTORY_THIN=1  VICTORY_THIN_THREADS=6' })
-  ports:    $(if ($Ports) { 'GUARD=1 JOURNAL=1 CONSTANTS=1 DESCRIPTORS=1' } else { 'off (use -Ports to enable)' })
+  ports:    $(if ($Safe) { 'off' } elseif ($Ports) { 'GUARD=1 JOURNAL=1 CONSTANTS=1 DESCRIPTORS=1' } else { 'GUARD=1 JOURNAL=1 CONSTANTS=1 (DESCRIPTORS opt-in via -Ports)' })
+  nvidia:   $(if ($Safe) { 'defaults' } else { 'WAIT_RESIDENT=0  CARD_BUFFERS_MIN_MB=1' })
   output:   $(if ($Output) { $Output } else { 'title default (normal HUD scale)' })
   stats:    $log
   HEAD:     $((git -C $PSScriptRoot rev-parse --short HEAD))
