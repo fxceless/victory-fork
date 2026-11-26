@@ -953,7 +953,13 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// level so that the marked pass can have this one start anew:
 /// [`State::heap_buffers_marked`].)
 type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, Ranges)>>> =
+#[derive(Default)]
+struct BufferScan {
+    passes: u64,
+    ranges: Ranges,
+    span_index: Option<crate::descriptor::host::BufferSpanIndex>,
+}
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, BufferScan>>> =
     std::sync::Mutex::new(None);
 /// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
 /// keeps (`VICTORY_HEAP_PASS_MARKED`; nothing while that is unset).
@@ -979,8 +985,8 @@ fn heap_range_cache_forgets_both_passes() {
     {
         let mut ranges = RANGES.lock().unwrap();
         let heaps = ranges.get_or_insert_with(Default::default);
-        heaps.insert(id, (17, Ranges::new()));
-        heaps.insert(other, (3, Ranges::new()));
+        heaps.insert(id, BufferScan { passes: 17, ..Default::default() });
+        heaps.insert(other, BufferScan { passes: 3, ..Default::default() });
     }
     {
         let mut marked = MARKED.lock().unwrap();
@@ -2191,13 +2197,18 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let BufferScan { passes, ranges, span_index } = kept
             .get_or_insert_with(Default::default)
             .entry(host.id())
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
+        static INCREMENTAL_SPANS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let incremental_spans = *INCREMENTAL_SPANS.get_or_init(|| {
+            std::env::var_os("VICTORY_DESCRIPTOR_BUFFER_SPANS").is_some_and(|v| v == "1")
+        });
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
+            *span_index = None;
             host.buffer_slots()
         } else {
             changed
@@ -2209,7 +2220,12 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            if let Some((shadow, from, to)) = ranges.remove(&index)
+                && let Some(spans) = span_index
+                && !spans.remove(std::sync::Arc::as_ptr(&shadow) as usize, index, from, to)
+            {
+                *span_index = None;
+            }
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
@@ -2240,18 +2256,32 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(spans) = span_index {
+                spans.insert(std::sync::Arc::as_ptr(&shadow) as usize, index, &shadow, address, address + len);
+            }
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let spans = if incremental_spans {
+            span_index.get_or_insert_with(|| {
+                let mut spans = crate::descriptor::host::BufferSpanIndex::default();
+                for (&slot, (shadow, from, to)) in ranges.iter() {
+                    spans.insert(std::sync::Arc::as_ptr(shadow) as usize, slot, shadow, *from, *to);
+                }
+                spans
+            }).snapshot()
+        } else {
+            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            spans
+        };
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.

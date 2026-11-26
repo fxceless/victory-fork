@@ -14,6 +14,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod buffer_spans;
+pub(crate) type BufferSpanIndex = buffer_spans::BufferSpans<std::sync::Arc<crate::shadow::Shadow>>;
+
 /// The locks [`HostHeap::kept`] is spread over: slot `i` is behind lock
 /// `i % KEPT_PIECES`, at place `i / KEPT_PIECES`. Neighbouring slots are
 /// behind different locks on purpose: the recording threads take their
