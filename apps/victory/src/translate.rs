@@ -233,6 +233,35 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+struct FailureDumps {
+    dir: PathBuf,
+    counts: Mutex<BTreeMap<String, usize>>,
+}
+
+impl FailureDumps {
+    fn sample(&self, reason: &str, bytes: &[u8]) {
+        let slot = {
+            let mut counts = lock(&self.counts);
+            let count = counts.entry(reason.to_owned()).or_default();
+            if *count >= 3 {
+                return;
+            }
+            *count += 1;
+            *count - 1
+        };
+
+        let stem: String = reason
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(60)
+            .collect();
+        // Different reasons can have the same sanitized stem, including on Windows.
+        let hash = blake3::hash(reason.as_bytes());
+        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = std::fs::write(self.dir.join(format!("{stem}_{hash}_{slot}.cdxil")), bytes);
+    }
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -269,6 +298,11 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    // Keep the sample budget across files and workers for this invocation.
+    let dumps = std::env::var_os("VICTORY_FAIL_DUMP").map(|dir| FailureDumps {
+        dir: dir.into(),
+        counts: Mutex::default(),
+    });
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -299,7 +333,14 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(
+                                job,
+                                entry.path(),
+                                &seen,
+                                &mut t,
+                                &mut checks,
+                                dumps.as_ref(),
+                            );
                         }
                         lock(&total).merge(t);
                     });
@@ -393,6 +434,7 @@ fn translate(
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
+    dumps: Option<&FailureDumps>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -457,18 +499,13 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
-    // has them (`.cdxil`), to work on a translator gap offline
-    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> =
+        dumps.map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
-    if let (Some(dir), Some(before)) = (dump, before) {
+    if let (Some(dumps), Some(before)) = (dumps, before) {
         for (reason, (n, _)) in &t.failed {
-            let was = before.get(reason).copied().unwrap_or(0);
-            if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+            if *n > before.get(reason).copied().unwrap_or(0) {
+                dumps.sample(reason, &bytes);
             }
         }
     }
@@ -863,4 +900,36 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_dumps_share_slots_and_keep_distinct_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = FailureDumps {
+            dir: dir.path().to_owned(),
+            counts: Mutex::default(),
+        };
+
+        dumps.sample("unsupported!", b"first");
+        std::thread::scope(|scope| {
+            scope.spawn(|| dumps.sample("unsupported!", b"second"));
+            scope.spawn(|| dumps.sample("unsupported!", b"third"));
+        });
+        dumps.sample("unsupported!", b"over budget");
+        dumps.sample("unsupported?", b"other reason");
+
+        let mut samples: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        samples.sort_unstable();
+        assert_eq!(
+            samples.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            [b"first".as_slice(), b"other reason", b"second", b"third"]
+        );
+    }
 }
