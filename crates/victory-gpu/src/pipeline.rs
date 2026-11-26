@@ -374,6 +374,7 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
+    if no_draws() { return false; }
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
@@ -482,7 +483,7 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if no_draws() || this.is_null() {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -496,7 +497,7 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// comparison of the nine words.
 #[cfg(windows)]
 pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if no_draws() || this.is_null() {
         return None;
     }
     let p = &pipeline(this).host;
@@ -504,6 +505,20 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
         return make::for_formats(p, bound);
     }
     make::ready(p)
+}
+
+/// Diagnostic ceiling test: suppress title graphics and compute pipelines.
+/// This changes simulation and GPU-dependent behavior, not just presentation.
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: diagnostic only; title graphics and compute suppressed");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -618,7 +633,7 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
-    let builder = of_builder(&shaders);
+    let builder = !no_draws() && of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -877,6 +892,37 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_no_draws_suppresses_title_pipeline_lookups() {
+        const CHILD: &str = "VICTORY_TEST_NO_DRAWS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pipeline::tests::diagnostic_no_draws_suppresses_title_pipeline_lookups", "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_NO_DRAWS", "1")
+                .env("VICTORY_BVH_BUILDER", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(no_draws());
+        let bytes = [1u8, 2, 3];
+        let shader = copy("compute", &Bytecode {
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        }).unwrap();
+        let mut p = std::ptr::null();
+        assert_eq!(hand_out(vec![shader.clone()], None, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert!(host_pipeline(p).is_none());
+        assert!(host_pipeline_for(p, &[26, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(!builder_runs());
+        assert_eq!(making(), 0);
+        assert!(shader.translated.get().is_none());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
     #[test]
