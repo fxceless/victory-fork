@@ -478,7 +478,7 @@ fn split_late() -> bool {
         1 => true,
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == victory_gpu::alt_on_phase();
             static LAST: AtomicU8 = AtomicU8::new(2);
             if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
                 tracing::info!(

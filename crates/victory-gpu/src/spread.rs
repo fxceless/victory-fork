@@ -197,7 +197,7 @@ pub(crate) fn start() {
             let mut said = String::new();
             let mut last = None;
             loop {
-                let wide = mode() == 1 || (epoch.elapsed().as_secs() / 20) % 2 == 1;
+                let wide = mode() == 1 || (epoch.elapsed().as_secs() / 20) % 2 == crate::alt_on_phase();
                 if mode() == 2 && last != Some(wide) {
                     tracing::info!(
                         "the title's crowded thread groups run on more processors from now (VICTORY_SPREAD=alt): {}",

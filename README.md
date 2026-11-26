@@ -480,7 +480,10 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
   `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
   `=alt` form (twenty seconds on, twenty off, each change said in the
-  log) so that one run measures both in the same scene.
+  log) so that one run measures both in the same scene. In a scripted
+  scene the two halves fall on the same stretches in every launch:
+  `VICTORY_ALT_FLIP=1` swaps them, and the mean of a launch each way has
+  the scene's own difference taken out.
 
 **Update, the same night: the first room now renders right on the test
 machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
