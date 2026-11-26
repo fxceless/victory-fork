@@ -528,6 +528,18 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .any(|c| expected(&scene, c, true) != expected(&scene, c, false)),
         "no case tells sorted from unsorted"
     );
+    check_batches(&shader, &scene, &batches, pointers, |case| {
+        expected(&scene, case, sort)
+    });
+}
+
+fn check_batches(
+    shader: &HostShader,
+    scene: &Scene,
+    batches: &[Vec<Case>],
+    pointers: u64,
+    expected_result: impl Fn(&Case) -> [u32; 4],
+) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -538,10 +550,10 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             continue;
         };
         let (root, pso) = host
-            .compute_pipeline(&shader)
+            .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         for (b, batch) in batches.iter().enumerate() {
-            let data = buffer(&scene, batch, pointers);
+            let data = buffer(scene, batch, pointers);
             let out = host
                 .dispatch(
                     &root,
@@ -562,12 +574,8 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
-                let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
-                    // A thread past the batch: its record is zeros, so it
-                    // is masked out.
-                    None => BEFORE,
-                };
+                // A thread past the batch has a zero record and is masked out.
+                let want = expected_result(&case);
                 let got = &out[0][4 * t..4 * t + 4];
                 assert_eq!(
                     got,
@@ -658,22 +666,51 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
-/// With `VICTORY_BVH_NO_HIT=1` a node test over title memory lowers and
-/// validates, and reads nothing: the program asks the host neither for the
-/// directory of title memory nor for the list of pages it found no copy
-/// of, which it does without the switch (the test above).
+/// With `VICTORY_BVH_NO_HIT=1` check the returned box children, triangle
+/// misses and masked lanes on the card with no scene memory bound.
 #[test]
 fn a_node_test_that_answers_no_hit_reads_nothing() {
+    // Translate with the launch settings in isolated processes. The builder
+    // takes precedence when both switches are set.
+    const CHILD: &str = "TEST_BVH_NO_HIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for builder in ["0", "1"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_BVH_NO_HIT", "1")
+                .env("VICTORY_BVH_BUILDER", builder)
+                .status()
+                .unwrap();
+            assert!(status.success(), "VICTORY_BVH_BUILDER={builder}");
+        }
+        return;
+    }
+    let builder_on = std::env::var("VICTORY_BVH_BUILDER").unwrap() == "1";
+    let (mut scene, batches) = scene();
+    // Keep the pointer offsets and ray records, but supply no node bytes or
+    // directory. The input buffer ends immediately after the lane records.
+    scene.words.clear();
     for wide in [true, false] {
-        super::lower::intersect::TEST_NO_HIT.set(true);
-        let built = build(wide, WHOLE);
-        super::lower::intersect::TEST_NO_HIT.set(false);
-        let (shader, _) = built.expect("lowers with no hit");
+        let descriptor = if wide {
+            WHOLE
+        } else {
+            Descriptor::Numbers((BASE >> 8) as u32, bvh::BOX_SORT)
+        };
+        let (shader, _) = build(wide, descriptor).expect("the program lowers");
+        if builder_on {
+            assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+            assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+            continue;
+        }
         assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
-        // And with it off again, as before.
-        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
-        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        let pointers = if wide { BASE } else { 0 };
+        check_batches(&shader, &scene, &batches, pointers, |case| match case {
+            Some((_, 4 | 5, _)) => [bvh::NONE; 4],
+            Some(_) => bvh::MISS.map(f32::to_bits),
+            None => BEFORE,
+        });
     }
 }
 
