@@ -112,6 +112,10 @@ enum Kind {
     /// `buffer_load_dword` (idxen, element 1): a structured read, lowered
     /// to a raw SRV read at element times the slot's stride.
     StructuredSrv,
+    /// [`Kind::StructuredSrv`] with a 12-byte stride on the same raw host
+    /// SRV: at stride 4 an element and a dword are one step, so this is the
+    /// control that element 1 is read at byte 12, not at byte 4.
+    StructuredSrv12,
     /// `s_buffer_load_dword` of a slot whose stride is 0: a constant buffer.
     Cbv,
     /// `s_buffer_load_dword` of a slot with a buffer stride: a raw SRV. Out
@@ -145,6 +149,7 @@ impl Kind {
     fn stride(self) -> u32 {
         match self {
             Kind::RawUav | Kind::RawSrv | Kind::StructuredSrv | Kind::ScalarRawSrv => 4,
+            Kind::StructuredSrv12 => 12,
             Kind::TypedSrv => 16,
             _ => 0,
         }
@@ -173,7 +178,7 @@ impl Kind {
             }
             Kind::TypedSrv => w.extend(mubuf(0x00, 2, 0, 8, false, true)),
             Kind::RawSrv => w.extend(mubuf(0x0C, 2, 0, 8, true, false)),
-            Kind::StructuredSrv => {
+            Kind::StructuredSrv | Kind::StructuredSrv12 => {
                 w.push(v_mov_b32(0, 0x81)); // element 1
                 w.extend(mubuf(0x0C, 2, 0, 8, false, true));
             }
@@ -308,6 +313,9 @@ impl Contents {
                 // Element 1 holds the value: a read at element 0 (no
                 // stride) gives a value no case accepts.
                 Kind::StructuredSrv => vec![0xBAD, value(j), 0xBAD, 0xBAD],
+                // Element 1 at a 12-byte stride is byte 12; byte 4 (a step
+                // of one dword) holds a sentinel no case accepts.
+                Kind::StructuredSrv12 => vec![0xBAD, 0xBAD, 0xBAD, value(j), 0xBAD, 0xBAD],
                 _ => vec![value(j); 4],
             })
             .collect();
@@ -328,10 +336,12 @@ impl Contents {
                     data,
                     stride: Stride::Typed,
                 },
-                Kind::RawSrv | Kind::StructuredSrv | Kind::ScalarRawSrv => View::Buffer {
-                    data,
-                    stride: Stride::Raw,
-                },
+                Kind::RawSrv | Kind::StructuredSrv | Kind::StructuredSrv12 | Kind::ScalarRawSrv => {
+                    View::Buffer {
+                        data,
+                        stride: Stride::Raw,
+                    }
+                }
                 Kind::Cbv => View::Cbv(data),
                 Kind::TextureSrv => View::Texture(1, 1, &self.texels[j]),
                 Kind::TextureUav => View::TextureUav(1, 1),
@@ -588,6 +598,13 @@ fn raw_buffer_srv_load_meets_a_raw_srv_guard() {
 #[test]
 fn structured_buffer_load_meets_a_raw_srv_guard() {
     check(Kind::StructuredSrv);
+}
+
+/// The element step is the slot's stride, not a dword: element 1 of a
+/// 12-byte stride reads byte 12.
+#[test]
+fn structured_buffer_load_at_a_12_byte_stride_meets_a_raw_srv_guard() {
+    check(Kind::StructuredSrv12);
 }
 
 #[test]
