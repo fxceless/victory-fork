@@ -99,6 +99,7 @@ mod imp {
     use std::sync::{LazyLock, Mutex};
 
     use victory_pe::ImportSymbol;
+    use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
     };
@@ -120,23 +121,98 @@ mod imp {
         proc.map(|f| f as *const () as usize)
     }
 
-    fn module(dll: &str) -> Option<usize> {
+    /// Resolves and caches a module handle without holding `cache` across
+    /// `load` (calling `LoadLibraryExA` under `MODULES` would invert lock order
+    /// with the Windows OS loader lock and self-deadlock on re-entrant hooks).
+    fn module_with(
+        cache: &Mutex<HashMap<String, usize>>,
+        dll: &str,
+        load: impl FnOnce(&str) -> usize,
+        free: impl FnOnce(usize),
+    ) -> Option<usize> {
         let key = dll.to_ascii_lowercase();
-        let mut cache = MODULES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&m) = cache.get(&key) {
+        if let Some(&m) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Some(m);
         }
-        let name = CString::new(key.as_str()).ok()?;
-        // System32 only: never pick up a same-named DLL from the current folder or PATH.
-        // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
-        let handle = unsafe {
-            LoadLibraryExA(
-                name.as_ptr().cast(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        } as usize;
-        (handle != 0).then(|| *cache.entry(key).or_insert(handle))
+        let handle = load(&key);
+        if handle == 0 {
+            return None;
+        }
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let chosen = *guard.entry(key).or_insert(handle);
+        drop(guard);
+        if chosen != handle {
+            free(handle);
+        }
+        Some(chosen)
+    }
+
+    fn module(dll: &str) -> Option<usize> {
+        module_with(
+            &MODULES,
+            dll,
+            |key| {
+                let Ok(name) = CString::new(key) else {
+                    return 0;
+                };
+                // System32 only: never pick up a same-named DLL from the current folder or PATH.
+                // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
+                let handle = unsafe {
+                    LoadLibraryExA(
+                        name.as_ptr().cast(),
+                        std::ptr::null_mut(),
+                        LOAD_LIBRARY_SEARCH_SYSTEM32,
+                    )
+                };
+                handle as usize
+            },
+            |handle| {
+                // SAFETY: redundant handle from `LoadLibraryExA` after another thread populated the slot.
+                unsafe { FreeLibrary(handle as _) };
+            },
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn module_with_releases_lock_during_load_and_frees_raced_duplicate() {
+            let cache: Mutex<HashMap<String, usize>> = Mutex::default();
+            cache.lock().unwrap().insert("already.dll".into(), 0x1111);
+
+            // Re-entrant lookup during `load` must not deadlock.
+            let mut freed = Vec::new();
+            let got = module_with(
+                &cache,
+                "Fresh.DLL",
+                |_| {
+                    assert_eq!(
+                        module_with(&cache, "already.dll", |_| unreachable!(), |_| unreachable!()),
+                        Some(0x1111)
+                    );
+                    0x2222
+                },
+                |h| freed.push(h),
+            );
+            assert_eq!(got, Some(0x2222));
+            assert!(freed.is_empty());
+
+            // If another thread inserts the same key while `load` runs, return
+            // the existing handle and free the redundant newly loaded handle.
+            let got = module_with(
+                &cache,
+                "Raced.DLL",
+                |k| {
+                    cache.lock().unwrap().insert(k.to_owned(), 0x3333);
+                    0x4444
+                },
+                |h| freed.push(h),
+            );
+            assert_eq!(got, Some(0x3333));
+            assert_eq!(freed, vec![0x4444]);
+        }
     }
 }
 

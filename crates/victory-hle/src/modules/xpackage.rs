@@ -136,6 +136,15 @@ extern "system" fn register_progress(
     put(out, token())
 }
 
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
+
 /// 0: ready.
 // shortcut: every selector counts as installed, including ones the
 // package's layout does not have (the console answers those with an
@@ -279,7 +288,7 @@ static VTABLE: Methods<40> = Methods([
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
@@ -367,5 +376,28 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+
+        // Progress registration and its paired bool-returning unregistration (0x48 / 0x50).
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        let mut tok = 0u64;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x48)(
+                this,
+                monitor(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut tok,
+            ),
+            S_OK
+        );
+        assert_ne!(tok, 0);
+        assert!(method::<Unregister>(&OBJECT, 0x50)(this, monitor(), tok, true));
     }
 }
