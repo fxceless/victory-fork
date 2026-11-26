@@ -4887,6 +4887,29 @@ fn spread_lean_on() -> bool {
     }
 }
 
+/// Looks up `key` in `cache`, calling `create` outside the mutex on a miss
+/// so slow driver `CreateCommandSignature` calls never block other recording
+/// threads on the cache lock.
+fn cached_command_signature<K: Copy + Eq, V: Clone>(
+    cache: &std::sync::Mutex<Vec<(K, V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<V>,
+) -> Option<V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(s.clone());
+        }
+    }
+    let created = create()?;
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    made.push((key, created.clone()));
+    Some(created)
+}
+
 /// The command signature of a spread dispatch: two root constants (row,
 /// asked x) at `index` of root parameter `param`, then the dispatch; 20
 /// bytes a record (the clamp's spread layout). Made once per root
@@ -4896,77 +4919,69 @@ fn host_spread_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> 
     type Key = (usize, u32, u32);
     static MADE: std::sync::Mutex<Vec<(Key, ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
     let key = (root.as_raw() as usize, param, index);
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
-        return Some(s.clone());
-    }
-    let args = [
-        D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
-            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-                    RootParameterIndex: param,
-                    DestOffsetIn32BitValues: index,
-                    Num32BitValuesToSet: 2,
+    cached_command_signature(&MADE, key, || {
+        let args = [
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: param,
+                        DestOffsetIn32BitValues: index,
+                        Num32BitValuesToSet: 2,
+                    },
                 },
             },
-        },
-        D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-            ..Default::default()
-        },
-    ];
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: 20,
-        NumArgumentDescs: args.len() as u32,
-        pArgumentDescs: args.as_ptr(),
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: two valid argument descriptions and a live root signature.
-    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, Some(root), &mut signature) };
-    if let Err(e) = result {
-        once!(error = %e, param, index, "spread command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push((key, signature.clone()));
-    Some(signature)
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            },
+        ];
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 20,
+            NumArgumentDescs: args.len() as u32,
+            pArgumentDescs: args.as_ptr(),
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: two valid argument descriptions and a live root signature.
+        let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, Some(root), &mut signature) };
+        if let Err(e) = result {
+            once!(error = %e, param, index, "spread command signature refused");
+            return None;
+        }
+        signature
+    })
 }
 
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    cached_command_signature(&MADE, (kind, stride), || {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        signature
+    })
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -5363,5 +5378,33 @@ mod tests {
         assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
         // No thread along an axis: nothing runs.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+
+    #[test]
+    fn command_signature_cache_creates_outside_lock() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let cache = Arc::new(Mutex::new(vec![(1u32, 100u32)]));
+        let in_create = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+
+        let cache_bg = Arc::clone(&cache);
+        let in_create_bg = Arc::clone(&in_create);
+        let proceed_bg = Arc::clone(&proceed);
+        let handle = std::thread::spawn(move || {
+            cached_command_signature(&cache_bg, 2, || {
+                in_create_bg.wait();
+                proceed_bg.wait();
+                Some(200)
+            })
+        });
+
+        // Wait until the worker is inside `create`, then verify another thread
+        // can still read an existing key from `cache` without blocking.
+        in_create.wait();
+        assert_eq!(cached_command_signature(&cache, 1, || unreachable!()), Some(100));
+        proceed.wait();
+
+        assert_eq!(handle.join().unwrap(), Some(200));
+        assert_eq!(cached_command_signature(&cache, 2, || unreachable!()), Some(200));
     }
 }
