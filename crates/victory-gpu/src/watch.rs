@@ -760,7 +760,10 @@ fn known_view(start: usize) -> bool {
         return true;
     }
     let g = guards();
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    g.protected.contains(&first)
+        || g.absent.contains(&first)
+        || g.pinned.contains_key(&first)
+        || (view_known() && g.viewed.contains(&first))
 }
 
 struct Guards {
@@ -789,6 +792,13 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
+    /// With [`pin_config`] (`VICTORY_WATCH_PIN=<N>`): consecutive opens/faults
+    /// for non-aliased blocks without surviving clean across a check (#1238).
+    hot_streak: BTreeMap<usize, u16>,
+    /// With [`pin_config`]: hot blocks temporarily left `PAGE_READWRITE` and
+    /// reported dirty without `VirtualProtect` re-arming, mapped to remaining
+    /// checks before re-probing with `PAGE_READONLY` (#1238).
+    pinned: BTreeMap<usize, u16>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -840,7 +850,49 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
+    hot_streak: BTreeMap::new(),
+    pinned: BTreeMap::new(),
 });
+
+/// Opt-in hot-block pinning (`VICTORY_WATCH_PIN=<N>`, off by default; #1238):
+/// non-aliased blocks that fault `N` consecutive times without surviving clean
+/// stay `PAGE_READWRITE` and report dirty for `VICTORY_WATCH_PIN_LEASE` checks
+/// (default 32) before one `PAGE_READONLY` re-probe checks whether they cooled.
+/// Returns `(threshold, lease)` where `threshold == 0` disables pinning.
+#[cfg(test)]
+static TEST_PIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn pin_config() -> (u16, u16) {
+    #[cfg(test)]
+    {
+        let ov = TEST_PIN.load(std::sync::atomic::Ordering::Relaxed);
+        if ov != 0 {
+            return ((ov >> 16) as u16, (ov & 0xffff) as u16);
+        }
+    }
+    static CFG: std::sync::OnceLock<(u16, u16)> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let threshold = std::env::var("VICTORY_WATCH_PIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(0);
+        let lease = std::env::var("VICTORY_WATCH_PIN_LEASE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .map_or(32, |n| n.clamp(1, 1024));
+        if threshold > 0 {
+            tracing::info!(
+                threshold,
+                lease,
+                "watch hot-block pinning enabled (VICTORY_WATCH_PIN, #1238)"
+            );
+        }
+        (threshold, lease)
+    })
+}
+
+/// Counts `VirtualProtect` re-arm cycles skipped by hot-block pinning (#1238).
+static PIN_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -1445,12 +1497,16 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        g.protected.contains(&first)
+            || g.absent.contains(&first)
+            || g.pinned.contains_key(&first)
+            || (view_known() && g.viewed.contains(&first))
     };
     if !known && !is_view(start, end) {
         return None;
     }
     install();
+    let (pin_threshold, _) = pin_config();
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -1463,6 +1519,12 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
+        if !g.hot_streak.is_empty() {
+            let cooled: Vec<usize> = g.hot_streak.range(first..last).map(|(&b, _)| b).collect();
+            for b in cooled {
+                g.hot_streak.remove(&b);
+            }
+        }
         return Some(written);
     }
     let mut next_clean = 0;
@@ -1472,6 +1534,9 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        if is_clean && !g.hot_streak.is_empty() {
+            g.hot_streak.remove(&block);
+        }
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Found uncommitted a moment ago ([`absent_once`]): Windows is
@@ -1506,6 +1571,23 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if pin_threshold > 0 && let Some(rem) = g.pinned.get_mut(&block) {
+                if *rem > 0 {
+                    *rem -= 1;
+                    PIN_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Keep pinned block PAGE_READWRITE (no VirtualProtect re-arm
+                    // or fault next frame); flush any preceding unpinned run.
+                    if let Some(from) = run.take() {
+                        protect(&mut g, from, block);
+                    }
+                    continue;
+                }
+                // Lease expired: re-probe once with PAGE_READONLY; if it faults
+                // immediately it re-pins on the next open, else it stays clean.
+                g.pinned.remove(&block);
+                g.hot_streak.insert(block, pin_threshold.saturating_sub(1));
+                run.get_or_insert(block);
+                continue;
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1513,6 +1595,20 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
+        }
+    }
+    if pin_threshold > 0 {
+        static PIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if (PIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
+            let skips = PIN_SKIPS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let active = g.pinned.len();
+            if skips > 0 || active > 0 {
+                tracing::info!(
+                    skips,
+                    active_pinned = active,
+                    "watch hot-block pinning: VirtualProtect re-arms skipped in last 65536 checks (VICTORY_WATCH_PIN)"
+                );
+            }
         }
     }
     Some(written)
@@ -1718,7 +1814,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
             }
         }
     }
-    let any = open_here(g, start, end);
+    let any = open_here(g, start, end, true);
     if start >= end || g.aliased.is_empty() {
         return any;
     }
@@ -1726,7 +1822,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK), false) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1737,19 +1833,27 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
+fn open_here(g: &mut Guards, start: usize, end: usize, record_hot: bool) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    let (pin_threshold, pin_lease) = if record_hot { pin_config() } else { (0, 0) };
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
         PUBLISHED.clear(block);
+        if pin_threshold > 0 && !g.aliased.contains(&block) {
+            let streak = g.hot_streak.entry(block).or_insert(0);
+            *streak = streak.saturating_add(1);
+            if *streak >= pin_threshold {
+                g.pinned.insert(block, pin_lease);
+            }
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1889,7 +1993,19 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         }
     }
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+        let end = at.saturating_add(n);
+        if !g.pinned.is_empty() || !g.hot_streak.is_empty() {
+            let r = at / BLOCK..end.div_ceil(BLOCK);
+            let pinned: Vec<usize> = g.pinned.range(r.clone()).map(|(&b, _)| b).collect();
+            for b in pinned {
+                g.pinned.remove(&b);
+            }
+            let hot: Vec<usize> = g.hot_streak.range(r).map(|(&b, _)| b).collect();
+            for b in hot {
+                g.hot_streak.remove(&b);
+            }
+        }
+        if open_here(&mut g, at, end, false) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2012,6 +2128,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
+    if !g.pinned.is_empty() || !g.hot_streak.is_empty() {
+        let r = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+        let pinned: Vec<usize> = g.pinned.range(r.clone()).map(|(&b, _)| b).collect();
+        for b in pinned {
+            g.pinned.remove(&b);
+        }
+        let hot: Vec<usize> = g.hot_streak.range(r).map(|(&b, _)| b).collect();
+        for b in hot {
+            g.hot_streak.remove(&b);
+        }
+    }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
         // `unmap`): a range it has just mapped a section's pages into,
@@ -2069,9 +2196,10 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // The switch is read here, not first in the handler ([`open`] asks
-    // it): reading the environment allocates.
+    // The switches are read here, not first in the handler ([`open`] asks
+    // them): reading the environment allocates.
     light_kept();
+    pin_config();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
@@ -3001,6 +3129,95 @@ mod tests {
         BITS.set(1 << 40);
         BITS.clear(1 << 40);
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    /// Hot-block pinning (`VICTORY_WATCH_PIN`, #1238): a repeatedly-written
+    /// view block stays `PAGE_READWRITE` for its lease without re-arming or
+    /// faulting, continues reporting dirty, re-arms once the lease expires,
+    /// returns clean when writes stop, and clears cleanly on remap.
+    #[test]
+    fn hot_block_pinning_skips_reprotect_and_cools_down() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        // threshold = 2, lease = 3
+        struct ResetPin;
+        impl Drop for ResetPin {
+            fn drop(&mut self) {
+                TEST_PIN.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        TEST_PIN.store((2u32 << 16) | 3, std::sync::atomic::Ordering::Relaxed);
+        let _reset = ResetPin;
+
+        // SAFETY: fresh 1-block mapped section, unmapped and closed below.
+        let (sec, base) = unsafe {
+            let sec = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!sec.is_null());
+            let view = MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, BLOCK);
+            assert!(!view.Value.is_null());
+            (sec, view.Value as usize)
+        };
+        let block = base / BLOCK;
+
+        // First guard arms PAGE_READONLY and reports dirty.
+        assert_eq!(guard_at(base, base + BLOCK, 0, 0), Some(vec![block]));
+        assert!(guards().protected.contains(&block));
+
+        // Fault 1 -> streak = 1 (below threshold 2), re-arms on next guard_at.
+        // SAFETY: mapped view memory; VEH opens the guard.
+        unsafe { (base as *mut u8).write_volatile(1) };
+        assert!(!guards().protected.contains(&block));
+        assert_eq!(guards().hot_streak.get(&block), Some(&1));
+        assert!(!guards().pinned.contains_key(&block));
+        assert_eq!(guard_at(base, base + BLOCK, 0, 0), Some(vec![block]));
+        assert!(guards().protected.contains(&block));
+
+        // Fault 2 -> streak = 2 (hits threshold) -> pinned with lease 3!
+        // SAFETY: mapped view memory.
+        unsafe { (base as *mut u8).write_volatile(2) };
+        assert_eq!(guards().pinned.get(&block), Some(&3));
+
+        // Next 3 guard_at calls report dirty WITHOUT re-protecting (stays PAGE_READWRITE).
+        for rem in [2u16, 1, 0] {
+            assert_eq!(guard_at(base, base + BLOCK, 0, 0), Some(vec![block]));
+            assert!(!guards().protected.contains(&block), "pinned block should stay unprotected");
+            assert_eq!(guards().pinned.get(&block), Some(&rem));
+            // Writing while pinned succeeds directly with no guard to open.
+            // SAFETY: mapped view memory.
+            unsafe { (base as *mut u8).write_volatile(3 + rem as u8) };
+        }
+
+        // Next guard_at sees lease == 0 -> re-probes once with PAGE_READONLY.
+        assert_eq!(guard_at(base, base + BLOCK, 0, 0), Some(vec![block]));
+        assert!(guards().protected.contains(&block), "re-probe should re-arm PAGE_READONLY");
+        assert!(!guards().pinned.contains_key(&block));
+
+        // No write happens (block cooled down) -> guard_at returns empty & clears streak!
+        assert_eq!(guard_at(base, base + BLOCK, 0, 0), Some(Vec::new()));
+        assert!(!guards().hot_streak.contains_key(&block));
+
+        // Remap cleans up state before unmapping.
+        title_memory_remapped(base, BLOCK);
+        assert!(!guards().protected.contains(&block));
+        assert!(!guards().pinned.contains_key(&block));
+        assert!(!guards().hot_streak.contains_key(&block));
+
+        // SAFETY: clean up section view and handle.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: base as *mut _,
+            });
+            CloseHandle(sec);
+        }
     }
 }
 
