@@ -3092,6 +3092,31 @@ mod tests {
     /// then read back from the host GPU.
     #[cfg(windows)]
     #[test]
+    fn reset_list_does_not_repeat_a_texture_readback() {
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut image = null;
+        let rgba = texture(4, 4, 28, 1);
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &rgba, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let pixel = resource(image).data();
+        let list = host.new_list().unwrap();
+        // SAFETY: the committed texture owns the first pixel for both submissions.
+        unsafe { pixel.write(0x5a) };
+        list.queue_texture_readback(image);
+        list.close();
+        host.execute(&[&list]);
+        // D3D12 zero-initializes this committed texture. The first readback landed.
+        assert_eq!(unsafe { pixel.read() }, 0);
+        list.reset();
+        unsafe { pixel.write(0xa5) };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(unsafe { pixel.read() }, 0xa5);
+        resource_release(image);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
