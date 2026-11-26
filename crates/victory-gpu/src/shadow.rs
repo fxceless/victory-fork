@@ -267,6 +267,11 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Title buffers big enough for a copy in the card's memory turned down
+/// because the copies made already hold the most [`card_limits`] allows,
+/// since the start, and their bytes (counted only).
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -410,6 +415,24 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said, as the turn-downs for room are: with the copies at the most
+        // `VICTORY_CARD_BUFFERS_MB` allows (512 MB under a 12 GiB budget),
+        // later big buffers stayed in the PC's memory and were compared on
+        // the CPU with no line telling why (162 MB a frame on an RTX 5070).
+        let n = CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB \
+                 (VICTORY_CARD_BUFFERS_MB); {} buffers turned down so far for it ({} MB), frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
