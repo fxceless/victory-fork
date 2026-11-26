@@ -203,6 +203,70 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     Ok(Translated { host, used, stores })
 }
 
+/// The vertex and geometry shaders of a pipeline with a geometry stage: the
+/// title's "vertex" container is the ES half of a merged ES+GS stage and its
+/// "geometry" container the GS half, so the two are translated together
+/// (`victory_shader::emit::translate_merged_gs`) into a host vertex shader
+/// and a host geometry shader. Each is a [`Shader`] with its translation
+/// already made.
+///
+/// Kept by the two containers' hashes, not by the cache of single
+/// translations: two pipelines that share a geometry container with other
+/// ES containers (other records, other user data) are two pairs.
+/// shortcut: in memory only, a pair is translated again at each start.
+#[cfg(windows)]
+pub(crate) fn merged_pair(es: &Shader, gs: &Shader) -> Result<(Arc<Shader>, Arc<Shader>), String> {
+    type Pair = Result<(Arc<Shader>, Arc<Shader>), String>;
+    static PAIRS: Mutex<Option<HashMap<(String, String), Pair>>> = Mutex::new(None);
+    let key = (es.hash.clone(), gs.hash.clone());
+    let lookup = |pairs: &Mutex<Option<HashMap<(String, String), Pair>>>| {
+        pairs.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned())
+    };
+    if let Some(done) = lookup(&PAIRS) {
+        return done;
+    }
+    // (the translation depends on it, as for a single shader)
+    crate::descriptor::host::probe_view_limit();
+    let made = victory_shader::emit::translate_merged_gs(&es.container, &gs.container)
+        .map_err(|e| e.to_string())
+        .map(|m| {
+            let hash = format!("{}+{}", es.hash, gs.hash);
+            let shader = |stage, host, native: &victory_shader::NativeProgram| {
+                let translated = OnceLock::new();
+                let _ = translated.set(Some(Translated {
+                    host,
+                    used: native.used.clone(),
+                    stores: stores(native),
+                }));
+                Arc::new(Shader {
+                    stage,
+                    hash: hash.clone(),
+                    container: Vec::new(),
+                    translated,
+                })
+            };
+            (
+                shader("vertex", m.vertex, &m.vertex_native),
+                shader("geometry", m.geometry, &m.geometry_native),
+            )
+        });
+    match &made {
+        Ok(_) => tracing::info!(es = %es.hash, gs = %gs.hash, "geometry stage translated"),
+        Err(e) => tracing::warn!(
+            es = %es.hash,
+            gs = %gs.hash,
+            error = %e,
+            "geometry stage does not translate; its pipelines' draws are dropped"
+        ),
+    }
+    PAIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, made.clone());
+    made
+}
+
 /// The compute pipelines of the console's ray-tracing structure builder
 /// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
 /// user-data table) run **all or none**. Its stages feed each other

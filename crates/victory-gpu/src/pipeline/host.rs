@@ -529,23 +529,40 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        // A geometry stage is the GS half of a merged ES+GS stage whose ES
+        // half is the "vertex" container: the two are translated together
+        // into a vertex and a geometry shader (`merged_pair`).
+        let merged = match find("geometry") {
+            None => None,
+            Some(_) if mesh.is_some() => {
+                return refuse("a geometry shader with a mesh shader", shaders);
+            }
+            Some(gs) => {
+                let Some(es) = find("vertex") else {
+                    return refuse("a geometry shader without the vertex shader of its stage", shaders);
+                };
+                // (the failure is logged by `merged_pair`, once per pair)
+                Some(super::merged_pair(es, gs).ok()?)
+            }
+        };
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
-            let first = match (mesh, find("vertex")) {
+            let first = match (mesh, merged.as_ref().map(|m| &m.0).or(find("vertex"))) {
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
+            stages.extend(merged.as_ref().map(|m| (&m.1, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
@@ -793,6 +810,22 @@ impl HostPipeline {
         // that completes each one from the three vertices the vertex
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
+        // A translated geometry stage takes triangles in (its emission is
+        // triangles in, a triangle strip out): the title's topology is used
+        // as it gives it, and any other is refused.
+        if merged.is_some() && g.topology.0 != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 {
+            return refuse("a geometry stage on a topology other than triangles", shaders);
+        }
+        let visible = |v: D3D12_SHADER_VISIBILITY| {
+            stages.iter().position(|(_, vis)| vis.0 == v.0).map_or(D3D12_SHADER_BYTECODE::default(), code)
+        };
+        let merged_codes = merged.as_ref().map(|_| {
+            [
+                code_bytes(&visible(D3D12_SHADER_VISIBILITY_VERTEX)),
+                code_bytes(&visible(D3D12_SHADER_VISIBILITY_PIXEL)),
+                code_bytes(&visible(D3D12_SHADER_VISIBILITY_GEOMETRY)),
+            ]
+        });
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
@@ -805,9 +838,9 @@ impl HostPipeline {
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            VS: visible(D3D12_SHADER_VISIBILITY_VERTEX),
+            PS: visible(D3D12_SHADER_VISIBILITY_PIXEL),
+            GS: rect_gs.as_ref().map_or(visible(D3D12_SHADER_VISIBILITY_GEOMETRY), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -843,6 +876,12 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
                 &state,
             ),
+            // The title's own geometry stage, translated with its vertex
+            // stage: a name of its own too.
+            None if merged_codes.is_some() => {
+                let [vs, ps, gs] = merged_codes.as_ref().unwrap();
+                super::library::name("graphics geometry", &root_blob, &[vs, ps, gs], &state)
+            }
             None => super::library::name(
                 "graphics",
                 &root_blob,
@@ -1203,6 +1242,41 @@ mod tests {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         }
+    }
+
+    /// A title pipeline with a geometry stage gets a host pipeline of a vertex,
+    /// a geometry and a pixel stage, from the two containers of the merged
+    /// stage translated together; other topologies than triangles are refused.
+    #[test]
+    fn a_geometry_pipeline_is_made_from_the_pair_of_containers() {
+        let Some(_host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let (es, gs) = victory_shader::synthetic::merged_stage();
+        let ps = victory_shader::synthetic::pixel_container();
+        let shaders = [
+            super::super::shader("vertex", &es),
+            super::super::shader("geometry", &gs),
+            super::super::shader("pixel", &ps),
+        ];
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let p = HostPipeline::new(&shaders, Some(&g)).expect("a host pipeline");
+        let stages: Vec<_> = p.stages.iter().map(|s| s.shader.stage).collect();
+        assert_eq!(stages, ["vertex", "geometry", "pixel"]);
+        assert!(!p.rects && !p.compute && !p.mesh);
+        // The pair is translated once, whatever pipelines use it.
+        let again = HostPipeline::new(&shaders, Some(&g)).expect("again");
+        assert!(Arc::ptr_eq(&p.stages[1].shader, &again.stages[1].shader));
+        // A geometry stage takes triangles only.
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(HostPipeline::new(&shaders, Some(&g)).is_none());
+        // Without the vertex container of its stage it is refused too.
+        assert!(HostPipeline::new(&shaders[1..], Some(&g)).is_none());
     }
 
     /// A mesh pipeline made once is loaded from the library the next time,

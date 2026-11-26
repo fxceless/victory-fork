@@ -82,6 +82,7 @@
 
 mod bitcode;
 mod container;
+pub(crate) mod gs;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -297,8 +298,18 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// What [`emit`] reports for a geometry program (the GS half of a merged
+/// ES+GS stage, [`crate::merged`]): everything before emission handles it,
+/// but a geometry program alone is not emitted: its input vertices and the
+/// runtime table come from the ES half, so only a pair is
+/// ([`translate_merged_gs`], `gs.rs`).
+pub const GS_EMIT: &str = "GS emit";
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container. A geometry container on its own does not translate:
+/// the runtime table in its first user-data dwords is the merged stage's,
+/// which only a pair ([`translate_merged_gs`]) can tell from a root
+/// parameter of the ES half.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -325,21 +336,170 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
+    translate_native(&c, &native, false)
+}
+
+/// The two halves of a merged geometry stage, from the vertex container the
+/// ES program is in and the geometry container: paired
+/// ([`crate::merged::pair_es_gs`]), the ES half traced, raised and
+/// structured as the stage runs it (with the merged layout), and the record
+/// it writes matched with the vertex reads of the GS half
+/// ([`crate::handoff::handoff`]).
+pub fn merged_halves(
+    es: &[u8],
+    gs: &[u8],
+) -> Result<(crate::merged::MergedGs, crate::handoff::Handoff), ShaderError> {
+    let stage_of = |bytes: &[u8], stage| -> Result<NativeProgram, ShaderError> {
+        let c = Container::parse(bytes)?;
+        let dxil = c
+            .part(FourCC::DXIL)
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| p.stage == stage)
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without the ES or GS program of a merged stage",
+            })
+    };
+    let mut merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    // (before anything numbers the instructions: the no-ops are dropped)
+    for half in [&mut merged.es, &mut merged.gs] {
+        let ir = crate::spill::build(half)?;
+        gs::drop_thread_masks(&mut half.code, &ir)?;
+    }
+    let es_native = NativeProgram {
+        layout: merged.layout.clone(),
+        ..merged.es.clone()
+    };
+    let es_ir = crate::spill::build(&es_native)?;
+    let st = structure::structure(&es_ir);
+    resource::track_merged(&es_ir, &es_native.layout, es_native.stage, st.as_ref().ok())?;
+    io::raise(&es_ir, &es_native)?;
+    st?;
+    let gs_ir = crate::spill::build(&merged.gs)?;
+    let handoff = crate::handoff::handoff(&es_ir, &gs_ir)?;
+    Ok((merged, handoff))
+}
+
+/// The two host shaders of a merged geometry stage ([`translate_merged_gs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedShaders {
+    /// The ES half as a vertex shader: its outputs are the records it
+    /// writes, [`MergedShaders::record_dwords`] dwords of them, as
+    /// `TEXCOORD` registers of four 32-bit integers.
+    pub vertex: HostShader,
+    /// The geometry shader (triangles in, triangle strip out): its inputs are
+    /// the vertex shader's outputs, its outputs the geometry container's own.
+    pub geometry: HostShader,
+    pub record_dwords: u32,
+    /// The programs the two were made from, over the merged layout: what a
+    /// host pipeline needs of them besides the host code (the console
+    /// resources they read, whether they store).
+    pub vertex_native: NativeProgram,
+    pub geometry_native: NativeProgram,
+}
+
+/// Translates a geometry program with the ES program it is linked with: the
+/// pair is one merged stage ([`crate::merged`]), whose user SGPRs hold the
+/// root parameters of both ([`merged_halves`]), and comes out as a vertex
+/// shader and a geometry shader (`gs.rs`, with what it assumes).
+pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, ShaderError> {
+    let (merged, handoff) = merged_halves(es, gs)?;
+    let record = gs::record_signature(handoff.es.dwords);
+    // The ES half as a vertex shader.
+    let es_ir0 = crate::spill::build(&merged.es)?;
+    let es_native = gs::es_as_vertex_shader(&merged, &es_ir0, &handoff)?;
+    let es_ir = crate::spill::build(&es_native)?;
+    let st = structure::structure(&es_ir);
+    let res = resource::track_merged(&es_ir, &es_native.layout, es_native.stage, st.as_ref().ok())?;
+    let io = io::raise(&es_ir, &es_native)?;
+    let st = st?;
+    lower::take_needs();
+    let (vertex, _) = emit_program_with(
+        &Container::parse(es)?,
+        &es_native,
+        &es_ir,
+        &st,
+        &io,
+        &res,
+        Overrides {
+            inputs: Some(gs::vertex_id_input()),
+            outputs: Some(record.clone()),
+            gs: None,
+        },
+    )?;
+    let mut vertex = vertex;
+    vertex.stage = HwStage::Vs;
+    // The GS half.
+    let gc = Container::parse(gs)?;
+    let native = merged.program();
     let p = crate::spill::build(&native)?;
+    let st = structure::structure(&p);
+    let res = resource::track_merged(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    // What the runtime table gives is taken to be the base of the output
+    // records, which the plan does not use: a second field read from it is
+    // not that, and would be read as zero.
+    let fields: std::collections::BTreeSet<u32> = res
+        .scalar
+        .iter()
+        .filter(|(_, a)| a.param == resource::RUNTIME_TABLE)
+        .map(|(_, a)| a.offset)
+        .collect();
+    if fields.len() > 1 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "more than one field read from the runtime table",
+        });
+    }
+    let outs = match gc.part(FourCC::OSG1) {
+        Some(part) => signature(part.data)?,
+        None => Vec::new(),
+    };
+    let plan = gs::plan(&p, &handoff, &outs)?;
+    lower::take_needs();
+    let (geometry, _) = emit_program_with(
+        &gc,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        Overrides {
+            inputs: Some(record),
+            outputs: None,
+            gs: Some(plan),
+        },
+    )?;
+    Ok(MergedShaders {
+        vertex,
+        geometry,
+        record_dwords: handoff.es.dwords,
+        vertex_native: es_native,
+        geometry_native: native,
+    })
+}
+
+/// `merged`: the layout is the merged ES+GS stage's ([`resource::track_merged`]).
+fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let track = if merged { resource::track_merged } else { resource::track };
+    let res = track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(c, native, &p, &st, &io, &res)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -351,6 +511,12 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if native.stage == HwStage::Gs {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: GS_EMIT,
+        });
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -634,6 +800,27 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_program_with(c, native, p, st, io, res, Overrides::default())
+}
+
+/// What a half of a merged stage takes in place of the container's: the
+/// signatures it declares and, for the geometry half, its plan.
+#[derive(Default)]
+struct Overrides {
+    inputs: Option<Vec<container::SigElement>>,
+    outputs: Option<Vec<container::SigElement>>,
+    gs: Option<gs::GsPlan>,
+}
+
+fn emit_program_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    over: Overrides,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -641,8 +828,14 @@ fn emit_program(
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = match over.inputs {
+        Some(i) => i,
+        None => sig(FourCC::ISG1)?,
+    };
+    let mut outputs = match over.outputs {
+        Some(o) => o,
+        None => sig(FourCC::OSG1)?,
+    };
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -701,6 +894,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        gs: over.gs,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1531,6 +1725,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            gs: None,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1957,5 +2152,108 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+/// The geometry stage's first step: containers of the merged ES+GS stage
+/// (synthetic programs) get past tracing and I/O raising and stop at
+/// [`GS_EMIT`] in emission.
+#[cfg(test)]
+mod merged_gs_tests {
+    use super::*;
+    use crate::native::tests::container;
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// `s_load_dword s0, s[<base>:<base + 1>], 0xb8`, then the end.
+    fn load(base: u32) -> Vec<u8> {
+        bytes(&[0xF400_0000 | base >> 1, 0xFA00_00B8, S_ENDPGM])
+    }
+
+    #[test]
+    fn a_geometry_container_alone_does_not_trace() {
+        // The load through the runtime table pointer (user data 0 and 1) is
+        // "an address in an SGPR that is no root parameter" until the ES
+        // half's layout says nothing is there.
+        let gs = container(&[(HwStage::Gs, &load(8))]);
+        assert!(matches!(
+            translate(&gs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
+    }
+
+    /// The ES half of a pair: record of five dwords, then the handover.
+    fn es_half() -> Vec<u8> {
+        bytes(&crate::handoff::tests::es_words())
+    }
+
+    /// The GS half: reads of two vertices' records, then the load through
+    /// the runtime table.
+    fn gs_half() -> Vec<u8> {
+        let mut words = crate::handoff::tests::gs_words();
+        words.pop();
+        words.extend([0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+        bytes(&words)
+    }
+
+    #[test]
+    fn an_es_and_a_gs_container_pair_and_translate() {
+        let es = gs::tests::es_container();
+        let gs = gs::tests::gs_container(3);
+        let out = translate_merged_gs(&es, &gs).unwrap();
+        assert_eq!(out.record_dwords, 5);
+        let (_, h) = merged_halves(&es, &gs).unwrap();
+        assert_eq!((h.es.dwords, h.vertices), (5, 2));
+    }
+
+    #[test]
+    fn a_gs_half_without_output_records_is_refused_with_its_reason() {
+        let es = container(&[(HwStage::Es, &es_half()), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        let r = translate_merged_gs(&es, &gs);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "a geometry program that emits no vertex"), "{r:?}");
+    }
+
+    #[test]
+    fn an_es_half_that_does_not_hand_over_stops_the_pair_before_the_gs_half() {
+        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        let r = translate_merged_gs(&es, &gs);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "an ES half that does not hand over to the GS half"), "{r:?}");
+    }
+
+    #[test]
+    fn containers_that_are_not_an_es_and_a_gs_do_not_pair() {
+        let es = container(&[(HwStage::Es, &es_half())]);
+        let vs = container(&[(HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        for (a, b) in [(&gs, &gs), (&vs, &gs), (&es, &vs), (&gs, &es)] {
+            assert!(translate_merged_gs(a, b).is_err(), "paired");
+        }
+    }
+
+    #[test]
+    fn other_unbound_pointers_still_fail_where_they_did() {
+        // Not the runtime table: user data 12 and 13 hold no parameter.
+        let gs = container(&[(HwStage::Gs, &load(20))]);
+        assert!(matches!(
+            translate(&gs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
+        // The same load in the hardware VS, whose SGPR 8 is no parameter either.
+        let vs = container(&[(HwStage::Vs, &load(8))]);
+        assert!(matches!(
+            translate(&vs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
     }
 }
