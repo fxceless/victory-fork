@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod frame_log;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,15 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Summarise diagnostic `usual frame` samples and fit time against draws.
+    FrameLog {
+        /// Diagnostic log files to analyse independently.
+        #[arg(required = true)]
+        logs: Vec<PathBuf>,
+        /// Ignore samples below this draw count (useful for world-only analysis).
+        #[arg(long, default_value_t = 0)]
+        min_draws: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,6 +55,7 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::FrameLog { logs, min_draws } => frame_log::run(&logs, min_draws),
     }
 }
 
