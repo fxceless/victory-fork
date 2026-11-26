@@ -2448,6 +2448,31 @@ impl State {
         }
     }
 
+    /// Claims the early or bake texture-upload budget for `frame` once a view
+    /// heap is known to be bound. Returns `Some(((ms, bytes), is_bake))`.
+    fn claim_early_budget(
+        frame: u64,
+        bake: bool,
+        early_ms: u64,
+        bake_ms: u64,
+        last_frame: &AtomicU64,
+        baked_ms: &AtomicU64,
+    ) -> Option<((u64, u64), bool)> {
+        let first = last_frame.swap(frame, Ordering::Relaxed) != frame;
+        if first {
+            baked_ms.store(0, Ordering::Relaxed);
+        }
+        let left = bake_ms.saturating_sub(baked_ms.load(Ordering::Relaxed));
+        if bake && left > 0 {
+            // What a bake may read must be there now: up to 2 GiB.
+            Some(((left, 2 << 30), true))
+        } else if first && early_ms > 0 {
+            Some(((early_ms, 64 << 20), false))
+        } else {
+            None
+        }
+    }
+
     /// [`State::early_textures`]' runs within budgets of their own.
     fn early_textures_budgeted(&self, list: &HostList, p: &HostPipeline) {
         let (early_ms, bake_ms) = early_budgets();
@@ -2460,20 +2485,30 @@ impl State {
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
-        if first {
-            BAKED_MS.store(0, Ordering::Relaxed);
-        }
-        let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let budget = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
-        } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
-        } else {
-            return;
-        };
+        let _ = self.early_textures_with(
+            list,
+            bake,
+            early_ms,
+            bake_ms,
+            crate::frame::current(),
+            &FRAME,
+            &BAKED_MS,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn early_textures_with(
+        &self,
+        list: &HostList,
+        bake: bool,
+        early_ms: u64,
+        bake_ms: u64,
+        frame: u64,
+        last_frame: &AtomicU64,
+        baked_ms: &AtomicU64,
+    ) -> bool {
+        // Check for a bound view heap before claiming the frame's early pass,
+        // so draws without a view heap do not burn the frame's one early run.
         let Some(heap) = self
             .heaps
             .iter()
@@ -2481,15 +2516,19 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())
         else {
-            return;
+            return false;
         };
         let Some(host) = heap.host() else {
-            return;
+            return false;
         };
-        let bake = bake && left > 0;
+        let Some((budget, bake)) =
+            Self::claim_early_budget(frame, bake, early_ms, bake_ms, last_frame, baked_ms)
+        else {
+            return false;
+        };
         // What can wait for a later list is the worker's.
         if !bake && crate::heap_worker::kick(heap) {
-            return;
+            return true;
         }
         let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
@@ -2509,8 +2548,9 @@ impl State {
         Self::heap_textures(Into::List(list), heap, host);
         PASS_BUDGET.set(None);
         if bake {
-            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            baked_ms.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
+        true
     }
 
     /// For a draw of the title's skin bake (any pixel shader with the
@@ -5300,5 +5340,81 @@ mod tests {
         assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
         // No thread along an axis: nothing runs.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+}
+
+#[cfg(test)]
+mod early_textures_tests {
+    use super::*;
+
+    #[test]
+    fn early_budget_runs_once_per_frame_and_resets_bake_budget() {
+        let last_frame = AtomicU64::new(u64::MAX);
+        let baked_ms = AtomicU64::new(0);
+        // First draw with a view heap in frame 1 gets the early budget.
+        assert_eq!(
+            State::claim_early_budget(1, false, 12, 1500, &last_frame, &baked_ms),
+            Some(((12, 64 << 20), false))
+        );
+        // Second non-bake draw in the same frame gets none.
+        assert_eq!(
+            State::claim_early_budget(1, false, 12, 1500, &last_frame, &baked_ms),
+            None
+        );
+        // Bake draw in the same frame still gets the full bake budget.
+        assert_eq!(
+            State::claim_early_budget(1, true, 12, 1500, &last_frame, &baked_ms),
+            Some(((1500, 2 << 30), true))
+        );
+        baked_ms.store(1500, Ordering::Relaxed);
+        assert_eq!(
+            State::claim_early_budget(1, true, 12, 1500, &last_frame, &baked_ms),
+            None
+        );
+        // Next frame resets baked_ms and allows early budget again.
+        assert_eq!(
+            State::claim_early_budget(2, false, 12, 1500, &last_frame, &baked_ms),
+            Some(((12, 64 << 20), false))
+        );
+        assert_eq!(baked_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn early_textures_without_view_heap_does_not_burn_frame_pass() {
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        let last_frame = AtomicU64::new(u64::MAX);
+        let baked_ms = AtomicU64::new(0);
+        // Draw 1 in frame 7 has no view heap bound: must NOT claim frame 7.
+        assert!(!state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+        assert_eq!(last_frame.load(Ordering::Relaxed), u64::MAX);
+
+        // Bind a real shader-visible view heap and draw again in the SAME frame 7.
+        // SAFETY: HeapDesc is repr(C) [kind, count, flags, nodes].
+        let desc: crate::descriptor::HeapDesc = unsafe { std::mem::transmute([0u32, 4, 1, 0]) };
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(std::ptr::null(), &desc, &iid, &mut heap),
+            crate::object::S_OK
+        );
+        state.set_heaps(&[heap]);
+        let before = EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed);
+        assert!(state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+        assert_eq!(last_frame.load(Ordering::Relaxed), 7);
+        assert_eq!(EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed), before + 1);
+        // A second non-bake draw in the same frame does not run again.
+        assert!(!state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+
+        list.close();
+        drop(list);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        assert_eq!(release(heap), 0);
     }
 }
