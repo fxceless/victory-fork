@@ -229,7 +229,13 @@ impl Shader {
             return g;
         }
         let arr = self.m.array(self.lds_dwords, self.t.i32);
-        let g = self.m.global("lds", arr, 3);
+        // A geometry shader has no group: its "LDS" is the thread's own array
+        // (the records it writes before it emits them).
+        let g = if self.geometry.is_some() {
+            self.m.private_global("gsout", arr)
+        } else {
+            self.m.global("lds", arr, 3)
+        };
         self.lds = Some(g);
         g
     }

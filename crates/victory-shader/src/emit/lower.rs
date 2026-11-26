@@ -16,8 +16,9 @@ use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::merged::GsMessage;
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, MEMORY, RUNTIME_TABLE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -78,6 +79,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// A geometry program: what its LDS accesses and messages mean.
+    pub gs: Option<super::gs::GsPlan>,
 }
 
 enum Stop {
@@ -1257,6 +1260,12 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let Some(g) = &x.gs {
+            s.geometry = Some(super::shader::Geometry {
+                max_vertices: g.max_vertices,
+            });
+            s.lds_dwords = g.array_dwords;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1565,7 +1574,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Es | HwStage::Gs => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -2369,6 +2378,7 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::RuntimeTable(_) => return Val::Missing("the console runtime table"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -4392,6 +4402,115 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A geometry program LDS access ([`super::gs::GsPlan`]): a read of an
+    /// input vertex record is `loadInput`, the records it writes and reads
+    /// back are an array of its own. `false` for what is no LDS access
+    /// (`ds_swizzle`, permutes).
+    fn gs_ds(&mut self, inst: &Inst, site: Site) -> Result<bool, Why> {
+        let name = inst.name();
+        if name.starts_with("ds_swizzle") || name.contains("permute") {
+            return Ok(false);
+        }
+        let x = self.x;
+        let Some(g) = x.gs.as_ref() else {
+            return Ok(false);
+        };
+        let Fields::Ds { data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let guard = self.guard(site.0, site.1)?;
+        let c = self.cur;
+        if let Some(r) = g.reads.get(&site) {
+            for k in 0..r.count {
+                let d = r.dword + k;
+                let (id, col) = (d / 4, d % 4);
+                let known = self.s.inputs.get(id as usize).is_some_and(|e| u32::from(e.cols) > col);
+                if !known {
+                    return Err("a read of a record dword the signature does not have");
+                }
+                let args = [
+                    self.s.m.i32(id),
+                    self.s.m.i32(0),
+                    self.s.m.i8(col as u8),
+                    self.s.m.i32(u32::from(r.vertex)),
+                ];
+                let i32t = self.s.t.i32;
+                let v = self.s.op(c, "loadInput.i32", Attr::ReadNone, i32t, 4, &args);
+                self.write(inst, Reg::V(r.reg + k as u8), v, guard);
+            }
+            return Ok(true);
+        }
+        if let Some(&(at, count, _)) = g.stores.get(&site) {
+            let vals = self.vgprs(inst, data.first().ok_or("an LDS write")?, count as u8)?;
+            let arr = self.s.lds();
+            let open = self.begin_guarded(guard);
+            for (k, v) in vals.into_iter().enumerate() {
+                let index = self.s.m.i32(at + k as u32);
+                let p = self.s.m.element(self.cur, arr, index);
+                self.s.m.store(self.cur, p, v);
+            }
+            self.end_guarded(open, &[]);
+            return Ok(true);
+        }
+        if let Some(&(at, count, reg)) = g.loads.get(&site) {
+            let arr = self.s.lds();
+            for k in 0..count {
+                let index = self.s.m.i32(at + k);
+                let p = self.s.m.element(c, arr, index);
+                let v = self.s.m.load(c, p);
+                self.write(inst, Reg::V(reg + k as u8), v, guard);
+            }
+            return Ok(true);
+        }
+        Err("an LDS access the geometry plan does not cover")
+    }
+
+    /// `s_sendmsg` of a geometry program: `GS_EMIT` writes the next record
+    /// of the array to the outputs and emits the vertex, `GS_CUT` ends the
+    /// strip; the other messages (`GS_DONE`, allocation) are left out.
+    fn gs_message(&mut self, _inst: &Inst, site: Site) -> Result<(), Why> {
+        let x = self.x;
+        let Some(g) = x.gs.as_ref() else {
+            return Ok(());
+        };
+        let Some(&(n, msg)) = g.messages.get(&site) else {
+            return Ok(());
+        };
+        let guard = self.guard(site.0, site.1)?;
+        let open = self.begin_guarded(guard);
+        let void = self.s.t.void;
+        let stream = self.s.m.i8(0);
+        if msg.vertices() == 1 {
+            let arr = self.s.lds();
+            let outputs = self.s.outputs.clone();
+            for (id, e) in outputs.iter().enumerate() {
+                let row = e.row.ok_or("a geometry output without a register")?;
+                for k in 0..e.cols {
+                    let c = self.cur;
+                    let dword = n * g.record_dwords + 4 * row + u32::from(e.col) + u32::from(k);
+                    let index = self.s.m.i32(dword);
+                    let p = self.s.m.element(c, arr, index);
+                    let bits = self.s.m.load(c, p);
+                    let (name, value) = if e.comp == 9 {
+                        ("storeOutput.f32", self.as_float(bits))
+                    } else {
+                        ("storeOutput.i32", bits)
+                    };
+                    let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(k), value];
+                    self.s.op(self.cur, name, Attr::NoUnwind, void, 5, &args);
+                    // (the signature says which components are written)
+                    self.s.outputs[id].usage |= 1 << (e.col + k);
+                }
+            }
+            self.s.op(self.cur, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
+        }
+        if matches!(msg, GsMessage::Cut { .. } | GsMessage::EmitCut { .. }) {
+            self.s.op(self.cur, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+        }
+        self.end_guarded(open, &[]);
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -4409,6 +4528,9 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
+        if self.x.gs.is_some() && self.gs_ds(inst, (b, i))? {
+            return Ok(());
+        }
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
@@ -4815,6 +4937,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || name == "s_sendmsg" && self.x.gs.is_some()
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -4853,6 +4976,9 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { .. } if name == "s_sendmsg" && self.x.gs.is_some() => {
+                self.gs_message(inst, (b, i))
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -5536,6 +5662,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.scalar.get(&site).is_some_and(|a| a.param == RUNTIME_TABLE) {
+            // The console runtime table: what is loaded from it is the base
+            // of the GS output in LDS, which the geometry plan does not use
+            // (the records are in an array of the invocation itself). Read as 0.
+            let Some(Operand::Scalar { code, dwords }) = *data else {
+                return Err("a read of the runtime table");
+            };
+            for k in 0..dwords {
+                let zero = self.s.m.i32(0);
+                self.write(inst, Reg::S(code + k), zero, None);
+            }
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -11543,6 +11682,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            gs: None,
         })
         .map(|_| ())
     }
@@ -11593,6 +11733,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            gs: None,
         })
     }
 
@@ -11704,6 +11845,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            gs: None,
         }).unwrap();
 
         let container =
