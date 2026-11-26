@@ -2147,15 +2147,28 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: a description that runs
+        // past it is not a valid call, and what a refused creation leaves in
+        // the slot is undefined rather than "whatever was there" -- enough to
+        // keep such a description away from a slot shaders read by index.
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let (range, cut) = raw_range(size, offset, len);
+        if let Some(cut) = cut {
+            raw_range_count("SRV", cut, offset, len, size);
+        }
+        let Some(range) = range else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -2182,14 +2195,27 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all. What a
+        // refused description leaves in the slot is undefined: it may leave the
+        // slot unusable, and a dispatch reading it then returns wrong bytes or
+        // faults. Not observed on this machine; recorded as a possibility.
+        // SAFETY: a live buffer.
+        let size = unsafe { buffer.GetDesc() }.Width;
+        let (range, cut) = raw_range(size, offset, len);
+        if let Some(cut) = cut {
+            raw_range_count("UAV", cut, offset, len, size);
+        }
+        let Some(range) = range else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -3929,6 +3955,100 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Where a raw buffer view starts and how many dwords it covers, both inside
+/// `size` bytes of buffer: `None` when the request has nothing in the buffer.
+///
+/// `FirstElement` is 64-bit and `NumElements` 32-bit, so only the length is cut
+/// at `u32::MAX`; the start is used as asked and never moved. Moving it is what
+/// a clamp would do, and clamping the start of a request that lies entirely past
+/// the buffer turns it into a view of the buffer's tail: 100 bytes of buffer
+/// with an offset of 112 used to view bytes 96 to 99 as if they had been asked
+/// for. A start at or past the last dword is a view of nothing instead.
+///
+/// Callers pass `offset` on 16 bytes: `draw.rs` biases by `offset & 15` on the
+/// UAV path and makes a null view for a root SRV that is not on 16, so a raw
+/// view's start stays on that boundary. An offset off it is refused here too.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The start is at or past the buffer's last dword: nothing to view.
+    Past,
+    /// The length was cut to what the buffer holds.
+    Length,
+    /// The title named less than a dword: one element, as before this guard.
+    Short,
+    /// The start is not on the 16 bytes a raw view needs.
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    // A length under a dword made one element before this guard. The floor is
+    // kept because nothing was gathered about why the title would ask for less
+    // than a dword; the buffer's end still caps it.
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+/// Counts what [`raw_range`] refused or cut, by kind (SRV, UAV) and cause, so
+/// that a run can say whether the guard applied at all. One atomic per cell,
+/// said on the first and every 4096th: no lock, nothing per view beyond that.
+fn raw_range_count(kind: &'static str, cut: Cut, offset: u64, len: u64, size: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SRV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static UAV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let cell = match (kind, cut) {
+        ("SRV", Cut::Past) => &SRV[0],
+        ("SRV", Cut::Length) => &SRV[1],
+        ("SRV", Cut::Short) => &SRV[2],
+        ("SRV", Cut::Unaligned) => &SRV[3],
+        (_, Cut::Past) => &UAV[0],
+        (_, Cut::Length) => &UAV[1],
+        (_, Cut::Short) => &UAV[2],
+        (_, Cut::Unaligned) => &UAV[3],
+    };
+    let n = cell.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 4096 == 0 {
+        tracing::warn!(
+            kind,
+            cut = ?cut,
+            offset,
+            len,
+            size,
+            seen = n,
+            "a raw buffer view the title's range did not cover"
+        );
+    }
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -4932,5 +5052,121 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod raw_range_tests {
+    use super::*;
+
+    fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
+        let (range, cut) = raw_range(size, offset, len);
+        (range.map(|v| (v.first, v.elements)), cut)
+    }
+
+    fn range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+        rr(size, offset, len).0
+    }
+
+    /// The table of the first review, plus the counterexample it found: 100
+    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
+    /// 96 to 99, which the request had asked nothing about.
+    #[test]
+    fn the_range_stays_inside_the_buffer() {
+        assert_eq!(range(1024, 0, 256), Some((0, 64)));
+        assert_eq!(range(1024, 768, 512), Some((192, 64)));
+        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
+        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
+        assert_eq!(range(100, 96, 4), Some((24, 1)));
+        assert_eq!(range(0, 0, 16), None, "an empty buffer");
+        assert_eq!(range(3, 0, 16), None, "no whole dword");
+        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
+        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
+        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
+        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
+        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
+    }
+
+    /// Why a request was refused or cut, which is what the counters report.
+    #[test]
+    fn the_cause_is_the_one_the_counters_would_report() {
+        assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
+        assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
+        assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
+        // Nothing cut, nothing refused: no counter is touched at all.
+        assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
+    }
+
+    /// `FirstElement` is 64-bit: a start past the 32-bit element index is kept
+    /// as it is, not narrowed to `u32::MAX`.
+    #[test]
+    fn a_start_past_32_bits_is_kept() {
+        let size = 1u64 << 40;
+        let offset = (u64::from(u32::MAX) + 10) * 16;
+        let range = range(size, offset, 64).expect("inside the buffer");
+        assert_eq!(range.0, offset / 4);
+        assert!(range.0 > u64::from(u32::MAX));
+        assert_eq!(range.1, 16);
+    }
+
+    /// `NumElements` is 32-bit: the length alone is cut at `u32::MAX`.
+    #[test]
+    fn the_length_is_cut_at_32_bits() {
+        let size = 1u64 << 40;
+        assert_eq!(range(size, 0, u64::MAX), Some((0, u32::MAX)));
+    }
+
+    /// An aligned start far past a buffer is still refused: alignment is not a
+    /// reason to accept a request, and the check is not reached by the
+    /// unaligned case first.
+    #[test]
+    fn an_aligned_start_past_the_buffer_is_refused() {
+        let size = 1u64 << 40;
+        assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
+    }
+
+    /// Every accepted range holds the four things the patch promises, and no
+    /// request that the input rules allow is turned away for no reason.
+    #[test]
+    fn accepted_ranges_hold_their_invariant() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(
+                                range.first,
+                                offset / 4,
+                                "{size} {offset} {len}: the start moved"
+                            );
+                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
+                            assert!(
+                                range.first + u64::from(range.elements) <= size / 4,
+                                "{size} {offset} {len}: {} + {} past the buffer",
+                                range.first,
+                                range.elements
+                            );
+                        }
+                        None => assert!(
+                            !(aligned && inside),
+                            "{size} {offset} {len}: refused though the rules allow it"
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
