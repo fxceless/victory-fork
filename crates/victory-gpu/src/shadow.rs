@@ -878,14 +878,14 @@ fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
         }
-    }
-    out
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -945,6 +945,44 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    #[test]
+    #[ignore = "synthetic dirty-range benchmark; run in release mode"]
+    fn dirty_range_bench() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        for count in [1, 8, 64, 512] {
+            let input: Vec<_> = (0..count)
+                .rev()
+                .map(|i| (i * 4096, i * 4096 + if i % 3 == 0 { 8192 } else { 1024 }))
+                .collect();
+            let mut expected: Vec<(usize, usize)> = Vec::new();
+            for &(from, to) in input.iter().rev() {
+                if let Some(last) = expected.last_mut().filter(|last| from <= last.1) {
+                    last.1 = last.1.max(to);
+                } else {
+                    expected.push((from, to));
+                }
+            }
+            assert_eq!(joined(input.clone()), expected);
+            let mut samples = [Duration::ZERO; 11];
+            for sample in &mut samples {
+                let vectors = vec![input.clone(); 4096];
+                let start = Instant::now();
+                for ranges in vectors {
+                    drop(black_box(joined(black_box(ranges))));
+                }
+                *sample = start.elapsed() / 4096;
+            }
+            samples.sort_unstable();
+            println!(
+                "{count} ranges: median {} ns, p90 {} ns",
+                samples[5].as_nanos(),
+                samples[9].as_nanos()
+            );
+        }
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
