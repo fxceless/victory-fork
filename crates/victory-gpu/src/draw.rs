@@ -350,6 +350,78 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// A window's first step after a walk is learned: the records clamped with
+/// the one that revealed it ([`serve`]).
+const WINDOW_FIRST: u32 = 16;
+
+/// The widest walk that is still the title stepping through an array of
+/// records, in bytes ([`serve`]).
+const STEP_MOST: u64 = 256;
+
+/// The window the last clamp opened, as [`serve`] sees it: numbers only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LastWindow {
+    pub(crate) base: u64,
+    pub(crate) step: u32,
+    pub(crate) records: u32,
+}
+
+/// What a windowed indirect call does with its record ([`serve`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Serve {
+    /// The window already holds this record, clamped, at `at` in its scratch buffer.
+    Held { at: u64 },
+    /// Clamp `records` (`>= 1` when from a walk) records `step` bytes apart.
+    Clamp { step: u32, records: u32 },
+}
+
+/// Pure, total window-step and bound-arithmetic decision for `execute_indirect`.
+pub(crate) fn serve(
+    declared_stride: u32,
+    declared_records: u32,
+    offset: u64,
+    left: u64,
+    previous: Option<LastWindow>,
+    most: u32,
+) -> Serve {
+    if let Some(w) = previous {
+        let step = u64::from(w.step);
+        if w.step != 0 && offset >= w.base {
+            let at = offset - w.base;
+            if at.is_multiple_of(step) && at / step < u64::from(w.records) {
+                return Serve::Held { at };
+            }
+        }
+        let last = w
+            .base
+            .saturating_add(u64::from(w.records.saturating_sub(1)).saturating_mul(step));
+        let walk = offset.saturating_sub(last);
+        let walks = walk != 0
+            && walk >= u64::from(declared_stride)
+            && walk.is_multiple_of(4)
+            && walk <= STEP_MOST
+            && (w.records == 1 || walk == step);
+        if walks {
+            let fit = (left / walk).min(u64::from(most)) as u32;
+            if fit > 0 {
+                let want = if w.records == 1 {
+                    WINDOW_FIRST
+                } else {
+                    w.records.saturating_mul(2)
+                };
+                return Serve::Clamp {
+                    step: walk as u32,
+                    records: want.min(fit).max(1),
+                };
+            }
+        }
+    }
+    Serve::Clamp {
+        step: declared_stride,
+        records: declared_records,
+    }
+}
+
 /// Whether a record that is not on the window's walk opens a window of its
 /// own at once, with the step the title was last seen to walk that
 /// argument buffer by (`VICTORY_WINDOW_JUMP=1`; `alt`: twenty seconds
@@ -4360,12 +4432,30 @@ impl State {
             }
         };
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
+        let previous = self
             .window
             .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+            .filter(|w| same(w))
+            .map(|w| LastWindow {
+                base: w.base,
+                step: w.step,
+                records: w.records,
+            });
+        let served = serve(
+            stride,
+            max,
+            offset,
+            args.left(arguments),
+            previous,
+            WINDOW_MOST as u32,
+        );
+        let hit = match served {
+            Serve::Held { at } => {
+                let w = self.window.as_ref().expect("a window holds the record it served");
+                Some((w.scratch.clone(), at, w.step))
+            }
+            Serve::Clamp { .. } => None,
+        };
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -4427,22 +4517,8 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
-                    }
-                    _ => (stride, max),
+                let Serve::Clamp { step, records } = served else {
+                    unreachable!("hit was None");
                 };
                 // A record that would be clamped alone, on a buffer whose
                 // step is remembered: the window the next record would
@@ -5086,5 +5162,122 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
+    fn w(base: u64, step: u32, records: u32) -> Option<LastWindow> {
+        Some(LastWindow { base, step, records })
+    }
+
+    #[test]
+    fn first_call_of_a_run_clamps_one_record() {
+        assert_eq!(serve(12, 1, 64, 4096, None, 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn non_windowed_clamps_every_record_it_asked_for() {
+        for records in [0, 1, 5, u32::MAX] {
+            assert_eq!(serve(12, records, 64, 4096, None, 64), Serve::Clamp { step: 12, records });
+        }
+    }
+
+    #[test]
+    fn the_second_call_learns_the_walk_and_takes_sixteen() {
+        assert_eq!(serve(12, 1, 96, 4096, w(64, 12, 1), 64), Serve::Clamp { step: 32, records: 16 });
+    }
+
+    #[test]
+    fn records_the_window_holds_clamp_nothing() {
+        let prev = w(96, 32, 16);
+        assert_eq!(serve(12, 1, 96, 4096, prev, 64), Serve::Held { at: 0 });
+        assert_eq!(serve(12, 1, 96 + 32 * 5, 4096, prev, 64), Serve::Held { at: 32 * 5 });
+        assert_eq!(serve(12, 1, 96 + 32 * 15, 4096, prev, 64), Serve::Held { at: 32 * 15 });
+    }
+
+    #[test]
+    fn the_record_after_a_window_doubles_it() {
+        assert_eq!(serve(12, 1, 96 + 32 * 16, 4096, w(96, 32, 16), 64), Serve::Clamp { step: 32, records: 32 });
+    }
+
+    #[test]
+    fn windows_double_to_the_cap_and_stop() {
+        assert_eq!(serve(12, 1, 96 + 32 * 32, 4096, w(96, 32, 32), 64), Serve::Clamp { step: 32, records: 64 });
+        assert_eq!(serve(12, 1, 96 + 32 * 64, 4096, w(96, 32, 64), 64), Serve::Clamp { step: 32, records: 64 });
+    }
+
+    #[test]
+    fn a_step_narrower_than_the_declared_stride_is_no_walk() {
+        assert_eq!(serve(16, 1, 76, 4096, w(64, 16, 1), 64), Serve::Clamp { step: 16, records: 1 });
+    }
+
+    #[test]
+    fn a_step_that_is_not_a_multiple_of_four_is_no_walk() {
+        assert_eq!(serve(12, 1, 78, 4096, w(64, 12, 1), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_step_at_the_cap_is_a_walk_and_one_past_it_is_not() {
+        assert_eq!(serve(12, 1, 64 + 256, 8192, w(64, 12, 1), 64), Serve::Clamp { step: 256, records: 16 });
+        assert_eq!(serve(12, 1, 64 + 260, 8192, w(64, 12, 1), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_walk_of_zero_is_not_a_walk() {
+        assert_eq!(serve(0, 1, 64, 4096, w(64, 0, 1), 64), Serve::Clamp { step: 0, records: 1 });
+    }
+
+    #[test]
+    fn a_step_of_zero_never_divides() {
+        assert_eq!(serve(12, 1, 96, 4096, w(64, 0, 2), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_buffer_with_room_for_a_few_records_clamps_only_those() {
+        assert_eq!(serve(12, 1, 96, 32 * 5 + 16, w(64, 12, 1), 64), Serve::Clamp { step: 32, records: 5 });
+    }
+
+    #[test]
+    fn a_walk_wider_than_the_room_left_is_not_a_walk() {
+        assert_eq!(serve(12, 1, 96, 20, w(64, 12, 1), 64), Serve::Clamp { step: 12, records: 1 });
+        assert_eq!(serve(12, 1, 96, 0, w(64, 12, 1), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_cap_of_zero_falls_back_to_the_declared_stride() {
+        assert_eq!(serve(12, 1, 96, 4096, w(64, 12, 1), 0), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_record_behind_the_window_is_no_hit() {
+        assert_eq!(serve(12, 1, 64, 4096, w(96, 32, 16), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn a_one_record_window_relearns_any_aligned_step() {
+        assert_eq!(serve(12, 1, 128, 4096, w(64, 12, 1), 64), Serve::Clamp { step: 64, records: 16 });
+    }
+
+    #[test]
+    fn a_sixteen_apart_record_ends_a_window() {
+        assert_eq!(serve(12, 1, 96 + 32 * 15 + 16, 4096, w(96, 32, 16), 64), Serve::Clamp { step: 12, records: 1 });
+    }
+
+    #[test]
+    fn after_a_sixteen_apart_record_the_next_window_learns_sixteen() {
+        assert_eq!(serve(12, 1, 608, 4096, w(592, 12, 1), 64), Serve::Clamp { step: 16, records: 16 });
+    }
+
+    #[test]
+    fn the_cap_is_a_parameter() {
+        assert_eq!(serve(12, 1, 96 + 32 * 64, 65536, w(96, 32, 64), 256), Serve::Clamp { step: 32, records: 128 });
+    }
+
+    #[test]
+    fn a_declared_stride_of_zero_clamps_one() {
+        assert_eq!(serve(0, 1, 64, 4096, None, 64), Serve::Clamp { step: 0, records: 1 });
+    }
+
+    #[test]
+    fn a_declared_stride_of_zero_with_a_window_follows_the_walk_rule() {
+        assert_eq!(serve(0, 1, 96, 4096, w(64, 12, 1), 64), Serve::Clamp { step: 32, records: 16 });
     }
 }

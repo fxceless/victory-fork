@@ -271,6 +271,9 @@ unsafe impl Sync for Clamp {}
 
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    // Reads the switch once, so a run that asked for the bypass is told it is
+    // refused even if nothing else about the clamp is ever mentioned.
+    let _ = clamp_is_on();
     CLAMP
         .get_or_init(|| match make() {
             Ok(c) => Some(c),
@@ -353,8 +356,50 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
+/// Parses `VICTORY_INDIRECT_CLAMP`: enabled by default; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) asked for the
+/// bypass this module no longer has. Kept because [`clamp_setting`] has to
+/// recognise the ask in order to answer it.
+pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// What `VICTORY_INDIRECT_CLAMP` is allowed to do, as `(clamp on, say why)`.
+///
+/// The clamp is **always** on, and a switch asking otherwise gets an answer
+/// rather than obedience. `dkdknight` (RTX 5080, Series X build) set
+/// `VICTORY_INDIRECT_CLAMP=0` and got `0xc0000005` writing `0x0`, twice out of
+/// two runs, within seconds.
+fn clamp_setting(asked: Option<&std::ffi::OsStr>) -> (bool, bool) {
+    (true, !parse_clamp_enabled(asked))
+}
+
+/// [`clamp_setting`] on the process's environment, saying its piece once.
+pub(crate) fn clamp_is_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let (on, refused) = clamp_setting(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref());
+        if refused {
+            tracing::warn!(
+                "VICTORY_INDIRECT_CLAMP=0 is refused: without the clamp pass the title's own argument records write 0x0 and the run dies with 0xc0000005 on real hardware. The clamp stays on."
+            );
+        }
+        on
+    })
+}
+
 /// Validates record alignment and returns the scratch byte size `stride * records`.
-fn validate_layout(
+pub(crate) fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
@@ -2655,6 +2700,50 @@ void main() {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
+    }
+
+    #[test]
+    fn parse_clamp_enabled_defaults_on_and_respects_explicit_disable() {
+        use std::ffi::OsStr;
+        assert!(parse_clamp_enabled(None));
+        for on in ["", "1", " 1 ", "true", "TRUE", "yes", "on"] {
+            assert!(
+                parse_clamp_enabled(Some(OsStr::new(on))),
+                "{on:?} must keep indirect clamp enabled"
+            );
+        }
+        for off in ["0", " 0 ", "false", "FALSE", "no", "NO", "off", "OFF"] {
+            assert!(
+                !parse_clamp_enabled(Some(OsStr::new(off))),
+                "{off:?} must disable indirect clamp"
+            );
+        }
+    }
+
+    /// The switch is answered, not obeyed.
+    #[test]
+    fn the_clamp_is_on_whatever_the_switch_asks_for() {
+        use std::ffi::OsStr;
+        assert!(parse_clamp_enabled(None));
+        assert_eq!(super::clamp_setting(None), (true, false), "unset asks for nothing");
+        assert_eq!(super::clamp_setting(Some(OsStr::new("1"))), (true, false));
+        for off in ["0", " 0 ", "false", "FALSE", "no", "NO", "off", "OFF"] {
+            assert_eq!(
+                super::clamp_setting(Some(OsStr::new(off))),
+                (true, true),
+                "{off:?} asks for the bypass, which is refused and said out loud"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_layout_rejects_misaligned_or_overflowing_direct_arguments() {
+        assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(validate_layout((10, 12, 8), 16, Some(4)), Some(96));
+        assert_eq!(validate_layout((0, 12, 1), 0, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 2, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 0, Some(2)), None);
+        assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
     }
 }
 
