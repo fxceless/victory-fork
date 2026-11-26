@@ -3731,6 +3731,12 @@ pub(crate) fn settle_for_present() {
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
+/// [`settle_now`] when the dynamic descriptor slots ran out: the flights'
+/// lists give theirs back as they land. Counted with the settles for too
+/// much in the air, which it is.
+pub(crate) fn settle_for_tables() {
+    settle_now(WHY_MOST);
+}
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
@@ -8737,6 +8743,13 @@ impl Meter {
                 "copies left out since the start because both sides were one host texture: {}",
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
             );
+            let short = &crate::draw::DYNAMIC_SHORT;
+            let (found, refused) = (short[0].load(Ordering::Relaxed), short[1].load(Ordering::Relaxed));
+            if found + refused > 0 {
+                tracing::info!(
+                    "dynamic descriptor slots run out, since the start: {found} found after settling the flights in the air, {refused} refused (their draws dropped; VICTORY_TABLE_SETTLE=0: not settled)"
+                );
+            }
             if crate::drvwatch::errors() > 0 {
                 tracing::warn!(
                     "errors the graphics driver reported to the system since the start: {} (the paths under suspicion are off)",

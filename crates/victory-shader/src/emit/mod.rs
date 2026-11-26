@@ -297,6 +297,24 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    // The program being translated may take the wave-wide branches form
+    // ([`with_wave_wide`]).
+    static WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation on this thread) with the wave-wide branches form
+/// allowed for a console wave64 compute program on a host of 32-lane waves,
+/// as `VICTORY_WAVE_WIDE=1` allows it for all. For programs seen to run in
+/// that form: it puts group barriers inside branches and loops, and two
+/// particle programs lost the card in it.
+pub fn with_wave_wide<T>(f: impl FnOnce() -> T) -> T {
+    let before = WAVE_WIDE.with(|w| w.replace(true));
+    let out = f();
+    WAVE_WIDE.with(|w| w.set(before));
+    out
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -424,7 +442,13 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Also for the programs a caller has seen run in it ([`with_wave_wide`]), unless
+        // `VICTORY_WAVE_WIDE=0`.
+        let wide_on = match std::env::var_os("VICTORY_WAVE_WIDE") {
+            Some(v) if v == "1" => true,
+            Some(v) if v == "0" => false,
+            _ => WAVE_WIDE.with(std::cell::Cell::get),
+        };
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.

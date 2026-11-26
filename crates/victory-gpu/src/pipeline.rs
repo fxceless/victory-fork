@@ -350,6 +350,13 @@ pub(crate) fn walk_held(this: This) -> bool {
     true
 }
 
+/// Whether one of the title's pipeline `this`'s shaders has the 16-digit
+/// hash `hash` (as the log names shaders).
+#[cfg(windows)]
+pub(crate) fn has_shader(this: This, hash: &str) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.hash == hash)
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

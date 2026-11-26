@@ -94,11 +94,58 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wide = wave_wide(container);
+    let translate = |c: &[u8]| {
+        if wide {
+            victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(c))
+        } else {
+            victory_shader::emit::translate(c)
+        }
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
+        // The form allowed is part of what the entry was made from.
+        Some(cache) if wide => {
+            let mut build = build();
+            build[0] ^= 0x57;
+            cached(cache, &build, container, translate)
+        }
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Console wave64 compute programs that a 32-lane host (NVIDIA) refuses as
+/// translated (they ask for 64-lane waves) and that run in the wave-wide
+/// branches form: the water's transmission volumetrics
+/// (`_VolumePortalsOnly`, `Submerged`) and `sr_tracing`'s
+/// `CS_Tiling_Generate_Opaque`, as another fork of this layer found them.
+/// Left out: the particles' `CS_Visibility` (369cbe906ea72764), in that
+/// list too; with it on, a run on an RTX 5060 Ti stopped as the first
+/// world frame was made, as particle programs in this form stopped the
+/// card before (runs 121-124). Also left out: the volumetrics' `_Tiled`
+/// and `_Tiled_LocalLights` (5dc3b25986622949, 6f225b641c5b0708); with
+/// them on, black patches lay on the water around the boat in the first
+/// boat mission, gone in a run without them (2026-11-25, with
+/// `VICTORY_TEXTURE_BACK=1`; the boat floats and the hull no longer cuts a
+/// hole in the water).
+/// `VICTORY_WAVE_WIDE_LIST` adds hashes (comma-separated),
+/// `VICTORY_WAVE_WIDE_SEEN=0` leaves these out (the added hashes still
+/// count), `VICTORY_WAVE_WIDE=0` turns the form off.
+const WAVE_WIDE_SEEN: [&str; 3] = ["a10179ab7eda0dc3", "926c46bab3b86bd6", "2cc4c197ee29e291"];
+
+/// Whether `container` is one of [`WAVE_WIDE_SEEN`] or the added hashes.
+fn wave_wide(container: &[u8]) -> bool {
+    static ADDED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let added = ADDED.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_LIST")
+            .map(|v| v.split(',').map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    static SEEN_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let seen_on = *SEEN_ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_SEEN").is_none_or(|v| v != "0"));
+    let hash = &blake3::hash(container).to_hex()[..16];
+    (seen_on && WAVE_WIDE_SEEN.contains(&hash)) || added.iter().any(|h| h == hash)
 }
 
 /// The cache entry's converter: the build and the container in, the
