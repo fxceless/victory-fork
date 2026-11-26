@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod translate_diff;
 
 use std::path::PathBuf;
 
@@ -81,6 +82,11 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// With the list (implied): each emitted program's line names a
+        /// hash of its DXIL (`dxil=` and 16 hex digits of its BLAKE3,
+        /// before validation), for `translate-diff`.
+        #[arg(long)]
+        hashes: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -91,6 +97,17 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+    },
+    /// Compare two `translate --list` outputs (two builds over the same
+    /// shaders): the programs one validates and the other does not, with
+    /// the other's reasons, and with `--hashes` lists, the programs both
+    /// validate whose DXIL differs.
+    TranslateDiff {
+        old: PathBuf,
+        new: PathBuf,
+        /// Also name each program (container hash and stage).
+        #[arg(long)]
+        keys: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -158,6 +175,7 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            hashes,
             jobs,
             warm,
         } => {
@@ -172,8 +190,9 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, hashes, jobs)
         }
+        Command::TranslateDiff { old, new, keys } => translate_diff::run(&old, &new, keys),
         Command::Run {
             exe,
             unimplemented,
