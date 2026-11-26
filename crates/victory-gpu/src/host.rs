@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+mod submit_diagnostics;
+
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -4774,6 +4776,7 @@ fn relay_hand_back(back: &[Declared]) {
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
+    submit_diagnostics::line(frames);
     if !late() {
         return;
     }
@@ -6937,7 +6940,9 @@ impl Host {
         // (`crate::descriptor::sync_beside`).
         let beside = crate::descriptor::sync_beside();
         if !beside {
+            let timer = submit_diagnostics::start();
             crate::descriptor::sync_heaps();
+            submit_diagnostics::finish(timer, submit_diagnostics::Stage::DescriptorSync, 0);
         }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -6961,7 +6966,9 @@ impl Host {
         if beside {
             crate::descriptor::sync_begin();
         } else {
+            let timer = submit_diagnostics::start();
             crate::descriptor::make_waiting();
+            submit_diagnostics::finish(timer, submit_diagnostics::Stage::DescriptorWaiting, 0);
         }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -7031,7 +7038,9 @@ impl Host {
         // The pass over the view heap, if it ran beside: done before any
         // list of this submission goes to the card.
         if beside {
+            let timer = submit_diagnostics::start();
             crate::descriptor::sync_end();
+            submit_diagnostics::finish(timer, submit_diagnostics::Stage::DescriptorJoin, 0);
         }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -7063,7 +7072,9 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                let timer = submit_diagnostics::start();
                 self.queue.ExecuteCommandLists(&lists);
+                submit_diagnostics::finish(timer, submit_diagnostics::Stage::Execute, lists.len());
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -7110,7 +7121,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                let timer = submit_diagnostics::start();
                 self.queue.ExecuteCommandLists(group);
+                submit_diagnostics::finish(timer, submit_diagnostics::Stage::Execute, group.len());
                 self.card_sent();
                 let waited = self
                     .queue
