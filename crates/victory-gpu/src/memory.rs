@@ -75,6 +75,20 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Copies numbered, by what named them first ([`Named`]).
+    by: [u32; 4],
+    /// A page the current [`ready`] named found no number left.
+    short: bool,
+}
+
+/// What named a page whose copy got a number: a root view, a pair of root
+/// constants, a root constant in 256-byte units, a shader's fault note.
+#[derive(Clone, Copy)]
+enum Named {
+    View,
+    Pair,
+    Units,
+    Fault,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -89,6 +103,10 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Every page the dispatch names has a copy, or is not the title's
+    /// memory. False once the numbers run out ([`COPIES`]): what it names
+    /// then reads zeros, a dropped stage for the structure builder.
+    pub(crate) whole: bool,
 }
 
 impl Memory {
@@ -111,12 +129,14 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            by: [0; 4],
+            short: false,
         })
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) {
+    fn map(&mut self, address: u64, named: Named) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -156,6 +176,7 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                self.by[named as usize] += 1;
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -178,9 +199,18 @@ impl Memory {
                 n
             }
             None => {
+                self.short = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    let [views, pairs, units, faults] = self.by;
+                    tracing::warn!(
+                        COPIES,
+                        views,
+                        pairs,
+                        units,
+                        faults,
+                        "title memory by address: no number left for another copy; its pages read zeros (numbered so far, by what named them first)"
+                    )
                 });
                 return;
             }
@@ -221,15 +251,15 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.map(u64::from(page) * PAGE, Named::Fault);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    fn name(&mut self, address: u64, named: Named) {
+        self.map(address, named);
+        self.map((address & !(CELL - 1)) + CELL, named);
     }
 }
 
@@ -257,9 +287,10 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
+    m.short = false;
     let numbered = m.copies.len();
     for &address in addresses {
-        m.name(address);
+        m.name(address, Named::View);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +300,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, Named::Pair);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, Named::Units);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -315,6 +346,7 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        whole: !m.short,
     })
 }
 
