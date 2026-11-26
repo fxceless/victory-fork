@@ -824,6 +824,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_SHADER_OVERRIDES=<dir>` | a shader whose 16-digit hash has a `<hash>.dxil` (a validated DXIL container, e.g. from `dxc`) in that folder runs that code instead of its translation; the translation's root signature, user data, samplers and heap views are kept, so a replacement is written against the translation's register layout |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

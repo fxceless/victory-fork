@@ -95,10 +95,13 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Hand-written replacements (`VICTORY_SHADER_OVERRIDES`) after the cache:
+    // the cache keeps the translation, the folder can change between runs.
+    Ok(crate::shader_override::apply(container, shader))
 }
 
 /// The cache entry's converter: the build and the container in, the
