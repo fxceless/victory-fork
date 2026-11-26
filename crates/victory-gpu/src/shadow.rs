@@ -299,6 +299,11 @@ fn card_room_kept_on() -> bool {
 }
 
 /// Title buffers big enough for a copy in the card's memory that were
+/// turned down because the copies made already hold the most
+/// [`card_limits`] allows, since the start, and their bytes (counted only).
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Title buffers big enough for a copy in the card's memory that were
 /// turned down for want of room, since the start, and their bytes: their
 /// copies stay in the PC's memory for as long as the title keeps the
 /// buffers, so no room is kept for them any more.
@@ -440,6 +445,24 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said, as the turn-downs for room are: run v8-220247 had 512 MB of
+        // copies on the card (`VICTORY_CARD_BUFFERS_MB`'s default under a
+        // 12 GiB budget), and 162 MB a frame of copies of 1 MiB or more
+        // were compared on the CPU with no line telling why.
+        let n = CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB \
+                 (VICTORY_CARD_BUFFERS_MB); {} buffers turned down so far for it ({} MB), frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -5737,7 +5760,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         let shadow = shadow.clone();
         drop(guard);
-        give_spare(buffer, data, width, 0);
+        give_spare(buffer, data, width, 0, 0);
         return Some(shadow);
     }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
@@ -5773,10 +5796,50 @@ fn exact_reuse() -> bool {
 const SWEEP_EVERY: u64 = 32;
 static EXACT_SWEEP: AtomicU64 = AtomicU64::new(0);
 
-/// A buffer of a copy let go of, mapped, kept for another copy.
+/// A buffer of a copy let go of, mapped, kept for another copy; and the
+/// frame it was let go of in.
 struct Spare {
     buffer: ID3D12Resource,
     data: usize,
+    frame: u64,
+}
+
+/// Whether a spare is held back as long as `crate::host::retire_resource`
+/// holds a buffer let go of, and for some frames more
+/// (`VICTORY_EXACT_REUSE_SAFE`, on unless `0`; `0` is v8: used again as soon
+/// as the submissions begun or queued when it was let go of had finished).
+///
+/// Why (v8, the user: "stretched textures out of the characters, like weird
+/// skin coloured shapes"): v8 used a spare buffer again once
+/// `FINISHED >= STARTED + queued` of the moment it was let go of. That is
+/// weaker than what every other buffer of ours gets: `retire_resource`
+/// keeps a buffer let go of for `bury_lag` (64) submissions more, because
+/// "lists recorded and not yet sent may name them" (the device losses of
+/// 2026-11-25: page faults in memory nothing of ours named any more). The
+/// lists the title has closed and holds, and the ones threads of ours are
+/// translating, are not in `STARTED` nor in `queue::queued`. A dropped
+/// buffer only went away late; a spare is the same GPU address handed to
+/// another view's bytes, zeroed and filled with them, so a list that still
+/// names the old copy reads someone else's data: for skinning matrices and
+/// vertex streams, vertices thrown across the screen.
+fn exact_reuse_safe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_REUSE_SAFE").is_none_or(|v| v != "0"))
+}
+
+/// Frames a spare waits at least before it is used again
+/// (`VICTORY_EXACT_REUSE_FRAMES`, 3 by default; with [`exact_reuse_safe`]).
+fn exact_reuse_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_EXACT_REUSE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3)
+    })
+}
+
+/// The submission after whose end, and the frame from which, a spare let go
+/// of now (`started`, `queued`, `frame`) may be used again.
+pub(crate) fn spare_gate(started: u64, queued: u64, frame: u64, safe: bool, lag: u64, frames: u64) -> (u64, u64) {
+    if safe { (started + queued + lag, frame + frames) } else { (started + queued, frame) }
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is the buffer's CPU
@@ -5800,14 +5863,22 @@ fn spare_exact(shadow: Arc<Shadow>) {
         return;
     }
     let (started, _) = crate::host::submissions();
-    give_spare(buffer, data, width, started + crate::queue::queued());
+    let (after, frame) = spare_gate(
+        started,
+        crate::queue::queued(),
+        crate::frame::current(),
+        exact_reuse_safe(),
+        crate::host::bury_lag(),
+        exact_reuse_frames(),
+    );
+    give_spare(buffer, data, width, after, frame);
 }
 
-fn give_spare(buffer: ID3D12Resource, data: *mut u8, width: u64, after: u64) {
+fn give_spare(buffer: ID3D12Resource, data: *mut u8, width: u64, after: u64, frame: u64) {
     let dropped = SPARES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .give(width, after, Spare { buffer, data: data as usize });
+        .give(width, after, Spare { buffer, data: data as usize, frame });
     for spare in dropped {
         crate::host::retire_resource(spare.buffer);
     }
@@ -5816,7 +5887,8 @@ fn give_spare(buffer: ID3D12Resource, data: *mut u8, width: u64, after: u64) {
 /// A spare buffer of `width` bytes the card is done with, zeroed.
 fn take_spare(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let (_, finished) = crate::host::submissions();
-    let spare = SPARES.lock().unwrap_or_else(|e| e.into_inner()).take(width, finished)?;
+    let frame = crate::frame::current();
+    let spare = SPARES.lock().unwrap_or_else(|e| e.into_inner()).take_if(width, finished, |s| s.frame <= frame)?;
     let data = spare.data as *mut u8;
     // SAFETY: the buffer's CPU mapping of `width` bytes (it was made so),
     // which neither a copy nor the card uses any more.
@@ -5858,7 +5930,12 @@ impl<T> Spares<T> {
 
     /// The oldest kept of `width` whose submission has finished.
     pub(crate) fn take(&mut self, width: u64, finished: u64) -> Option<T> {
-        let at = self.items.iter().position(|&(w, after, _)| w == width && after <= finished)?;
+        self.take_if(width, finished, |_| true)
+    }
+
+    /// [`Spares::take`] of one `ready` also says may be used.
+    pub(crate) fn take_if(&mut self, width: u64, finished: u64, ready: impl Fn(&T) -> bool) -> Option<T> {
+        let at = self.items.iter().position(|(w, after, item)| *w == width && *after <= finished && ready(item))?;
         let (w, _, item) = self.items.remove(at)?;
         self.bytes -= w;
         Some(item)
@@ -5899,6 +5976,19 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod spare_tests {
     use super::Spares;
+
+    #[test]
+    fn a_spare_waits_as_long_as_a_retired_buffer_and_some_frames() {
+        // Safe: 64 submissions past those begun or queued, 3 frames on.
+        assert_eq!(super::spare_gate(100, 4, 10, true, 64, 3), (168, 13));
+        // `VICTORY_EXACT_REUSE_SAFE=0`: v8's gate.
+        assert_eq!(super::spare_gate(100, 4, 10, false, 64, 3), (104, 10));
+        let mut s = Spares::new(1 << 20);
+        assert!(s.give(256, 168, 13u64).is_empty());
+        assert_eq!(s.take_if(256, 104, |&f| f <= 20), None, "lists not yet sent may still name it");
+        assert_eq!(s.take_if(256, 200, |&f| f <= 12), None, "too few frames since");
+        assert_eq!(s.take_if(256, 168, |&f| f <= 13), Some(13));
+    }
 
     #[test]
     fn a_spare_is_taken_only_of_its_width_and_after_its_submission() {
