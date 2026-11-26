@@ -1598,7 +1598,9 @@ fn effects(
             }
             "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => {}
             _ if name.contains("_load_") || name.contains("_store_") => {
-                regs(base, &mut r)?;
+                if let Some(base) = base {
+                    regs(base, &mut r)?;
+                }
                 regs(soffset, &mut r)?;
                 let data = data.as_ref().ok_or_else(unsupported)?;
                 regs(

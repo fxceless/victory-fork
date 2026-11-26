@@ -289,11 +289,11 @@ pub fn track(
                     descriptor(rsrc, Role::Resource)?
                 }
                 Fields::Buffer { .. } => {}
-                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
+                Fields::Smem { base: Some(base), .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }
                 Fields::Smem {
-                    base,
+                    base: Some(base),
                     offset,
                     soffset,
                     ..
@@ -1255,7 +1255,7 @@ impl<'a> Tracer<'a> {
                 let inst = self.inst(*load);
                 match &inst.fields {
                     Fields::Smem {
-                        base,
+                        base: Some(base),
                         offset,
                         soffset,
                         ..
@@ -1484,7 +1484,7 @@ impl<'a> Tracer<'a> {
     fn first_lane_offset(&self, load: Site) -> Option<Value> {
         let inst = self.inst(load);
         let Fields::Smem {
-            base,
+            base: Some(base),
             offset,
             soffset,
             ..
@@ -2139,7 +2139,7 @@ impl<'a> Tracer<'a> {
             let inst = self.inst(site);
             match &inst.fields {
                 Fields::Smem {
-                    base,
+                    base: Some(base),
                     offset,
                     soffset,
                     ..
@@ -2219,7 +2219,7 @@ impl<'a> Tracer<'a> {
     fn base_from_entry(&self, site: Site) -> bool {
         let inst = self.inst(site);
         let Fields::Smem {
-            base: Operand::Scalar { code, .. },
+            base: Some(Operand::Scalar { code, .. }),
             soffset: Operand::Scalar { code: NULL, .. },
             ..
         } = &inst.fields

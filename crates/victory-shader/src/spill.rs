@@ -161,7 +161,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         'insts: for (i, inst) in block.insts.iter().enumerate() {
             let Fields::Smem {
                 data: Some(Operand::Scalar { code: first, .. }),
-                base: Operand::Scalar { code: base, .. },
+                base: Some(Operand::Scalar { code: base, .. }),
                 offset,
                 soffset,
                 ..
