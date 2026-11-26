@@ -13,6 +13,7 @@ pub mod emit;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
+pub mod merged;
 pub mod native;
 pub mod resource;
 pub mod spill;

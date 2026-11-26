@@ -69,6 +69,17 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Geometry programs (the GS half of a merged ES+GS stage), those whose
+    /// resources were traced and whose I/O was raised, and those emission
+    /// stopped at [`emit::GS_EMIT`]: counted here, not among `failed`.
+    gs_programs: usize,
+    gs_tracked: usize,
+    gs_raised: usize,
+    /// Geometry programs whose emitted vertices are bounded in the code, and
+    /// the largest bound ([`victory_shader::merged::limits`]).
+    gs_bounded: usize,
+    gs_max_vertices: u32,
+    gs_stopped: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +141,12 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.gs_programs += other.gs_programs;
+        self.gs_tracked += other.gs_tracked;
+        self.gs_raised += other.gs_raised;
+        self.gs_bounded += other.gs_bounded;
+        self.gs_max_vertices = self.gs_max_vertices.max(other.gs_max_vertices);
+        self.gs_stopped += other.gs_stopped;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -356,6 +373,15 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "geometry     {} programs: {} resources traced, {} I/O raised, {} stopped at {} \
+         (no geometry emission yet; not among the failures below)",
+        t.gs_programs,
+        t.gs_tracked,
+        t.gs_raised,
+        t.gs_stopped,
+        emit::GS_EMIT
+    );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -505,8 +531,19 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let geometry = p.stage == HwStage::Gs;
+                t.gs_programs += usize::from(geometry);
+                if geometry && let Ok(l) = victory_shader::merged::limits(&program) {
+                    t.gs_bounded += 1;
+                    t.gs_max_vertices = t.gs_max_vertices.max(l.max_vertices);
+                }
+                // (the ES half each geometry program pairs with is not in
+                // its container: its user data 0 and 1 are taken as free, which
+                // the geometry line says)
+                let track = if geometry { resource::track_merged } else { resource::track };
+                let res = match track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
+                        t.gs_tracked += usize::from(geometry);
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
@@ -524,13 +561,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || p.stage == HwStage::Ms || geometry {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
                             if graphics {
                                 tally_io(&r, t);
                             }
+                            t.gs_raised += usize::from(geometry);
                             raised = Some(r);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -557,6 +595,18 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
+                    if geometry {
+                        // No geometry emission yet: counted on its own line,
+                        // anything else it fails with is a failure.
+                        match emit::emit(container, &p, &program, &s, &i, &r) {
+                            Err(ShaderError::Unsupported { what, .. }) if what == emit::GS_EMIT => {
+                                t.gs_stopped += 1;
+                            }
+                            Err(e) => t.fail(format!("emit: {e}"), label),
+                            Ok(_) => unreachable!("geometry emission is refused"),
+                        }
+                        continue;
+                    }
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
@@ -790,6 +840,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
+            && a.param != resource::RUNTIME_TABLE
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap
