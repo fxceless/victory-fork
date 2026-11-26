@@ -2984,6 +2984,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// `VICTORY_BVH_QUARANTINE`: the list records a stage of the structure
+    /// builder, so nothing its shaders write is copied back into title
+    /// memory. Copy-backs are declared per list, not per dispatch: another
+    /// shader's declaration in the same list covered the builder's stores
+    /// too, and quarantine leaked.
+    quarantined: bool,
 }
 
 impl Deferred {
@@ -8507,9 +8513,22 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        if deferred.quarantined {
+            return;
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// The list records a quarantined stage of the structure builder: no
+    /// shader write of the whole list is copied back into title memory,
+    /// those declared before it included (see `Deferred::quarantined`).
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
