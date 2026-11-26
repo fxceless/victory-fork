@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -187,7 +187,65 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+type PendingStaging = Arc<OnceLock<Option<Arc<Staging>>>>;
+
+enum StagingEntry {
+    Creating(PendingStaging),
+    Ready(Arc<Staging>),
+}
+
+impl StagingEntry {
+    fn ready(&self) -> Option<&Arc<Staging>> {
+        match self {
+            Self::Creating(_) => None,
+            Self::Ready(staging) => Some(staging),
+        }
+    }
+}
+
+#[derive(Default)]
+struct StagingTable {
+    entries: HashMap<usize, StagingEntry>,
+    creating: usize,
+}
+
+static STAGING: Mutex<Option<StagingTable>> = Mutex::new(None);
+
+struct StagingCreation {
+    key: usize,
+    pending: PendingStaging,
+}
+
+impl StagingCreation {
+    fn publish(&self, result: Option<Arc<Staging>>) {
+        {
+            let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            // Removals wait for this reservation. Idle eviction skips it.
+            let table = table.as_mut().expect("staging table initialized");
+            match &result {
+                Some(staging) => {
+                    table
+                        .entries
+                        .insert(self.key, StagingEntry::Ready(staging.clone()));
+                }
+                None => {
+                    table.entries.remove(&self.key);
+                }
+            }
+            table.creating -= 1;
+        }
+        let _ = self.pending.set(result);
+    }
+}
+
+impl Drop for StagingCreation {
+    fn drop(&mut self) {
+        // Also release the reservation if the creator unwinds.
+        if self.pending.get().is_none() {
+            self.publish(None);
+        }
+    }
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -529,7 +587,7 @@ pub(crate) fn memory() -> [u64; 3] {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or(0, |map| map.len() as u64);
+        .map_or(0, |table| (table.entries.len() - table.creating) as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
@@ -554,7 +612,7 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
+    let Some(map) = map.as_mut().map(|table| &mut table.entries) else {
         return;
     };
     if map.is_empty() {
@@ -565,7 +623,10 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
+    map.retain(|_, entry| {
+        let Some(s) = entry.ready() else {
+            return true;
+        };
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
@@ -661,10 +722,7 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
-    }
+    unstage(resource as This);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -1255,16 +1313,66 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    let key = resource as usize;
+    let pending = {
+        let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = table.as_mut().map(|table| &mut table.entries) else {
+            return;
+        };
+        if let Some(StagingEntry::Creating(pending)) = map.get(&key) {
+            pending.clone()
+        } else {
+            let removed = map.remove(&key);
+            drop(table);
+            drop(removed);
+            return;
+        }
+    };
+    // A concurrent creator can finish for callers already using this
+    // texture. Remove its result before returning. Another remover may
+    // already have removed it and a later use may have staged it again.
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::RemovalWaiting);
+    let Some(staging) = pending.wait() else {
+        return;
+    };
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::RemovalReady);
+    let removed = {
+        let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = table.as_mut().map(|table| &mut table.entries) else {
+            return;
+        };
+        if map
+            .get(&key)
+            .and_then(StagingEntry::ready)
+            .is_some_and(|s| Arc::ptr_eq(s, staging))
+        {
+            map.remove(&key)
+        } else {
+            None
+        }
+    };
+    drop(removed);
+}
+
+/// Observe a ready entry, or wait for this identity's current creator.
+fn with_staging<R>(resource: This, read: impl FnOnce(&Arc<Staging>) -> R) -> Option<R> {
+    let pending = {
+        let table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        match table.as_ref()?.entries.get(&(resource as usize))? {
+            StagingEntry::Ready(staging) => return Some(read(staging)),
+            StagingEntry::Creating(pending) => pending.clone(),
+        }
+    };
+    #[cfg(test)]
+    staging_tests::at(staging_tests::Point::Waiting);
+    pending.wait().as_ref().map(read)
 }
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+    let (at, len) = with_staging(resource, |staging| staging.memory())?;
     Some((at as u64, len as u64))
 }
 
@@ -1308,23 +1416,19 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let staging = map.as_ref()?.get(&(resource as usize))?;
-    Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
+    with_staging(resource, |staging| {
+        (staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed))
+    })
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    with_staging(resource, |_| ()).is_some()
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
-    let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
-    };
+    let s = with_staging(resource, Arc::clone)?;
     let size = s.layout.size as usize;
     Some((size as u64, committed(s.memory, size)))
 }
@@ -1486,11 +1590,42 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
-    }
+    let key = resource as usize;
+    let creator = {
+        use std::collections::hash_map::Entry;
+        let mut table = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let StagingTable { entries, creating } = table.get_or_insert_with(StagingTable::default);
+        match entries.entry(key) {
+            Entry::Occupied(entry) => match entry.get() {
+                StagingEntry::Ready(staging) => return Some(staging.clone()),
+                StagingEntry::Creating(pending) => {
+                    let pending = pending.clone();
+                    drop(table);
+                    #[cfg(test)]
+                    staging_tests::at(staging_tests::Point::Waiting);
+                    return pending.wait().clone();
+                }
+            },
+            Entry::Vacant(entry) => {
+                let pending = Arc::new(OnceLock::new());
+                entry.insert(StagingEntry::Creating(pending.clone()));
+                *creating += 1;
+                StagingCreation { key, pending }
+            }
+        }
+    };
+    // The caller keeps the title resource and its host copy live.
+    // Creation cannot lock the resource's host side: its sweep holds that
+    // lock while waiting for this reservation in `unstage`.
+    #[cfg(test)]
+    let staging = staging_tests::create(|| new_staging(resource, texture, on_demand));
+    #[cfg(not(test))]
+    let staging = new_staging(resource, texture, on_demand);
+    creator.publish(staging.clone());
+    staging
+}
+
+fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1538,7 +1673,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let s = Arc::new(Staging {
+    Some(Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
@@ -1558,9 +1693,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
-    });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    }))
 }
 
 /// Shared body of [`Staging::refresh_unlocked`], separated for unit tests.
@@ -1603,6 +1736,9 @@ fn refresh_unlocked_with(
         0
     }
 }
+
+#[cfg(test)]
+mod staging_tests;
 
 #[cfg(test)]
 mod title_memory_tests {
