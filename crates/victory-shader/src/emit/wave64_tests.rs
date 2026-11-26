@@ -905,3 +905,71 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// Edge threading (`ir::thread_edges`) can resolve an unsupported register
+/// error on a wave64 compute shader that still needs the 32-lane retry passes
+/// (`without_skips` / `local_waves`). Calling `emit_once` after threading lets
+/// those retries run instead of failing or emitting `WaveSize(64)`.
+#[test]
+fn threaded_wave64_compute_still_runs_wave32_retries() {
+    // Uniform triangle on s0 == 0:
+    //   fork: v1 = 0; if (s0 == 0) jump join (ttmp0 uninitialized on this edge)
+    //   arm:  ttmp0 = 5; v1 = 1; fallthrough join
+    // join: if (v1 == 0) branch S_ENDPGM
+    // body: if (t < s1) { v_readlane_b32 s7, v0, 0 } (needs without_skips on wave32);
+    //       store ttmp0 + s7 to UAV.
+    let words = [
+        0x7E02_0280, // 0: v_mov_b32 v1, 0
+        0xBF06_8000, // 1: s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // 2: s_cbranch_scc1 +2 -> word 5 (join)
+        0xBEEC_0385, // 3: s_mov_b32 ttmp0 (108), 5
+        0x7E02_0281, // 4: v_mov_b32 v1, 1
+        0x7D84_0280, // 5: join: v_cmp_eq_u32 vcc, 0, v1
+        0xBF87_000B, // 6: s_cbranch_vccnz +11 -> S_ENDPGM (word 18)
+        0xBE87_0380, // 7: body: s_mov_b32 s7, 0
+        0x7D88_0001, // 8: v_cmp_gt_u32 vcc, s1, v0
+        0xBE8C_246A, // 9: s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // 10: s_cbranch_execz +2 -> word 13
+        0xD760_0007, // 11: v_readlane_b32 s7, v0, 0 (2 dwords)
+        0x0001_0100, // 12:
+        0xBEFE_040C, // 13: s_mov_b64 exec, s[12:13]
+        0x8006_076C, // 14: s_add_u32 s6, ttmp0 (108), s7
+        0x7E04_0206, // 15: v_mov_b32 v2, s6
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 2 << 8, // 16-17: buffer_store_dword v2, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let edges = super::threading::constant_edges(&p, &st);
+    assert!(!edges.is_empty(), "test program must trigger constant-edge threading");
+    let io = io::raise(&p, &native).expect("io");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+    let empty_bytes = crate::dxbc::build(&[]);
+    let empty = crate::Container::parse(&empty_bytes).unwrap();
+    // Confirm the threaded program alone still requires the wave32 retry path.
+    let tp = ir::thread_edges(&p, &edges).expect("thread_edges");
+    let tst = structure::structure(&tp).expect("threaded structure");
+    let tio = io::raise(&tp, &native).expect("threaded io");
+    let tres = resource::track(&tp, &native.layout, native.stage, Some(&tst)).expect("threaded res");
+    let (plain_threaded, shader) = lower::TEST_HOST_WAVE.with(|cell| {
+        let was = cell.replace(Some(32));
+        let plain = super::emit_program(&empty, &native, &tp, &tst, &tio, &tres);
+        let full = super::emit(&empty, &native, &p, &st, &io, &res);
+        cell.set(was);
+        (plain, full)
+    });
+    assert!(
+        matches!(
+            &plain_threaded,
+            Ok((_, Some(64))) | Err(ShaderError::Unsupported { .. })
+        ),
+        "expected plain threaded emit_program to need wave32 retries, got {:?}",
+        plain_threaded.as_ref().map(|(_, w)| w)
+    );
+    let shader = shader.expect("threaded wave64 compute shader should succeed via wave32 retries");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
