@@ -2677,6 +2677,59 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        cpu: u64,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
+        let Some(view @ View::Unordered(..)) = crate::descriptor::view(cpu) else {
+            once!("an unordered access clear of a slot without a view");
+            return;
+        };
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+            once!("an unordered access clear without a bound view heap");
+            return;
+        };
+        let Some(visible) = heap.host() else { return };
+        let Some(slot) = visible.dynamic(1) else {
+            return;
+        };
+        let Some((at, resource)) = host.clear_view().and_then(|at| {
+            visible.make_clear_view(slot, &view, at).map(|resource| (at, resource))
+        }) else {
+            visible.release(slot, 1);
+            once!("an unordered access clear of a view the host cannot make");
+            return;
+        };
+        self.dynamic
+            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        // What the clear writes to a buffer's host copy goes back to title
+        // memory, as a shader's stores do.
+        self.window = None;
+        list.gather_close();
+        let stores = STORES.replace(true);
+        readable(list, ResourceType::Uav, &view);
+        STORES.set(stores);
+        self.bind_heaps(list);
+        list.keep(&resource);
+        let gpu = visible.gpu_handle(slot);
+        // SAFETY: an open list; both slots view the live resource.
+        unsafe {
+            if float {
+                let values = values.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
