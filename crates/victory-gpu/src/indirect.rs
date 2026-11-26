@@ -781,8 +781,28 @@ pub(crate) fn clamp_window() -> bool {
     }
 }
 
-/// Records a window clamps at most (a multiple of the clamp's 64 threads).
+/// Ordered single-group batching for read-only indirect draws (0051 subset).
+pub(crate) fn ordered_batches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_BATCH").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn ordered_batch_eligible(kind: u32, max: u32, has_count: bool, spread: bool) -> bool {
+    matches!(kind, 0 | 1) && max == 1 && !has_count && !spread
+}
+
+/// A single 64-thread group charges its budget in lane order. The legacy
+/// multi-group window is unchanged when ordered batching is disabled.
 const WINDOW_SLOTS: u32 = 256;
+const ORDERED_SLOTS: u32 = 64;
+
+fn window_capacity(ordered: bool) -> u32 {
+    if ordered { ORDERED_SLOTS } else { WINDOW_SLOTS }
+}
+
+fn window_has_space(used: u32, records: u32, capacity: u32) -> bool {
+    records != 0 && used.checked_add(records).is_some_and(|n| n <= capacity)
+}
 
 /// Since the start: windows opened (passes), draws served, records.
 pub(crate) static WINDOWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -811,6 +831,13 @@ pub(crate) fn end_window(list: &HostList) {
     *list.clamp_window() = None;
 }
 
+/// Explicit title ordering boundaries for the ordered mode.
+pub(crate) fn end_ordered_batch(list: &HostList) {
+    if ordered_batches() {
+        end_window(list);
+    }
+}
+
 /// The clamped records of an indirect draw (no count buffer, not spread, shaders that cannot store): `records`
 /// records of `kind`, `stride` bytes apart from `offset` in the host copy `src`, in `list`'s open window or in one
 /// opened for it. Returns the scratch buffer, the records' byte offset in it, and whether a pass was recorded (it
@@ -823,7 +850,18 @@ pub(crate) fn windowed(
     use std::sync::atomic::Ordering::Relaxed;
     // SAFETY: a live D3D12 buffer resource.
     let src_gpu = unsafe { src.GetGPUVirtualAddress() };
-    if kind == 2 || records == 0 || records > WINDOW_SLOTS {
+    let ordered = ordered_batches();
+    let capacity = window_capacity(ordered);
+    if ordered {
+        // SAFETY: src is a live D3D12 buffer. Check the actual resource extent,
+        // not just whether the gathered offset fits a 32-bit table entry.
+        let width = unsafe { src.GetDesc() }.Width;
+        let bytes = u64::from(min_stride(kind)?);
+        if records != 1 || !matches!(kind, 0 | 1) || offset.checked_add(bytes)? > width {
+            return None;
+        }
+    }
+    if kind == 2 || !window_has_space(0, records, capacity) {
         return None;
     }
     // Every record's offset fits the table's 32-bit words and the clamp's gathered form.
@@ -833,13 +871,13 @@ pub(crate) fn windowed(
     let mut slot = list.clamp_window();
     let joins = slot
         .as_ref()
-        .is_some_and(|w| w.src == src_gpu && w.kind == kind && w.stride == stride && w.records + records <= WINDOW_SLOTS);
+        .is_some_and(|w| w.src == src_gpu && w.kind == kind && w.stride == stride && window_has_space(w.records, records, capacity));
     let mut opened = false;
     if !joins {
         *slot = None;
         let (c, budget) = (clamp()?, list.budget()?);
-        let dst = list.indirect_scratch(u64::from(WINDOW_SLOTS) * u64::from(stride))?;
-        let (table_gpu, table) = list.scratch(4 + 4 * u64::from(WINDOW_SLOTS))?;
+        let dst = list.indirect_scratch(u64::from(capacity) * u64::from(stride))?;
+        let (table_gpu, table) = list.scratch(4 + 4 * u64::from(capacity))?;
         // SAFETY: the first word of the list's fresh upload memory.
         unsafe { (table as *mut u32).write_volatile(0) };
         // SAFETY: a live D3D12 buffer resource.
@@ -848,7 +886,7 @@ pub(crate) fn windowed(
             return None;
         }
         let before = list.indirect_state(&dst);
-        let constants = [kind, stride, WINDOW_SLOTS, 0u32, 4u32 | 16u32, 0u32];
+        let constants = [kind, stride, capacity, 0u32, 4u32 | 16u32, 0u32];
         let first = [uav_barrier(), transition(&dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
         let second = [
             uav_barrier(),
@@ -868,7 +906,7 @@ pub(crate) fn windowed(
             l.SetComputeRootShaderResourceView(2, table_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(WINDOW_SLOTS / 64, 1, 1);
+            l.Dispatch(capacity / 64, 1, 1);
             l.ResourceBarrier(&second);
         }
         crate::cardmeter::end(l, timed);
@@ -2686,6 +2724,70 @@ void main(uint3 gid : SV_GroupID) {
         // The source is read only.
         // SAFETY: a mapped buffer.
         assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    #[test]
+    fn ordered_batch_admission_and_capacity_are_conservative() {
+        assert_eq!(window_capacity(true), 64);
+        assert_eq!(window_capacity(false), 256);
+        assert!(window_has_space(63, 1, window_capacity(true)));
+        assert!(!window_has_space(64, 1, window_capacity(true)));
+        assert!(!window_has_space(u32::MAX, 1, window_capacity(true)));
+        assert!(!window_has_space(0, 0, window_capacity(true)));
+        assert!(ordered_batch_eligible(0, 1, false, false));
+        assert!(ordered_batch_eligible(1, 1, false, false));
+        assert!(!ordered_batch_eligible(2, 1, false, false));
+        assert!(!ordered_batch_eligible(10, 1, false, false));
+        assert!(!ordered_batch_eligible(1, 2, false, false));
+        assert!(!ordered_batch_eligible(1, 1, true, false));
+        assert!(!ordered_batch_eligible(1, 1, false, true));
+    }
+
+    #[test]
+    fn warp_ordered_counted_table_charges_duplicate_records_in_order() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 16;
+        let capacity = window_capacity(true);
+        let (_source, src_ptr, src_gpu) = warp.shared_buffer(u64::from(STRIDE));
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(u64::from(capacity + 1) * 4);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback, readback_ptr, _) = warp.shared_buffer(u64::from(3 * STRIDE));
+        let dst = warp.default_uav(u64::from(capacity * STRIDE));
+        let draw = [1u32 << 22, 16, 5, 7];
+        let constants = [0, STRIDE, capacity, 0, 4 | 16, 0];
+        // Three executions of the same source; only two fit the budget.
+        // SAFETY: mapped buffers of the indicated lengths and an open list.
+        unsafe {
+            std::ptr::copy_nonoverlapping(draw.as_ptr(), src_ptr.cast::<u32>(), draw.len());
+            std::ptr::write_bytes(table_ptr, 0, (capacity as usize + 1) * 4);
+            table_ptr.cast::<u32>().write_volatile(3);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, (3 * STRIDE) as usize);
+            let dst_gpu = dst.GetGPUVirtualAddress();
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            warp.list.SetComputeRootSignature(&warp.clamp.root);
+            warp.list.SetPipelineState(&warp.clamp.pso);
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, src_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, table_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(4, budget_gpu);
+            warp.list.Dispatch(capacity / 64, 1, 1);
+            warp.list.ResourceBarrier(&[uav_barrier(), transition(&dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&readback, 0, &dst, 0, u64::from(3 * STRIDE));
+        }
+        warp.submit_and_wait();
+        // SAFETY: completed GPU work and mapped readback buffers.
+        let (spent, out) = unsafe {
+            (budget_ptr.cast::<u32>().read_volatile(), std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 12))
+        };
+        assert_eq!(spent, 1 << 27);
+        assert_eq!(&out[..4], &draw);
+        assert_eq!(&out[4..8], &draw);
+        assert_eq!(&out[8..], &[0, 0, 5, 7]);
     }
 
     #[test]

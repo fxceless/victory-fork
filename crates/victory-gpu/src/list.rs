@@ -754,6 +754,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        crate::indirect::end_ordered_batch(list);
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -1499,7 +1500,14 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if crate::indirect::ordered_batches() && let Some(list) = host_list(this) {
+        crate::indirect::end_window(list);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1987,6 +1995,10 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    #[cfg(windows)]
+    if crate::indirect::ordered_batches() && let Some(list) = host_list(this) {
+        crate::indirect::end_window(list);
+    }
     let wait = ValueWait {
         address,
         comparison,
@@ -2037,6 +2049,10 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    if count > 0 && crate::indirect::ordered_batches() && let Some(list) = host_list(this) {
+        crate::indirect::end_window(list);
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {

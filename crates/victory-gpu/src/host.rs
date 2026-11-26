@@ -8246,6 +8246,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        crate::indirect::end_ordered_batch(self);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -8303,6 +8304,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        crate::indirect::end_ordered_batch(self);
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
@@ -8313,11 +8315,13 @@ impl HostList {
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        crate::indirect::end_ordered_batch(self);
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        crate::indirect::end_ordered_batch(self);
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -8618,6 +8622,7 @@ impl HostList {
     /// (refreshes after it copy again; [`near_writes`] uses the place,
     /// without the switch any write of title memory is assumed).
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
+        crate::indirect::end_ordered_batch(self);
         self.deferred().copies.push(Step::Run(Box::new(work), Some((at, len))));
         self.deferred().refreshed.clear();
         if list_reuse_set() {
@@ -8627,6 +8632,7 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
+        crate::indirect::end_ordered_batch(self);
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
