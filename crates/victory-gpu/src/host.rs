@@ -1195,15 +1195,54 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
+    host_result().as_ref().ok()
+}
+
+fn host_result() -> &'static windows::core::Result<Host> {
+    static HOST: OnceLock<windows::core::Result<Host>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let result = create();
+        if let Err(error) = &result {
+            tracing::warn!(%error, "no host D3D12 device; command lists will not run");
         }
+        result
     })
-    .as_ref()
+}
+
+/// Verify the runtime used by the title before any title code runs.
+pub fn require_runtime() -> anyhow::Result<()> {
+    check_runtime(host_result())
+}
+
+fn check_runtime(initialization: &windows::core::Result<Host>) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let host = initialization.as_ref().map_err(Clone::clone).context("initializing the host D3D12 device")?;
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: each feature selector matches the writable output structure.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32,
+        ).context("querying D3D12 Shader Model 6.6 support")?;
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32,
+        ).context("querying D3D12 resource binding tier")?;
+    }
+    require_direct_indexing(model.HighestShaderModel, options.ResourceBindingTier)?;
+    crate::pipeline::host::root_signature(&host.device, &[], &[], false)
+        .context("creating the Direct Indexing root signature on the host D3D12 device")?;
+    Ok(())
+}
+
+fn require_direct_indexing(model: D3D_SHADER_MODEL, tier: D3D12_RESOURCE_BINDING_TIER) -> anyhow::Result<()> {
+    if model.0 < D3D_SHADER_MODEL_6_6.0 || tier.0 < D3D12_RESOURCE_BINDING_TIER_3.0 {
+        anyhow::bail!(
+            "host D3D12 Direct Indexing needs Shader Model 6.6 and Resource Binding Tier 3. \
+             Found SM {}.{} and Tier {}. Use a D3D12 runtime and driver that support both",
+            model.0 >> 4, model.0 & 0xf, tier.0
+        );
+    }
+    Ok(())
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -1275,7 +1314,9 @@ fn create() -> windows::core::Result<Host> {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device = device.ok_or_else(|| {
+            windows::core::Error::new(windows::Win32::Foundation::E_POINTER, "D3D12CreateDevice returned no device")
+        })?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -1314,7 +1355,6 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
             .is_ok()
             && o16.GPUUploadHeapSupported.as_bool();
-        GPU_UPLOAD.store(upload, Ordering::Relaxed);
         tracing::info!(
             supported = upload,
             "GPU upload heaps (the card's memory written by the CPU through a resizable BAR; VICTORY_WINDOW_UPLOAD=1 puts windows outside buffers there)"
@@ -1327,7 +1367,6 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -1345,6 +1384,8 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        let event = CreateEventW(None, false, false, None)?;
+        GPU_UPLOAD.store(upload, Ordering::Relaxed);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1389,6 +1430,33 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_initialization_failure_preserves_hresult() {
+        let hresult = windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED;
+        let initialization = Err(windows::core::Error::from_hresult(hresult));
+        let error = super::check_runtime(&initialization).unwrap_err();
+        assert_eq!(error.to_string(), "initializing the host D3D12 device");
+        assert_eq!(error.downcast_ref::<windows::core::Error>().unwrap().code(), hresult);
+    }
+
+    #[test]
+    fn direct_indexing_rejects_shader_model_6_5() {
+        let error = super::require_direct_indexing(
+            super::D3D_SHADER_MODEL_6_5, super::D3D12_RESOURCE_BINDING_TIER_3,
+        ).unwrap_err();
+        assert!(error.to_string().contains("Found SM 6.5 and Tier 3"));
+    }
+
+    #[test]
+    fn direct_indexing_requires_binding_tier_3_at_shader_model_6_6() {
+        assert!(super::require_direct_indexing(
+            super::D3D_SHADER_MODEL_6_6, super::D3D12_RESOURCE_BINDING_TIER_2,
+        ).is_err());
+        super::require_direct_indexing(
+            super::D3D_SHADER_MODEL_6_6, super::D3D12_RESOURCE_BINDING_TIER_3,
+        ).unwrap();
+    }
+
     /// Run once with VICTORY_CARD_SYNC_BATCH=0 and once with it set to 1.
     #[test]
     #[ignore = "requires a D3D12 adapter and the card hash pipeline; run alone"]

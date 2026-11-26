@@ -1106,7 +1106,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
+pub(crate) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
@@ -1138,17 +1138,25 @@ fn root_signature(
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                let data = error.GetBufferPointer().cast::<u8>();
+                let size = error.GetBufferSize();
+                if !data.is_null() && size != 0 {
+                    let text = std::slice::from_raw_parts(data, size);
+                    tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                }
             }
             return Err(e);
         }
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        let missing = || windows::core::Error::new(
+            windows::Win32::Foundation::E_POINTER, "root signature serialization returned no bytes",
+        );
+        let blob = blob.ok_or_else(missing)?;
+        let data = blob.GetBufferPointer().cast::<u8>();
+        let size = blob.GetBufferSize();
+        if data.is_null() || size == 0 {
+            return Err(missing());
+        }
+        let bytes = std::slice::from_raw_parts(data, size);
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }
