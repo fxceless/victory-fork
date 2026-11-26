@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "lds_integer.rs"]
+mod lds_integer;
+
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
@@ -4818,7 +4821,6 @@ impl<'a> Lower<'a> {
             .strip_prefix("ds_")
             .map(|n| n.replace("_rtn", ""))
             .ok_or("an LDS operation")?;
-        use super::bitcode::Rmw;
         let rmw = match op.as_str() {
             "add_u32" => Some(Rmw::Add),
             "sub_u32" => Some(Rmw::Sub),
@@ -4830,7 +4832,8 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" | "max_f32" | "min_f32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" | "rsub_u32" | "mskor_b32"
+            | "inc_u32" | "dec_u32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -4851,6 +4854,23 @@ impl<'a> Lower<'a> {
         } {
             let at = self.begin_guarded(guard);
             let r = self.lds_float_min_max(p, v0, max);
+            let r = self.end_guarded(at, &[(r, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
+        if matches!(
+            op.as_str(),
+            "rsub_u32" | "mskor_b32" | "inc_u32" | "dec_u32"
+        ) {
+            let mask_value = if op == "mskor_b32" {
+                Some(v1.ok_or("an LDS masked OR")?)
+            } else {
+                None
+            };
+            let at = self.begin_guarded(guard);
+            let r = self.lds_integer_update(p, &op, v0, mask_value);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
                 self.write(inst, Reg::V(reg), r, None);

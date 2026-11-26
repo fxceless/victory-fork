@@ -100,6 +100,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_with_output(body, threads, lds_bytes, false, &buffer_store_dword(0, 8, 0))
+}
+
+fn build_cs_with_output(
+    body: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    wave64: bool,
+    output: &[u32],
+) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -110,13 +120,13 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(output);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -1148,6 +1158,21 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     ]
 }
 
+const fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+const DS_INC_U32: u8 = 0x03;
+const DS_DEC_U32: u8 = 0x04;
+const DS_RSUB_U32: u8 = 0x02;
+const DS_RSUB_RTN_U32: u8 = 0x22;
+const DS_INC_RTN_U32: u8 = 0x23;
+const DS_DEC_RTN_U32: u8 = 0x24;
+const DS_MSKOR_B32: u8 = 0x0c;
+const DS_MSKOR_RTN_B32: u8 = 0x2c;
 const DS_WRITE_B32: u8 = 0x0D;
 const DS_MIN_F32: u8 = 0x12;
 const DS_MAX_F32: u8 = 0x13;
@@ -1655,6 +1680,203 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         }
         assert_eq!(got, want[i], "{backend}: case {i}");
     });
+}
+
+fn ds_inc_dec_program(op: u8, read_back: bool) -> HostShader {
+    let mut body = vec![vop1(0x001, 5, 0x80)];
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.extend(ds(op, 0, 5, 2)); // DATA0 = v2, the unsigned limit.
+    if read_back {
+        body.extend(ds(DS_READ_B32, 0, 5, 0));
+    }
+    build_cs(&body, 1, 512)
+}
+
+#[test]
+fn ds_inc_dec_u32_lower() {
+    for op in [DS_INC_U32, DS_DEC_U32, DS_INC_RTN_U32, DS_DEC_RTN_U32] {
+        let _ = ds_inc_dec_program(op, true);
+    }
+}
+
+#[test]
+#[ignore = "requires an SM 6.6 GPU or WARP device"]
+fn ds_inc_dec_u32_step_and_return() {
+    // Literal RDNA2 Section 12.13 vectors: (old, DATA0, increment result, decrement result).
+    let vectors = [
+        (0, 0, 0, 0),
+        (0, 5, 1, 5),
+        (1, 0, 0, 0),
+        (1, 5, 2, 0),
+        (4, 5, 5, 3),
+        (5, 5, 0, 4),
+        (6, 5, 0, 5),
+        (0x7fff_ffff, 0x8000_0000, 0x8000_0000, 0x7fff_fffe),
+        (0x8000_0000, 0x7fff_ffff, 0, 0x7fff_ffff),
+        (u32::MAX - 1, u32::MAX, u32::MAX, u32::MAX - 2),
+        (u32::MAX, u32::MAX, 0, u32::MAX - 1),
+        (u32::MAX, 0, 0, 0),
+    ];
+    let inputs = vectors.map(|(old, limit, _, _)| [old, limit, 0, 0]);
+    for (op, read_back, field) in [
+        (DS_INC_U32, true, 1),
+        (DS_INC_RTN_U32, true, 1),
+        (DS_INC_RTN_U32, false, 0),
+        (DS_DEC_U32, true, 2),
+        (DS_DEC_RTN_U32, true, 2),
+        (DS_DEC_RTN_U32, false, 0),
+    ] {
+        run_cases_on(
+            &ds_inc_dec_program(op, read_back),
+            &inputs,
+            &[("hardware", false), ("warp", true)],
+            |backend, i, _, got| {
+                let (old, _, inc, dec) = vectors[i];
+                assert_eq!(got, [old, inc, dec][field], "{backend}: opcode {op:#x}, vector {i}");
+            },
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an SM 6.6 GPU or WARP device"]
+fn ds_inc_dec_return_values_from_successful_contended_updates() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).or_else(|_| Host::new(true)).expect("SM 6.6 device");
+    for (op, start) in [(DS_INC_RTN_U32, 0x80), (DS_DEC_RTN_U32, 0x9f)] {
+        let mut body = vec![
+            vop1(0x001, 5, 0x80), // LDS address 0
+            vop1(0x001, 2, 0x9f), // limit 31
+            vop1(0x001, 1, start),
+            0x340E_0082, // v7 = thread ID * 4
+            0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+        ];
+        body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        body.extend([s_mov_b32(126, 0xc1), 0xBF8A_0000]); // restore EXEC; s_barrier
+        body.extend(ds(op, 6, 5, 2));
+        let shader = build_cs_with_output(&body, 32, 512, false, &[0xE070_1000, 0x8002_0607]);
+        let (root, pso) = host.compute_pipeline(&shader).expect("atomic pipeline");
+        let mut outputs = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+            views: &[View::RawUav(32)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("contended atomic dispatch");
+        outputs[0].sort_unstable();
+        assert!(outputs[0].iter().copied().eq(0..32), "one old value per update: {outputs:?}");
+    }
+}
+
+#[test]
+fn ds_rsub_u32_lower() {
+    // ds_rsub_u32 (0x02) / _rtn (0x22): reversed subtract, mem = data - old
+    // (a compare-exchange loop, not a plain atomic). build_cs runs lower +
+    // DXIL validation, so this proves it lowers on the CPU without a GPU.
+    let body = |op: u8| {
+        let mut b = vec![vop1(0x001, 5, 0x80)]; // v5 = 0
+        b.extend(ds(DS_WRITE_B32, 0, 5, 1)); // LDS[v5] = v1
+        b.extend(ds(op, 0, 5, 2)); // LDS[v5] = v2 - LDS[v5]
+        b.extend(ds(DS_READ_B32, 0, 5, 0)); // v0 = LDS[v5]
+        b
+    };
+    for op in [DS_RSUB_U32, DS_RSUB_RTN_U32] {
+        let _ = build_cs(&body(op), 1, 512);
+    }
+}
+
+#[test]
+#[ignore = "requires an SM 6.6 GPU or WARP device"]
+fn ds_rsub_u32_reverses_the_subtract() {
+    // v5 = 0; LDS[v5] = v1 (A); ds_rsub_u32 leaves LDS[v5] = v2 - A (data -
+    // old, the reversed form); v0 is the old value (_rtn) or the dword
+    // afterwards (read back). With one thread the atomic is a plain
+    // load+store, so the result is exactly (v2 - A) mod 2^32.
+    let body = |op: u8, read_back: bool| {
+        let mut b = vec![vop1(0x001, 5, 0x80)];
+        b.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        b.extend(ds(op, 0, 5, 2));
+        if read_back {
+            b.extend(ds(DS_READ_B32, 0, 5, 0));
+        }
+        b
+    };
+    let vectors = [
+        (5, 20, 15),
+        (0, 0, 0),
+        (7, 1, 0xffff_fffa),
+        (1, u32::MAX, u32::MAX - 1),
+        (u32::MAX, 0, 1),
+        (0x8000_0000, 0x7fff_ffff, u32::MAX),
+        (u32::MAX, u32::MAX, 0),
+    ];
+    let cases = vectors.map(|(old, data, _)| [old, data, 0, 0]);
+    for (op, read_back) in [(DS_RSUB_U32, true), (DS_RSUB_RTN_U32, true), (DS_RSUB_RTN_U32, false)] {
+        run_cases_on(
+            &build_cs(&body(op, read_back), 1, 512),
+            &cases,
+            &[("hardware", false), ("warp", true)],
+            |backend, i, _, got| {
+                let (old, _, updated) = vectors[i];
+                assert_eq!(got, if read_back { updated } else { old }, "{backend}: vector {i}");
+            },
+        );
+    }
+}
+
+#[test]
+fn ds_mskor_b32_lower() {
+    // ds_mskor_b32 (0x0c) / _rtn (0x2c): a masked OR over an LDS dword.
+    // build_cs runs lower + DXIL validation, so this proves it lowers on
+    // the CPU without a GPU.
+    let body = |op: u8| {
+        let mut b = vec![vop1(0x001, 5, 0x80)]; // v5 = 0
+        b.extend(ds(DS_WRITE_B32, 0, 5, 1)); // LDS[v5] = v1
+        b.extend(ds2(op, 0, 5, 2, 3)); // LDS[v5] = (LDS[v5] & ~v2) | v3
+        b.extend(ds(DS_READ_B32, 0, 5, 0)); // v0 = LDS[v5]
+        b
+    };
+    for op in [DS_MSKOR_B32, DS_MSKOR_RTN_B32] {
+        let _ = build_cs(&body(op), 1, 512);
+    }
+}
+
+#[test]
+#[ignore = "requires an SM 6.6 GPU or WARP device"]
+fn ds_mskor_b32_masks_the_or() {
+    // v5 = 0; LDS[v5] = v1 (old); ds_mskor_b32 (data0=v2 mask, data1=v3
+    // value) leaves (old & ~mask) | value in LDS; v0 is the old value
+    // (_rtn) or the dword afterwards (read back). One thread: a plain
+    // load+store.
+    let body = |op: u8, read_back: bool| {
+        let mut b = vec![vop1(0x001, 5, 0x80)];
+        b.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        b.extend(ds2(op, 0, 5, 2, 3));
+        if read_back {
+            b.extend(ds(DS_READ_B32, 0, 5, 0));
+        }
+        b
+    };
+    let vectors = [
+        (0x1111_1111, 0x0f0f_0f0f, 0x5a5a_5a5a, 0x5a5a_5a5a),
+        (0, 0, u32::MAX, u32::MAX),
+        (0xffff_0000, 0, 0x0000_00ff, 0xffff_00ff),
+        (u32::MAX, 0xffff_00ff, 0, 0x0000_ff00),
+        (u32::MAX, u32::MAX, 0, 0),
+        (u32::MAX, u32::MAX, 0x8000_0001, 0x8000_0001),
+        (0x00ff_00ff, 0xff00_ff00, 0x0f0f_0f0f, 0x0fff_0fff),
+    ];
+    let cases = vectors.map(|(old, mask, value, _)| [old, mask, value, 0]);
+    for (op, read_back) in [(DS_MSKOR_B32, true), (DS_MSKOR_RTN_B32, true), (DS_MSKOR_RTN_B32, false)] {
+        run_cases_on(
+            &build_cs(&body(op, read_back), 1, 512),
+            &cases,
+            &[("hardware", false), ("warp", true)],
+            |backend, i, _, got| {
+                let (old, _, _, updated) = vectors[i];
+                assert_eq!(got, if read_back { updated } else { old }, "{backend}: vector {i}");
+            },
+        );
+    }
 }
 
 /// A dispatch spread across z past 65,535 groups in x
