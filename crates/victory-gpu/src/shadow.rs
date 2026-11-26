@@ -1979,20 +1979,23 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
-/// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
-/// one run, the gap's bytes included.
-fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+/// Join adjacent runs in place when at most `gap` equal bytes separate them.
+fn join_changed_runs(runs: &mut Vec<(usize, usize)>, gap: usize) {
     if gap == 0 || runs.len() < 2 {
-        return runs;
+        return;
     }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for (at, n) in runs {
-        match out.last_mut() {
-            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
-            _ => out.push((at, n)),
+    let mut kept = 1;
+    for next in 1..runs.len() {
+        let (at, len) = runs[next];
+        let last = &mut runs[kept - 1];
+        if at - (last.0 + last.1) <= gap {
+            last.1 = at + len - last.0;
+        } else {
+            runs[kept] = (at, len);
+            kept += 1;
         }
     }
-    out
+    runs.truncate(kept);
 }
 
 /// The gap, in bytes, over which the title bytes put into a copy in the
@@ -2096,11 +2099,24 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    if changed_runs_wide_on() { changed_runs_wide(now, was) } else { changed_runs_bytes(now, was) }
+fn find_changed_runs(now: &[u8], was: &[u8], gap: usize, runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
+    if changed_runs_wide_on() {
+        changed_runs_wide(now, was, runs);
+    } else {
+        changed_runs_bytes(now, was, runs);
+    }
+    join_changed_runs(runs, gap);
 }
 
-/// Which form [`changed_runs`] takes: the wide one unless
+#[cfg(test)]
+fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    find_changed_runs(now, was, 0, &mut runs);
+    runs
+}
+
+/// Which form [`find_changed_runs`] takes: the wide one unless
 /// `VICTORY_CHANGED_RUNS=0` (the walk byte by byte, as before);
 /// `VICTORY_CHANGED_RUNS=alt`: twenty seconds wide, twenty byte by byte, in
 /// turn, each change said in the log, so that one run measures both in the
@@ -2131,11 +2147,10 @@ fn changed_runs_wide_on() -> bool {
     }
 }
 
-/// [`changed_runs`] as it was: equal bytes eight at a time, differing bytes
+/// [`find_changed_runs`] as it was: equal bytes eight at a time, differing bytes
 /// one by one.
-fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+fn changed_runs_bytes(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
     let n = now.len().min(was.len());
-    let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
         // Equal bytes, eight at a time while they last.
@@ -2154,10 +2169,9 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         }
         runs.push((first, i - first));
     }
-    runs
 }
 
-/// [`changed_runs`] 64 bytes at a time: one mask of the bytes that differ
+/// [`find_changed_runs`] 64 bytes at a time: one mask of the bytes that differ
 /// (four 16-byte compares), and the runs read off the masks. Every byte is
 /// read once. Timed on 48 MB against the walk (2026-11-25, this PC): all
 /// equal 4.3 against 4.3 ms; all differing 4 against 12; one byte in 64
@@ -2165,11 +2179,10 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// that compared 64 equal bytes and then walked eight at a time was slower
 /// than the walk in the last two, by a fifth: it never ran in a game.)
 #[cfg(target_arch = "x86_64")]
-fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+fn changed_runs_wide(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let n = now.len().min(was.len());
     let (now, was) = (&now[..n], &was[..n]);
-    let mut runs = Vec::with_capacity(64);
     // The first byte of a run not yet ended.
     let mut open: Option<usize> = None;
     let mut base = 0;
@@ -2232,17 +2245,28 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     if let Some(first) = open {
         runs.push((first, n - first));
     }
-    runs
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    changed_runs_bytes(now, was)
+fn changed_runs_wide(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
+    changed_runs_bytes(now, was, runs);
 }
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, find_changed_runs};
+
+    fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        super::changed_runs_bytes(now, was, &mut runs);
+        runs
+    }
+
+    fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        super::changed_runs_wide(now, was, &mut runs);
+        runs
+    }
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -2448,6 +2472,22 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn reused_runs_keep_exact_and_joined_pages_separate() {
+        let was = [0; 24];
+        let mut now = was;
+        for at in [6, 8, 9, 11, 16, 17, 23] {
+            now[at] = 1;
+        }
+        let mut runs = vec![(99, 99)];
+        find_changed_runs(&now, &was, 1, &mut runs);
+        assert_eq!(runs, [(6, 6), (16, 2), (23, 1)]);
+        find_changed_runs(&now, &was, 0, &mut runs);
+        assert_eq!(runs, [(6, 1), (8, 2), (11, 1), (16, 2), (23, 1)]);
+        find_changed_runs(&was, &was, 1, &mut runs);
+        assert!(runs.is_empty());
     }
 }
 
@@ -3476,6 +3516,7 @@ impl Shadow {
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
+        let mut runs = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3514,21 +3555,21 @@ impl Shadow {
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
+                let mut merged_bytes = 0;
                 if self.card.is_some() {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    find_changed_runs(title, held, merge_gap(), &mut runs);
                     if runs.len() > *runs_left {
                         MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
-                    for (r, m) in runs {
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        merged_bytes += m;
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3539,17 +3580,21 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    find_changed_runs(title, held, 0, &mut runs);
+                    for &(r, m) in &runs {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        merged_bytes += m;
                     }
                 }
                 drop(before);
+                if !runs.is_empty() {
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(merged_bytes as u64, Ordering::Relaxed);
+                }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
