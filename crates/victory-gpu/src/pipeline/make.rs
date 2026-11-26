@@ -29,6 +29,7 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    completion: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -54,6 +55,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            completion: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -62,7 +64,7 @@ impl Pending {
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
-        let (lock, done) = &DONE;
+        let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -90,9 +92,6 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         }
     }
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -159,6 +158,43 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// The newest frame that has requested a wait, and its spent or
+/// reserved budget. A late caller from an older frame cannot reopen it
+/// or erase the reservations of a newer frame.
+#[derive(Default)]
+struct WaitBudget {
+    frame: Option<u64>,
+    spent: Duration,
+}
+
+impl WaitBudget {
+    fn reserve(&mut self, frame: u64, budget: Duration, shared: bool) -> Duration {
+        if self.frame.is_some_and(|current| frame < current) {
+            return Duration::ZERO;
+        }
+        if self.frame != Some(frame) {
+            self.frame = Some(frame);
+            self.spent = Duration::ZERO;
+        }
+        let left = budget.saturating_sub(self.spent);
+        if shared {
+            self.spent += left;
+        }
+        left
+    }
+
+    fn finish(&mut self, frame: u64, reserved: Duration, elapsed: Duration, shared: bool) {
+        if self.frame == Some(frame) {
+            let waited = elapsed.min(reserved);
+            if shared {
+                self.spent = self.spent.saturating_sub(reserved - waited);
+            } else {
+                self.spent = self.spent.saturating_add(waited);
+            }
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
@@ -167,24 +203,17 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: Mutex<WaitBudget> = Mutex::new(WaitBudget {
+        frame: None,
+        spent: Duration::ZERO,
+    });
     let shared = shared_budget();
-    let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
-    };
+    let left = SPENT.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, budget, shared);
     if left.is_zero() {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.completion;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
@@ -198,13 +227,7 @@ fn wait(p: &Pending, frame: u64) {
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
+        spent.finish(frame, left, waited, shared);
     }
     crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
@@ -349,6 +372,37 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_frame_cannot_reset_newer_budget() {
+        for shared in [false, true] {
+            let ms = Duration::from_millis;
+            let mut state = WaitBudget::default();
+            let first = state.reserve(10, ms(500), shared);
+            assert_eq!(first, ms(500));
+            state.finish(10, first, ms(300), shared);
+            let next = state.reserve(11, ms(500), shared);
+            assert_eq!(next, ms(500));
+            assert_eq!(state.reserve(10, ms(500), shared), Duration::ZERO);
+            state.finish(10, first, ms(400), shared);
+            state.finish(11, next, ms(120), shared);
+            assert_eq!(state.reserve(11, ms(500), shared), ms(380));
+        }
+    }
+
+    #[test]
+    fn shared_reservations_do_not_overbook() {
+        let ms = Duration::from_millis;
+        let mut state = WaitBudget::default();
+        let first = state.reserve(0, ms(500), true);
+        assert_eq!(state.reserve(0, ms(500), true), Duration::ZERO);
+        state.finish(0, first, ms(80), true);
+        let second = state.reserve(0, ms(500), true);
+        assert_eq!(second, ms(420));
+        state.finish(0, second, ms(600), true);
+        assert_eq!(state.reserve(0, ms(500), true), Duration::ZERO);
+        assert_eq!(state.reserve(1, ms(500), true), ms(500));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
