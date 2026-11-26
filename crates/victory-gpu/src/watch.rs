@@ -60,6 +60,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+mod reservation;
+pub(crate) use reservation::line as reservation_line;
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -76,6 +79,7 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -89,6 +93,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     sub: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
 });
@@ -138,6 +143,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    j.ordered = false;
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -231,6 +237,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
+    if reservation::enabled() {
+        reservation::ask(ranges);
+        return;
+    }
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -269,9 +279,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if j.kept {
+    if j.kept || reservation::enabled() {
         j.kept = false;
         j.ahead.clear();
+        j.ordered = false;
     }
 }
 
@@ -364,6 +375,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
+    reservation::count_kernel(count);
     let failed = unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
@@ -508,9 +520,7 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    reservation::covered(&j, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -549,7 +559,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if reservation::covered(j, first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -584,6 +594,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
+    if !known_view { reservation::count_kernel(count); }
     let failed = known_view
         || unsafe {
             GetWriteWatch(
@@ -1834,6 +1845,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    reservation::completed_write(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1963,6 +1975,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again.
 pub fn title_memory_committed(at: usize, len: usize) {
+    if reservation::enabled() { ask_once_end(); }
     if len == 0 || absent_mode() == 0 {
         return;
     }
@@ -1982,6 +1995,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if reservation::enabled() { ask_once_end(); }
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
