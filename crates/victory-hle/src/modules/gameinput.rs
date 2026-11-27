@@ -115,6 +115,55 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// A scripted key: when it starts, how long it is held, and its code.
+#[cfg(any(test, feature = "diagnostics", feature = "benchmark-input"))]
+type Scripted = (Duration, Duration, u8);
+
+/// Parse `at:key[:hold]` entries, using a 0.2 s hold when omitted. A
+/// screen that samples its input slower than the hold ignores the key, which
+/// reads exactly like a screen that ignores input.
+#[cfg(any(test, feature = "diagnostics", feature = "benchmark-input"))]
+fn parse_scripted(list: &str) -> Vec<Scripted> {
+    const DEFAULT_HOLD: Duration = Duration::from_millis(200);
+    list.split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.split(':');
+            let at = parts.next()?;
+            let key = parts.next()?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            let hold = parts
+                .next()
+                .and_then(|h| Duration::try_from_secs_f64(h.trim().parse().ok()?).ok())
+                .unwrap_or(DEFAULT_HOLD);
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                hold,
+                vk,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "diagnostics", feature = "benchmark-input"))]
+fn scripted_at(keys: &[Scripted], now: Duration) -> Vec<u8> {
+    keys.iter().filter_map(|&(at, hold, key)| {
+        now.checked_sub(at).is_some_and(|elapsed| elapsed < hold).then_some(key)
+    }).collect()
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -1150,7 +1199,7 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(feature = "diagnostics", feature = "benchmark-input"))]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,9 +1211,9 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(any(feature = "diagnostics", feature = "benchmark-input"))]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
+            #[cfg(not(any(feature = "diagnostics", feature = "benchmark-input")))]
             let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
@@ -1198,43 +1247,21 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` holds each
+    /// key for that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons). The
+    /// hold is in seconds, 0.2 by default: a screen that samples its input
+    /// slowly misses a hold shorter than its sampling, which looks exactly
+    /// like a screen that ignores input.
+    #[cfg(any(feature = "diagnostics", feature = "benchmark-input"))]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_scripted(&list))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        scripted_at(keys, start.elapsed())
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1626,4 +1653,39 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
+
+    /// `VICTORY_KEYS` entries carry a hold now, and keep 0.2 s when they do
+    /// not: a screen that samples slower than the hold ignores the key, which
+    /// reads exactly like a screen that ignores input.
+    #[test]
+    fn a_scripted_key_holds_for_its_own_time_or_a_fifth_of_a_second() {
+        let keys = parse_scripted("100:Enter:0.8,105:Down,110:Z:1.5,broken,,7:Enter:notatime");
+        assert_eq!(
+            keys,
+            [
+                (Duration::from_secs(100), Duration::from_millis(800), 0x0D),
+                (Duration::from_secs(105), Duration::from_millis(200), 0x28),
+                (Duration::from_secs(110), Duration::from_millis(1500), b'Z'),
+                // A hold that does not parse falls back rather than dropping
+                // the key: the run matters more than the exact time.
+                (Duration::from_secs(7), Duration::from_millis(200), 0x0D),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hold_has_a_half_open_interval_even_at_large_times() {
+        let keys = parse_scripted("50:Enter:4.4,60:Up");
+        let at = |ms| scripted_at(&keys, Duration::from_millis(ms));
+        assert!(at(49999).is_empty());
+        assert_eq!(at(50000), [0x0d]);
+        assert_eq!(at(54399), [0x0d]);
+        assert!(at(54400).is_empty());
+        assert_eq!(at(60199), [0x26]);
+        assert!(at(60200).is_empty());
+        let far = [(Duration::MAX, Duration::from_secs(1), 0x20)];
+        assert_eq!(scripted_at(&far, Duration::MAX), [0x20]);
+    }
+
+
 }

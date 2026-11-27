@@ -48,6 +48,8 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
+# Scripted input in an otherwise normal release build for repeatable gameplay tests.
+benchmark-input = []
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
 
