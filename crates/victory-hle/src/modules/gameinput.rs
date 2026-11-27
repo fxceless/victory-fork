@@ -319,6 +319,10 @@ struct Slot {
 }
 
 struct State {
+    /// The keyboard's stand-in when every physical pad is absent.
+    fallback_slot: usize,
+    /// Rumble has no physical destination while the stand-in occupies slot 0.
+    virtual_slot_zero: bool,
     slots: [Slot; DEVICES],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
@@ -356,7 +360,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, fallback_slot: usize) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -365,6 +369,8 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             state: Mutex::new(State {
+                fallback_slot,
+                virtual_slot_zero: false,
                 slots: Default::default(),
                 callbacks: Vec::new(),
                 pending: Vec::new(),
@@ -384,7 +390,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(source, fallback_slot());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -454,12 +460,13 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
-        for (slot, pad) in pads.into_iter().enumerate() {
+        let stand_in = pads.iter().all(Option::is_none).then(|| fallback(&keys));
+        self.virtual_slot_zero = self.fallback_slot == 0 && stand_in.is_some();
+        // FALLBACK follows the four physical slots. Offer exactly one stand-in.
+        for (slot, pad) in pads.into_iter().chain([None]).enumerate() {
+            let pad = if slot == self.fallback_slot { pad.or(stand_in) } else { pad };
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -528,6 +535,16 @@ fn host() -> Box<dyn Source> {
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
     Box::new(Nothing)
+}
+
+/// A title can listen only to device zero during profile selection. Keep
+/// the stand-in there throughout a scripted run, including gaps between keys.
+fn fallback_slot() -> usize {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if !host::schedule().is_empty() {
+        return 0;
+    }
+    FALLBACK
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -915,7 +932,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.index >= PADS {
+    if device.index >= PADS || (device.index == 0 && device.hub().state().virtual_slot_zero) {
         return;
     }
     let [low, high, ..] = if params.is_null() {
@@ -1203,8 +1220,8 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+    pub(super) fn schedule() -> &'static [(Duration, u8)] {
+        static SCRIPT: LazyLock<Vec<(Duration, u8)>> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1227,11 +1244,23 @@ mod host {
                     vk,
                 ))
             });
-            (Instant::now(), keys.collect())
+            keys.collect()
         });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
+        &SCRIPT
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn scripted() -> Vec<u8> {
+        scripted_at(Instant::now())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn scripted_at(sample: Instant) -> Vec<u8> {
+        // Parsing the schedule selects the device before the first XInput poll.
+        // Start the clock only when someone actually samples its keys.
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let now = sample.saturating_duration_since(*START.get_or_init(|| sample));
+        schedule().iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
@@ -1303,7 +1332,7 @@ mod tests {
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), FALLBACK);
         hub.poll();
         (hub, host)
     }
@@ -1485,6 +1514,126 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn scripted_keys_keep_slot_zero_connected_between_keys_and_across_hotplug() {
+        const CHILD: &str = "VICTORY_TEST_SCRIPTED_PAD_SLOT";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for (mode, schedule) in [
+                ("empty", ""),
+                ("invalid", "bad,key"),
+                ("active", "0:Enter,30:Down"),
+            ] {
+                let run = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env("VICTORY_KEYS", schedule)
+                    .status()
+                    .unwrap();
+                assert!(run.success(), "{mode}");
+            }
+            return;
+        };
+        if mode != "active" {
+            assert_eq!(fallback_slot(), FALLBACK);
+            return;
+        }
+        let inputs = Arc::new(Mutex::new(FakeHost::default()));
+        let hub = Hub::new(Box::new(Fake(inputs.clone())), fallback_slot());
+        let read = |device| {
+            let r = current(hub, GAMEPAD_KIND, device).unwrap();
+            let state = pad(r);
+            release(r);
+            state
+        };
+        hub.poll();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(0, STATUS_CONNECTED, 0)]);
+        assert_eq!(read(0), PadState::default());
+        let device = &hub.devices[0];
+        // Titles can cache the info pointer for this logical device.
+        let info = device_info(device);
+        set_rumble(device, &[1.0; 4]);
+        assert!(inputs.lock().unwrap().rumble.is_empty());
+
+        // Sample the real schedule at an explicit time. The other three keys
+        // represent simultaneous physical input, without querying the OS.
+        let first_sample = Instant::now() + Duration::from_secs(10);
+        let scheduled = |time| host::scripted_at(first_sample + time);
+        assert_eq!(
+            scheduled(Duration::ZERO),
+            [0x0D],
+            "the initial poll did not shorten the first pulse"
+        );
+        assert!(scheduled(Duration::from_secs(1)).is_empty());
+        let mut keys: Vec<_> = scheduled(Duration::from_secs(30))
+            .into_iter()
+            .map(key)
+            .collect();
+        keys.extend([key(b'W'), key(b'L'), key(b'C')]);
+        inputs.lock().unwrap().keys = keys.clone();
+        hub.poll();
+        assert_eq!(
+            read(0),
+            PadState {
+                buttons: DOWN,
+                left_y: 1.0,
+                right_x: 1.0,
+                right_trigger: 1.0,
+                ..Default::default()
+            }
+        );
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        assert!(matches!(&reading(r).value, Value::Keys(k) if k == &keys));
+        release(r);
+        inputs.lock().unwrap().keys = scheduled(Duration::from_secs(31))
+            .into_iter()
+            .map(key)
+            .collect();
+        hub.poll();
+        assert_eq!(read(0), PadState::default());
+
+        let physical = PadState {
+            buttons: B,
+            left_x: 0.5,
+            ..Default::default()
+        };
+        inputs.lock().unwrap().pads[0] = Some(physical);
+        hub.poll();
+        assert_eq!(read(0), physical);
+        assert_eq!(device_info(device), info);
+        set_rumble(device, &[1.0; 4]);
+        assert_eq!(inputs.lock().unwrap().rumble, [(0, u16::MAX, u16::MAX)]);
+        inputs.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(read(0), PadState::default());
+        assert_eq!(device_info(device), info);
+        set_rumble(device, &[1.0; 4]);
+        assert_eq!(inputs.lock().unwrap().rumble.len(), 1);
+        assert_eq!(log.lock().unwrap().len(), 1, "slot 0 stayed connected");
+
+        inputs.lock().unwrap().pads[2] = Some(physical);
+        hub.poll();
+        assert_eq!(read(2), physical);
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        inputs.lock().unwrap().pads[2] = None;
+        hub.poll();
+        assert_eq!(read(0), PadState::default());
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
     }
 
     #[test]
