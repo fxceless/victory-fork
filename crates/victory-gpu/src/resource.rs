@@ -1513,6 +1513,27 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Whether `bytes` more stay within 95 % of the budget the system gives
+/// this process for the card's memory, by what is in use now alone: none
+/// of the room [`room`] keeps for copies not made yet. For uploads that
+/// are small and needed at once. (Past the budget the system moves the
+/// card's memory into the PC's; Dawn's D3D12 residency keeps to 95 % of
+/// it too.)
+///
+/// A skin bake reads its sources once and keeps what it made for the run.
+/// While a world loads, `room` counts up to 4.3 GB kept for buffer copies
+/// and render targets as used, and refused 106 of a bake's uploads on a
+/// card at 6.7 GB of a 15.4 GB budget (an RX 9070 XT tester's run): 101
+/// bake draws sampled a texture that was not there, and faces came out
+/// black.
+#[cfg(windows)]
+pub(crate) fn within_budget(bytes: u64) -> bool {
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used + bytes < budget / 100 * 95,
+        None => room(),
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
