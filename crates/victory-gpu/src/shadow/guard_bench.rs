@@ -75,23 +75,83 @@ struct Title {
     blocks: usize,
     section: windows_sys::Win32::Foundation::HANDLE,
     views: Vec<MEMORY_MAPPED_VIEW_ADDRESS>,
+    /// The second views ([`Title::new`]'s `aliased`): where, and how many blocks.
+    alias: (usize, usize),
+}
+
+/// The views of [`Title`]: unknown to `crate::inplace` (as a test that
+/// maps memory itself), or told to it as the runtime tells the title's
+/// (`title_memory_view`, which the guards look at with
+/// `VICTORY_VIEW_GUARD` on, the default), with the first `aliased` blocks'
+/// pages also shown at a second view each.
+#[derive(Clone, Copy, Debug)]
+enum Views {
+    Unknown,
+    Told { aliased: usize },
+}
+
+/// Maps block `block` of `section` at `place` (a placeholder block),
+/// replacing the placeholder.
+///
+/// # Safety
+/// `place` is a 64 KiB placeholder of ours; `block` lies in `section`.
+unsafe fn map_block(
+    section: windows_sys::Win32::Foundation::HANDLE,
+    place: usize,
+    block: usize,
+) -> MEMORY_MAPPED_VIEW_ADDRESS {
+    // SAFETY: the caller's.
+    let view = unsafe {
+        MapViewOfFile3(
+            section,
+            GetCurrentProcess(),
+            place as *const _,
+            (block * BLOCK) as u64,
+            BLOCK,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(view.Value as usize, place);
+    view
+}
+
+/// A placeholder of `blocks` blocks, split into blocks.
+///
+/// # Safety
+/// Plain reservation calls; the caller releases it.
+unsafe fn placeholders(blocks: usize) -> usize {
+    // SAFETY: the caller's.
+    unsafe {
+        let at = VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            blocks * BLOCK,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        ) as usize;
+        assert_ne!(at, 0);
+        for block in 0..blocks.saturating_sub(1) {
+            VirtualFree(
+                (at + block * BLOCK) as *mut _,
+                BLOCK,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+        at
+    }
 }
 
 impl Title {
-    fn new(blocks: usize) -> Title {
+    fn new(blocks: usize, told: Views) -> Title {
         // SAFETY: a fresh placeholder and pagefile section, split and
         // mapped block by block; all ours until dropped.
         unsafe {
-            let at = VirtualAlloc2(
-                GetCurrentProcess(),
-                std::ptr::null(),
-                blocks * BLOCK,
-                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                PAGE_NOACCESS,
-                std::ptr::null_mut(),
-                0,
-            ) as usize;
-            assert_ne!(at, 0);
+            let at = placeholders(blocks);
             let bytes = (blocks * BLOCK) as u64;
             let section = CreateFileMappingW(
                 -1isize as _,
@@ -102,36 +162,39 @@ impl Title {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            let mut views = Vec::with_capacity(blocks);
-            for block in 0..blocks {
-                let place = at + block * BLOCK;
-                if block + 1 < blocks {
-                    VirtualFree(
-                        place as *mut _,
+            let mut views: Vec<MEMORY_MAPPED_VIEW_ADDRESS> = (0..blocks)
+                .map(|block| map_block(section, at + block * BLOCK, block))
+                .collect();
+            crate::watch::title_memory_remapped(at, blocks * BLOCK);
+            let mut alias = (0, 0);
+            if let Views::Told { aliased } = told {
+                let aliased = aliased.min(blocks);
+                if aliased > 0 {
+                    let place = placeholders(aliased);
+                    views.extend(
+                        (0..aliased).map(|block| map_block(section, place + block * BLOCK, block)),
+                    );
+                    crate::watch::title_memory_remapped(place, aliased * BLOCK);
+                    alias = (place, aliased);
+                }
+                let shown = (0..blocks)
+                    .map(|block| (at + block * BLOCK, block))
+                    .chain((0..alias.1).map(|block| (alias.0 + block * BLOCK, block)));
+                for (place, block) in shown {
+                    crate::inplace::title_memory_view(
+                        place,
                         BLOCK,
-                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                        section as usize,
+                        (block * BLOCK) as u64,
                     );
                 }
-                let view = MapViewOfFile3(
-                    section,
-                    GetCurrentProcess(),
-                    place as *const _,
-                    (block * BLOCK) as u64,
-                    BLOCK,
-                    MEM_REPLACE_PLACEHOLDER,
-                    PAGE_READWRITE,
-                    std::ptr::null_mut(),
-                    0,
-                );
-                assert_eq!(view.Value as usize, place);
-                views.push(view);
             }
-            crate::watch::title_memory_remapped(at, blocks * BLOCK);
             Title {
                 at,
                 blocks,
                 section,
                 views,
+                alias,
             }
         }
     }
@@ -143,18 +206,29 @@ impl Title {
 
 impl Drop for Title {
     fn drop(&mut self) {
-        crate::watch::title_memory_remapped(self.at, self.len());
-        // SAFETY: our views, placeholder and section.
+        let (alias, aliased) = self.alias;
+        let forget = |at: usize, len: usize| {
+            if len > 0 {
+                crate::watch::title_memory_remapped(at, len);
+            }
+        };
+        forget(self.at, self.len());
+        forget(alias, aliased * BLOCK);
+        // SAFETY: our views, placeholders and section.
         unsafe {
             for &view in &self.views {
                 UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
             }
-            for block in 0..self.blocks {
-                VirtualFree((self.at + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            let places = (0..self.blocks)
+                .map(|block| self.at + block * BLOCK)
+                .chain((0..aliased).map(|block| alias + block * BLOCK));
+            for place in places {
+                VirtualFree(place as *mut _, 0, MEM_RELEASE);
             }
             windows_sys::Win32::Foundation::CloseHandle(self.section);
         }
-        crate::watch::title_memory_remapped(self.at, self.len());
+        forget(self.at, self.len());
+        forget(alias, aliased * BLOCK);
     }
 }
 
@@ -257,7 +331,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// before each flush, 1,400 = about 89 MB), `BENCH_WRITERS` (title
 /// threads, 4), `BENCH_GAP_US` (a writer's pause between writes during
 /// the flush, 20), `BENCH_ROUNDS` (11), `BENCH_WIDE` (1: the flush on the
-/// helper threads).
+/// helper threads), `BENCH_VIEWS` (1: the views told to `crate::inplace`
+/// as the runtime tells the title's; 0, the default: not told).
 #[test]
 #[ignore = "benchmark: run by hand on a quiet machine"]
 fn guard_contention() {
@@ -271,7 +346,15 @@ fn guard_contention() {
     let gap = env("BENCH_GAP_US", 20) as u64;
     let rounds = env("BENCH_ROUNDS", 11);
     let wide = env("BENCH_WIDE", 0) == 1;
-    let title = Title::new(blocks);
+    let told = env("BENCH_VIEWS", 0) == 1;
+    let title = Title::new(
+        blocks,
+        if told {
+            Views::Told { aliased: 0 }
+        } else {
+            Views::Unknown
+        },
+    );
     let copies = copies(&buffer, &title, span, false);
     // The first flush takes everything and guards it.
     flush(&copies, false);
@@ -375,7 +458,7 @@ fn guard_contention() {
     }
     let m = |i: usize| median(rows.iter().map(|r| r[i]).collect());
     println!(
-        "MEDIAN of {rounds} (blocks {blocks}, span {} blocks, dirty {dirty}, writers {writers}, gap {gap} us, wide {wide}): flush {:.2} ms, {:.1} MB; waits flush thread {:.2} ms, writers {:.2} ms, all {:.2} ms; held {:.2} ms; re-guard calls {:.0} ({:.2} ms); write {:.2} us",
+        "MEDIAN of {rounds} (blocks {blocks}, span {} blocks, dirty {dirty}, writers {writers}, gap {gap} us, wide {wide}, views told {told}): flush {:.2} ms, {:.1} MB; waits flush thread {:.2} ms, writers {:.2} ms, all {:.2} ms; held {:.2} ms; re-guard calls {:.0} ({:.2} ms); write {:.2} us",
         span / BLOCK,
         m(0),
         m(1),
@@ -396,6 +479,11 @@ fn guard_contention() {
 /// taken back (a copy never holds a value newer than was written, nor
 /// older than it held after the flush before), and once the writers stop
 /// one flush makes every copy equal to title memory.
+///
+/// Twice: over views the guards know nothing of, and over views told as
+/// the runtime tells the title's, some of whose pages are shown at a
+/// second view (`VICTORY_VIEW_GUARD`: those are guarded together, under
+/// the lock, and the others outside it with `VICTORY_GUARD_OUTSIDE`).
 #[test]
 fn flushes_under_writes_lose_nothing() {
     // Askings by the thousand: not beside the tests that count the light
@@ -404,11 +492,19 @@ fn flushes_under_writes_lose_nothing() {
     let Some(buffer) = warp_buffer() else {
         return;
     };
+    for told in [Views::Unknown, Views::Told { aliased: 16 }] {
+        lose_nothing(&buffer, told);
+    }
+    crate::watch::GUARD_OUTSIDE_TEST.store(0, Relaxed);
+}
+
+/// [`flushes_under_writes_lose_nothing`] over title memory of views `told`.
+fn lose_nothing(buffer: &ID3D12Resource, told: Views) {
     const BLOCKS: usize = 96;
     const WRITERS: usize = 3;
     // Each writer counts up in its own words, spread over every block.
     const SLOTS: usize = 64;
-    let title = Title::new(BLOCKS);
+    let title = Title::new(BLOCKS, told);
     let (at, len) = (title.at, title.len());
     let slot = |w: usize, i: usize| -> usize {
         // Block `i` (of the writer's slots), at a place of the writer's.
@@ -423,7 +519,10 @@ fn flushes_under_writes_lose_nothing() {
     let latest: Vec<AtomicU64> = (0..WRITERS).map(|_| AtomicU64::new(0)).collect();
     for (wide, outside) in [(false, false), (true, false), (false, true), (true, true)] {
         crate::watch::GUARD_OUTSIDE_TEST.store(if outside { 2 } else { 1 }, Relaxed);
-        let copies = copies(&buffer, &title, 8 * BLOCK, true);
+        let later = crate::watch::GUARD_LATER
+            .each_ref()
+            .map(|c| c.load(Relaxed));
+        let copies = copies(buffer, &title, 8 * BLOCK, true);
         flush(&copies, false);
         let stop = AtomicBool::new(false);
         // What each copy held at each slot after the flush before.
@@ -483,17 +582,17 @@ fn flushes_under_writes_lose_nothing() {
                             };
                             assert!(
                                 value >= floor[k],
-                                "wide {wide} outside {outside}: copy {c} lost a write at {address:#x}: holds {value}, {} was written before the flush",
+                                "{told:?} wide {wide} outside {outside}: copy {c} lost a write at {address:#x}: holds {value}, {} was written before the flush",
                                 floor[k]
                             );
                             assert!(
                                 value <= ceiling[w],
-                                "wide {wide} outside {outside}: copy {c} holds {value} at {address:#x}, never written ({} at most)",
+                                "{told:?} wide {wide} outside {outside}: copy {c} holds {value} at {address:#x}, never written ({} at most)",
                                 ceiling[w]
                             );
                             assert!(
                                 value >= held[c][k],
-                                "wide {wide} outside {outside}: copy {c} went back at {address:#x}: {value} after {}",
+                                "{told:?} wide {wide} outside {outside}: copy {c} went back at {address:#x}: {value} after {}",
                                 held[c][k]
                             );
                             held[c][k] = value;
@@ -511,11 +610,30 @@ fn flushes_under_writes_lose_nothing() {
             let now = unsafe { std::slice::from_raw_parts(start as *const u8, n) };
             assert!(
                 copy.side[..n] == *now,
-                "wide {wide} outside {outside}: copy {c} differs from title memory after a quiet flush"
+                "{told:?} wide {wide} outside {outside}: copy {c} differs from title memory after a quiet flush"
             );
         }
+        if outside {
+            // Runs made read-only outside the lock, and (pages shown at two
+            // views) under it. Other tests only add to the counts.
+            let [apart, kept] =
+                [0, 1].map(|i| crate::watch::GUARD_LATER[i].load(Relaxed) - later[i]);
+            assert!(
+                apart > 0,
+                "{told:?} wide {wide}: no run made read-only outside the lock"
+            );
+            // (`VICTORY_VIEW_GUARD=0`: other views are not guarded.)
+            let view_guard = std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0");
+            if let Views::Told { aliased: 1.. } = told
+                && view_guard
+            {
+                assert!(
+                    kept > 0,
+                    "{told:?} wide {wide}: no run kept under the lock for its second view"
+                );
+            }
+        }
     }
-    crate::watch::GUARD_OUTSIDE_TEST.store(0, Relaxed);
 }
 
 /// Whether making blocks read-only scales with threads at all
@@ -530,7 +648,7 @@ fn protect_scaling() {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let blocks = env("BENCH_BLOCKS", 4096);
     let spinners = env("BENCH_SPIN", 4);
-    let title = Title::new(blocks);
+    let title = Title::new(blocks, Views::Unknown);
     let at = title.at;
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| {

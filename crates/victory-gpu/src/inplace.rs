@@ -640,6 +640,42 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether no 64 KiB page of title views in `[start, end)` is shown at 2 to
+/// `many` views: [`views_between`] and [`pages_of`] for each page of them,
+/// under one take of the registry's lock and with nothing copied.
+pub(crate) fn shown_alone(start: usize, end: usize, many: usize) -> bool {
+    if start >= end {
+        return true;
+    }
+    let v = views();
+    let first = v
+        .views
+        .range(..=start)
+        .next_back()
+        .filter(|(base, view)| *base + view.0 > start)
+        .map(|(base, _)| *base);
+    let later = v
+        .views
+        .range(start.saturating_add(1)..end)
+        .map(|(base, _)| *base);
+    for base in first.into_iter().chain(later) {
+        let (bytes, section, offset) = v.views[&base];
+        // The view's pages in the range, as `pages_of` finds them.
+        let from = start.max(base).next_multiple_of(K64);
+        let to = end.min(base + bytes);
+        for page in (from..to).step_by(K64) {
+            let shown = v
+                .pages
+                .get(&(section, offset + (page - base) as u64))
+                .map_or(0, Vec::len);
+            if (2..=many).contains(&shown) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

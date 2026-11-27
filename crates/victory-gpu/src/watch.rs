@@ -1613,11 +1613,12 @@ fn guard_at_later(
         }
         if let Some(from) = run.take() {
             // Later, outside the lock, where no other view of the pages is
-            // known (those are guarded together, under it).
-            if later
-                && (!view_guard()
-                    || crate::inplace::views_between(from * BLOCK, block * BLOCK).is_empty())
-            {
+            // guarded with them (those are guarded together, under it).
+            let alone = later && alone_in_views(from, block);
+            if later {
+                GUARD_LATER[usize::from(!alone)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if alone {
                 g.protected.extend(from..block);
                 g.clean.extend(from..block);
                 if view_known() {
@@ -1632,6 +1633,30 @@ fn guard_at_later(
     }
     Some((written, arming))
 }
+
+/// Whether [`protect`] of blocks `[from, to)` would change their own
+/// protection only: no other view of their pages is guarded with them
+/// (`VICTORY_VIEW_GUARD=0`, or each page is shown at one view, or at more
+/// than [`MANY_VIEWS`], which are guarded each by itself). The test of
+/// [`protect`]'s own loop. A view of their pages mapped after this answer
+/// opens them ([`views_mapped`]), and an asking outside the lock then
+/// leaves them writable ([`Arming`]).
+fn alone_in_views(from: usize, to: usize) -> bool {
+    if !view_guard() {
+        return true;
+    }
+    crate::inplace::shown_alone(
+        from.saturating_mul(BLOCK),
+        to.saturating_mul(BLOCK),
+        MANY_VIEWS,
+    )
+}
+
+/// Since the start, with [`guard_outside`]: runs of blocks made read-only
+/// outside the guards' lock (0), and runs kept under it because another
+/// view of their pages is guarded with them (1).
+pub(crate) static GUARD_LATER: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Tests: [`guard_outside`] as the environment says (0), off (1), on (2).
 #[cfg(test)]
@@ -1801,7 +1826,7 @@ fn guard_outside() -> bool {
                 use std::sync::atomic::Ordering::Relaxed;
                 let [askings, held, calls, us] = GUARD_WORK.each_ref().map(|c| c.load(Relaxed));
                 tracing::info!(
-                    "blocks are made read-only again outside the guards' lock from now (VICTORY_GUARD_OUTSIDE=alt): {}; since the start: {askings} askings held the guards' lock {} ms, {calls} protection changes took {} ms, the guards' lock was waited for {} times ({} ms), the journal's {} times ({} ms)",
+                    "blocks are made read-only again outside the guards' lock from now (VICTORY_GUARD_OUTSIDE=alt): {}; since the start: {askings} askings held the guards' lock {} ms, {calls} protection changes took {} ms, the guards' lock was waited for {} times ({} ms), the journal's {} times ({} ms); runs of blocks made read-only outside the lock {}, kept under it for other views of their pages {}",
                     if on {
                         "ON"
                     } else {
@@ -1813,6 +1838,8 @@ fn guard_outside() -> bool {
                     WAITS[0][1].load(Relaxed) / 1000,
                     WAITS[1][0].load(Relaxed),
                     WAITS[1][1].load(Relaxed) / 1000,
+                    GUARD_LATER[0].load(Relaxed),
+                    GUARD_LATER[1].load(Relaxed),
                 );
             }
             on
