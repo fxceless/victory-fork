@@ -58,6 +58,9 @@ pub struct Part<'a> {
 pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
+    /// The header's total size, checked against the data: the container is
+    /// exactly this many bytes, whatever follows it.
+    pub size: usize,
     pub parts: Vec<Part<'a>>,
 }
 
@@ -102,6 +105,7 @@ impl<'a> Container<'a> {
         Ok(Container {
             digest,
             version,
+            size: total,
             parts,
         })
     }
