@@ -134,32 +134,55 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+fn writable_line(line: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+    };
+    let Some(end) = line.checked_add(64) else {
+        return false;
+    };
+    // SAFETY: plain data filled in by VirtualQuery.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of exact struct size.
+    let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
+    found
+        && m.State == MEM_COMMIT
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+}
+
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
 /// a spin loop around them works with mwaitx as a yield.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
+    // instruction's bytes are readable inside its page, as the CPU just fetched them.
     unsafe {
         let record = &*(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
+        // Only bytes inside the faulting instruction's page are read: the next page may
+        // not be mapped.
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        let mut bytes = [0u8; 32];
+        let n = room.min(bytes.len());
+        std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+        match &bytes[..n] {
+            [0x0f, 0x01, 0xfc, ..] => {
+                let line = (context.Rax & !63) as usize;
+                if !writable_line(line) {
+                    return false;
+                }
+                (line as *mut u8).write_bytes(0, 64);
+            }
+            [0x0f, 0x01, 0xfa, ..] => {}
+            [0x0f, 0x01, 0xfb, ..] => std::thread::yield_now(),
+            slice => {
+                if let Some(pass) = clwb_loop(slice) {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
                     let base = gpr(context, pass.base);
@@ -173,14 +196,17 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
+                let mut padded = [0u8; 15];
+                let copy = n.min(padded.len());
+                padded[..copy].copy_from_slice(&slice[..copy]);
+                if let Some(len) = clwb_len(padded)
+                    && len <= n
                 {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
                 context.Rip += len as u64;
@@ -313,30 +339,32 @@ const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let prefix = *code.first()?;
+    let b1 = *code.get(1)?;
+    let (rex, at) = if b1 & 0xf0 == 0x40 { (b1, 2) } else { (0, 1) };
+    if !matches!(prefix, 0x66 | 0xf2)
+        || *code.get(at)? != 0x0f
+        || !matches!(*code.get(at + 1)?, 0x78 | 0x79)
+    {
         return None;
     }
-    let modrm = b(at + 2);
+    let modrm = *code.get(at + 2)?;
     if modrm >> 6 != 3 {
         return None;
     }
     let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
     let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
+    let immediate = *code.get(at + 1)? == 0x78;
     let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
+        ((*code.get(at + 3)?, *code.get(at + 4)?), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+        let f = if prefix == 0x66 {
+            xmm[src].Low
+        } else {
+            xmm[src].High as u64
+        };
         ((f as u8, (f >> 8) as u8), at + 3)
     };
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
@@ -415,14 +443,31 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p.len() < 4 || p[2] == 0 || p[3] == 0 {
+        return "<rethrow>".into();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
+        let types_rva = rva(p[2] + 12);
+        let Some(types) = (types_rva != 0).then(|| p[3].checked_add(types_rva)).flatten() else {
+            return "<unknown>".into();
+        };
+        let count = rva(types);
+        if count == 0 {
+            return "<unknown>".into();
+        }
+        let name = |i: usize| -> std::borrow::Cow<'_, str> {
+            let ct_rva = rva(types + 4 + 4 * i);
+            let Some(ct) = (ct_rva != 0).then(|| p[3].checked_add(ct_rva)).flatten() else {
+                return std::borrow::Cow::Borrowed("<unknown>");
+            };
+            let td_rva = rva(ct + 4);
+            let Some(descriptor) = (td_rva != 0).then(|| p[3].checked_add(td_rva)).flatten() else {
+                return std::borrow::Cow::Borrowed("<unknown>");
+            };
             std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
                 .to_string_lossy()
         };
@@ -433,7 +478,7 @@ unsafe fn thrown(p: &[usize]) -> String {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
+            _ if p[1] != 0 && (0..count).any(|i| name(i) == ".?AVexception@std@@") => {
                 let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
                 if message.is_null() {
                     String::new()
@@ -995,6 +1040,71 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn veh_rejects_unwritable_clzero_bounds_page_edge_and_handles_rethrow() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        // SAFETY: allocate our own pages, set protections cleanly, and free before returning.
+        unsafe {
+            // 1. Unwritable clzero target (read-only page) must not AV inside emulate_amd_only.
+            let ro = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READONLY,
+            );
+            assert!(!ro.is_null());
+            let mut xmm = [reg(0, 0); 16];
+            assert_eq!(emulate(&[0x0f, 0x01, 0xfc], ro as u64, &mut xmm), None);
+            VirtualFree(ro, 0, MEM_RELEASE);
+
+            // 2. Illegal instruction near page end adjacent to PAGE_NOACCESS must not overread.
+            let pages = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!pages.is_null());
+            let mut old = 0u32;
+            assert_ne!(
+                VirtualProtect(pages.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                0
+            );
+            // 2-byte `ud2` at offset 0xFFE (would fault on [u8; 3] read without page check).
+            let ud2_at = pages.add(0xFFE);
+            std::ptr::copy_nonoverlapping([0x0f, 0x0b].as_ptr(), ud2_at, 2);
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = ud2_at as u64;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            assert!(!emulate_amd_only(&mut pointers));
+
+            // Truncated SSE4a prefix at offset 0xFFD (3 bytes before PAGE_NOACCESS).
+            let sse_at = pages.add(0xFFD);
+            std::ptr::copy_nonoverlapping([0x66, 0x0f, 0x78].as_ptr(), sse_at, 3);
+            let mut context2: CONTEXT = std::mem::zeroed();
+            context2.Rip = sse_at as u64;
+            let mut pointers2 = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context2,
+            };
+            assert!(!emulate_amd_only(&mut pointers2));
+            VirtualFree(pages.cast(), 0, MEM_RELEASE);
+
+            // 3. MSVC C++ rethrow (`p[1] = 0, p[2] = 0`) must not dereference NULL+0xC.
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0, 0]), "<rethrow>");
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0, 0x1000]), "<rethrow>");
         }
     }
 }
