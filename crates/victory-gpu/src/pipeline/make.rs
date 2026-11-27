@@ -15,7 +15,7 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -33,22 +33,26 @@ use super::host::{GraphicsState, HostPipeline, TargetFormats};
 /// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
 /// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
 fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
-    static LIST: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    static LIST: OnceLock<HashSet<String>> = OnceLock::new();
     let list = LIST.get_or_init(|| {
+        let value = std::env::var("VICTORY_DENY_PIPELINES").unwrap_or_default();
+        let mut list = super::parse_shader_hashes(&value, "VICTORY_DENY_PIPELINES");
         // `VICTORY_DENY_PIPELINES_FILE=<path>`: more hashes, any 16 hex
         // digits in the file (one a line, say), with the list's own.
-        let file = std::env::var_os("VICTORY_DENY_PIPELINES_FILE")
+        if let Some(file) = std::env::var_os("VICTORY_DENY_PIPELINES_FILE")
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default();
-        let list: std::collections::HashSet<String> = std::env::var("VICTORY_DENY_PIPELINES")
-            .unwrap_or_default()
-            .split(|c: char| !c.is_ascii_hexdigit())
-            .chain(file.split(|c: char| !c.is_ascii_hexdigit()))
-            .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| h.len() == 16)
-            .collect();
+        {
+            list.extend(
+                file.split(|c: char| !c.is_ascii_hexdigit())
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| h.len() == 16),
+            );
+        }
         if !list.is_empty() {
-            tracing::info!(pipelines = list.len(), "shaders whose pipelines are not built (VICTORY_DENY_PIPELINES / _FILE)");
+            tracing::info!(
+                pipelines = list.len(),
+                "shaders whose pipelines are not built (VICTORY_DENY_PIPELINES / _FILE)"
+            );
         }
         list
     });
