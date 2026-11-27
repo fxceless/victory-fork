@@ -586,6 +586,10 @@ struct Sampler {
     frames: [u64; MAX_DEPTH],
     /// Cycles of the processor's counter per microsecond.
     cycles_per_us: f64,
+    /// Whether the system counts a thread's cycles (`QueryThreadCycleTime`).
+    /// Wine does not: there every look takes the thread's stack, and its
+    /// time on a processor is not known.
+    counted: bool,
     /// The cycles a waiting thread uses at most to be suspended and let
     /// go again ([`SETTLING_US`]).
     settling: u64,
@@ -635,6 +639,7 @@ impl Sampler {
             dirty: 0,
             frames: [0; MAX_DEPTH],
             cycles_per_us,
+            counted: counts_cycles(),
             settling: (SETTLING_US * cycles_per_us) as u64,
             clock,
             presents: &FRAMES,
@@ -716,18 +721,25 @@ impl Sampler {
         let reuse = self.config.reuse;
         let thread = &mut self.threads[at];
         thread.looks += 1;
-        let mut cycles = 0;
-        // SAFETY: a thread handle of ours and a valid out pointer.
-        if unsafe { QueryThreadCycleTime(thread.handle, &mut cycles) } == 0 {
-            thread.missed += 1;
-            return;
-        }
-        let ran = cycles.saturating_sub(thread.cycles);
-        thread.cycles = cycles;
+        // Without the counter nothing says whether the thread ran: its
+        // stack is taken every time.
+        let ran = if self.counted {
+            let mut cycles = 0;
+            // SAFETY: a thread handle of ours and a valid out pointer.
+            if unsafe { QueryThreadCycleTime(thread.handle, &mut cycles) } == 0 {
+                thread.missed += 1;
+                return;
+            }
+            let ran = cycles.saturating_sub(thread.cycles);
+            thread.cycles = cycles;
+            Some(ran)
+        } else {
+            None
+        };
         // It has not run since the last look: it is where it was. A
         // thread that was suspended for that look ran to be suspended and
         // let go, which is not running its own code.
-        let still = ran == 0 || thread.stood && ran <= self.settling;
+        let still = ran.is_some_and(|ran| ran == 0 || thread.stood && ran <= self.settling);
         let last = thread.last;
         let node = match last {
             Some(node) if still && reuse => {
@@ -773,7 +785,9 @@ impl Sampler {
                 node
             }
         };
-        let cpu = ((ran as f64 / self.cycles_per_us) as u64).min(weight);
+        let cpu = ran.map_or(0, |ran| {
+            ((ran as f64 / self.cycles_per_us) as u64).min(weight)
+        });
         let thread = &mut self.threads[at];
         thread.last = Some(node);
         let node = &mut thread.tree.nodes[node as usize];
@@ -985,9 +999,7 @@ impl Sampler {
             return;
         }
         let (low, high) = stack_of(handle);
-        let mut cycles = 0;
-        // SAFETY: a thread handle of ours and a valid out pointer.
-        unsafe { QueryThreadCycleTime(handle, &mut cycles) };
+        let cycles = spent(handle, self.counted, self.cycles_per_us);
         self.threads.push(Thread {
             id,
             handle,
@@ -1041,6 +1053,7 @@ impl Sampler {
         // Every thread of the process: (cycles since the last scan, id) of
         // those with no role.
         let mut busy: Vec<(u64, u32)> = Vec::new();
+        let (counted, per_us) = (self.counted, self.cycles_per_us);
         let mut previous: HANDLE = null_mut();
         loop {
             let mut next = null_mut();
@@ -1082,9 +1095,7 @@ impl Sampler {
                     if handle.is_null() {
                         continue;
                     }
-                    let mut cycles = 0;
-                    // SAFETY: a thread handle of ours, a valid out pointer.
-                    unsafe { QueryThreadCycleTime(handle, &mut cycles) };
+                    let cycles = spent(handle, counted, per_us);
                     v.insert(Other {
                         handle,
                         cycles,
@@ -1112,9 +1123,7 @@ impl Sampler {
                 }
                 continue;
             }
-            let mut cycles = 0;
-            // SAFETY: a thread handle of ours and a valid out pointer.
-            unsafe { QueryThreadCycleTime(other.handle, &mut cycles) };
+            let cycles = spent(other.handle, counted, per_us);
             busy.push((cycles.saturating_sub(other.cycles), id));
             other.cycles = cycles;
         }
@@ -1407,6 +1416,29 @@ fn gpr(context: &CONTEXT, n: u8) -> u64 {
         14 => context.R14,
         _ => context.R15,
     }
+}
+
+/// Whether `QueryThreadCycleTime` answers. Wine has it as a stub that
+/// fails for every thread; with the answer taken for "the thread ended",
+/// no thread was ever looked at there and the report came out empty.
+fn counts_cycles() -> bool {
+    let mut cycles = 0;
+    // SAFETY: our own thread and a valid out pointer.
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) != 0 }
+}
+
+/// The cycles a thread has used since its start: the system's count, or
+/// without one (`counted` false) its processor time taken for cycles. That
+/// time moves in the scheduler's steps, which is enough to find the busy
+/// threads from one scan to the next and too coarse for a look.
+fn spent(thread: HANDLE, counted: bool, cycles_per_us: f64) -> u64 {
+    if counted {
+        let mut cycles = 0;
+        // SAFETY: a thread handle of ours and a valid out pointer.
+        unsafe { QueryThreadCycleTime(thread, &mut cycles) };
+        return cycles;
+    }
+    (cpu_of(thread).as_micros() as f64 * cycles_per_us) as u64
 }
 
 /// The processor counter's cycles per microsecond, measured.
@@ -1752,11 +1784,24 @@ impl DbgHelp {
                     let mut names: Vec<String> = (first..=first + inlines)
                         .filter_map(|context| {
                             let mut displacement = 0;
-                            Self::named(|symbol| {
+                            let (name, _) = Self::named(|symbol| {
                                 name(self.process, address, context, &mut displacement, symbol)
+                            })?;
+                            // Wine's library names an inlined call by its
+                            // last part alone (`lock`, `wait`): the path is
+                            // put back from the file the call's code is in,
+                            // or the language's runtime is taken for ours.
+                            if name.split('<').next().is_some_and(|n| n.contains("::")) {
+                                return Some(name);
+                            }
+                            let scope = self
+                                .line(address, Some(context))
+                                .and_then(|(file, _)| scope_of(&file));
+                            Some(match scope {
+                                Some(scope) => format!("{scope}::{name}"),
+                                None => name,
                             })
                         })
-                        .map(|(name, _)| name)
                         .collect();
                     if !names.is_empty() {
                         names.reverse();
@@ -1832,6 +1877,29 @@ impl DbgHelp {
     }
 }
 
+/// The module path of the Rust source file `file`, for the files whose
+/// place says it: the language's library (`.../library/std/src/sync/mutex.rs`
+/// is `std::sync::mutex`) and this workspace's crates
+/// (`.../crates/victory-gpu/src/draw.rs` is `victory_gpu::draw`).
+fn scope_of(file: &str) -> Option<String> {
+    let file = file.replace('\\', "/");
+    let (root, inside) = ["/library/", "/crates/"]
+        .iter()
+        .find_map(|root| file.rsplit_once(root).map(|(_, inside)| (*root, inside)))?;
+    let (name, path) = inside.split_once("/src/")?;
+    if name.contains('/') || (root == "/library/" && !["std", "core", "alloc"].contains(&name)) {
+        return None;
+    }
+    let path = path.strip_suffix(".rs")?;
+    let path = path.strip_suffix("/mod").unwrap_or(path);
+    let mut scope = name.replace('-', "_");
+    for part in path.split('/').filter(|part| !matches!(*part, "lib" | "main" | "")) {
+        scope.push_str("::");
+        scope.push_str(part);
+    }
+    Some(scope)
+}
+
 /// The start of the function `address` is in, by its image's unwind data
 /// (the first part's, for a function in several); `None` for code that
 /// has none.
@@ -1860,6 +1928,80 @@ fn function_start(address: u64) -> Option<u64> {
         }
         Some(image + u64::from(entry[0]))
     }
+}
+
+/// The named exports of the image loaded at `base` (up to `end`), by
+/// address, read from its export table; a forwarder is not code of the
+/// module and is left out. Of several names for one address (ntdll's `Nt`
+/// and `Zw`) the first in the alphabet stays.
+fn exports_of(base: u64, end: u64) -> FastMap<u64, String> {
+    let mut found = FastMap::default();
+    let size = end.saturating_sub(base) as usize;
+    // SAFETY: reads the headers and the export table of an image the
+    // system's loader mapped, as `GetProcAddress` does, and nothing past
+    // the image's size.
+    let word = |at: usize, bytes: usize| -> Option<u32> {
+        if at.checked_add(bytes)? > size {
+            return None;
+        }
+        let from = (base as usize + at) as *const u8;
+        Some(match bytes {
+            2 => u32::from(unsafe { from.cast::<u16>().read_unaligned() }),
+            _ => unsafe { from.cast::<u32>().read_unaligned() },
+        })
+    };
+    let mut list = || -> Option<()> {
+        let pe = word(0x3c, 4)? as usize;
+        // "PE\0\0", then the 64-bit optional header 24 bytes on, whose
+        // directories start at its byte 112: the first is the exports'.
+        if word(pe, 4)? != 0x4550 || word(pe + 24, 2)? != 0x20b || word(pe + 24 + 108, 4)? == 0 {
+            return None;
+        }
+        let (table, length) = (
+            word(pe + 24 + 112, 4)? as usize,
+            word(pe + 24 + 116, 4)? as usize,
+        );
+        if table == 0 {
+            return None;
+        }
+        let (functions, names) = (word(table + 0x14, 4)?, word(table + 0x18, 4)?);
+        let function_at = word(table + 0x1c, 4)? as usize;
+        let name_at = word(table + 0x20, 4)? as usize;
+        let ordinal_at = word(table + 0x24, 4)? as usize;
+        for i in 0..names.min(1 << 16) as usize {
+            let ordinal = word(ordinal_at + 2 * i, 2)?;
+            if ordinal >= functions {
+                continue;
+            }
+            let code = word(function_at + 4 * ordinal as usize, 4)? as usize;
+            if code == 0 || code >= size || (code >= table && code < table + length) {
+                continue;
+            }
+            let text = word(name_at + 4 * i, 4)? as usize;
+            let mut name = String::new();
+            while name.len() < 256 && text + name.len() < size {
+                // SAFETY: inside the image, as checked.
+                let byte = unsafe { *((base as usize + text + name.len()) as *const u8) };
+                if byte == 0 {
+                    break;
+                }
+                name.push(char::from(byte));
+            }
+            match found.entry(base + code as u64) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if name < *o.get() {
+                        o.insert(name);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(name);
+                }
+            }
+        }
+        Some(())
+    };
+    list();
+    found
 }
 
 /// Whether a thread whose innermost frame is `name` waits there: the
@@ -1930,6 +2072,9 @@ struct Symbols {
     by_line: HashMap<String, u32>,
     resolved: Vec<Resolved>,
     by_address: FastMap<u64, u32>,
+    /// The exports of the modules asked about so far, by module base and
+    /// then by address ([`exports_of`]).
+    exports: FastMap<u64, FastMap<u64, String>>,
 }
 
 impl Symbols {
@@ -1945,7 +2090,18 @@ impl Symbols {
             by_line: HashMap::new(),
             resolved: Vec::new(),
             by_address: FastMap::default(),
+            exports: FastMap::default(),
         }
+    }
+
+    /// The export of the module at `base` that is at exactly `address`,
+    /// by the module's own table.
+    fn exported(&mut self, base: u64, end: u64, address: u64) -> Option<String> {
+        self.exports
+            .entry(base)
+            .or_insert_with(|| exports_of(base, end))
+            .get(&address)
+            .cloned()
     }
 
     /// Lists the loaded modules anew (a report's first step).
@@ -2076,8 +2232,16 @@ impl Symbols {
                 line: None,
             };
         };
-        let (base, kind, label) = (module.base, module.kind, module.label.clone());
+        let (base, end, kind, label) = (module.base, module.end, module.kind, module.label.clone());
         let start = function_start(address);
+        // What the module's own export table calls the function, for a
+        // symbol library that names nothing in the system's modules
+        // (Wine's does not without their debug files, and every wait was
+        // an `ntdll.dll+0x...` that nothing took for a wait).
+        let listed = match (kind, start) {
+            (Kind::Title, _) | (_, None) => None,
+            (_, Some(start)) => self.exported(base, end, start),
+        };
         // By the function's start in its module: what code with no names
         // (the title, the driver) is told apart by.
         let plain = || match start {
@@ -2103,8 +2267,8 @@ impl Symbols {
                     Some(start) => at >= start && at <= address,
                     None => at <= address && address - at < 0x100,
                 });
-                match export {
-                    Some((name, _)) => {
+                match export.map(|(name, _)| name).or(listed) {
+                    Some(name) => {
                         let module = label.rsplit_once('.').map_or(&*label, |(stem, _)| stem);
                         vec![format!("{module}!{name}")]
                     }
@@ -2404,6 +2568,14 @@ impl Sampler {
             "the sampler's thread used {:.1} % of one processor",
             100.0 * mine.as_secs_f64() / since.as_secs_f64().max(1e-9),
         );
+        if !self.counted {
+            let _ = writeln!(
+                w,
+                "the system does not count a thread's cycles here (QueryThreadCycleTime fails, as it \
+                 does under Wine): every look took the thread's stack, and \"on cpu\" is not known \
+                 and reads 0"
+            );
+        }
         let _ = writeln!(
             w,
             "names of ours: {}",
@@ -2737,22 +2909,21 @@ impl Sampler {
 
 /// The processor time the calling thread has used.
 fn own_cpu() -> Duration {
+    // SAFETY: a plain query; the handle is this thread's own.
+    cpu_of(unsafe { GetCurrentThread() })
+}
+
+/// The processor time a thread has used, in the kernel and out of it; zero
+/// if it cannot be asked.
+fn cpu_of(thread: HANDLE) -> Duration {
     use windows_sys::Win32::Foundation::FILETIME;
     let zero = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
     };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: our own thread and four valid out pointers.
-    unsafe {
-        GetThreadTimes(
-            GetCurrentThread(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
-    };
+    // SAFETY: a thread handle of the caller's and four valid out pointers.
+    unsafe { GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user) };
     let ticks = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
     Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
 }

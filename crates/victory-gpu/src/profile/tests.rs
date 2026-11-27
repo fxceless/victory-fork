@@ -244,9 +244,11 @@ fn time_goes_to_the_function_that_spent_it() {
     assert!(outer < inner, "{stack}");
     // The thread that waited the whole time was suspended once at most a
     // few times: it had not run since the look before.
+    // (Where the system counts a thread's cycles: without the count every
+    // look suspends it.)
     let waiting = sampler.threads.iter().find(|t| t.id == locked).unwrap();
     assert!(
-        waiting.reused * 10 >= waiting.looks * 9,
+        !sampler.counted || waiting.reused * 10 >= waiting.looks * 9,
         "{} of {}",
         waiting.reused,
         waiting.looks
@@ -527,6 +529,25 @@ fn names_say_what_waits_and_whose_code_it_is() {
     assert_eq!(Role::of_name("victory-pipelines-3"), Some(Role::Pipelines));
     assert_eq!(Role::of_name("victory-wide-0"), Some(Role::Wide));
     assert_eq!(Role::of_name("victory-window"), None);
+}
+
+#[test]
+fn a_source_file_says_whose_inlined_code_it_is() {
+    for (file, scope) in [
+        (r"/rustc/48a229ce/library\std\src\sys\sync\mutex\futex.rs", Some("std::sys::sync::mutex::futex")),
+        ("/rustc/48a229ce/library/core/src/sync/atomic.rs", Some("core::sync::atomic")),
+        ("/rustc/48a229ce/library/alloc/src/collections/btree/mod.rs", Some("alloc::collections::btree")),
+        (r"C:\work\victory\crates\victory-gpu\src\draw.rs", Some("victory_gpu::draw")),
+        ("/home/me/victory/crates/victory-gpu/src/lib.rs", Some("victory_gpu")),
+        ("/home/me/victory/crates/victory-gpu/src/descriptor/host.rs", Some("victory_gpu::descriptor::host")),
+        // Not a place that says the path: a dependency, a library crate
+        // that is not the runtime, a file that is no Rust source.
+        ("/home/me/.cargo/registry/src/index/windows-core-0.62.2/src/interface.rs", None),
+        ("/rustc/48a229ce/library/stdarch/crates/core_arch/src/x86/sse2.rs", None),
+        ("/rustc/48a229ce/library/std/src/sys/thing.c", None),
+    ] {
+        assert_eq!(scope_of(file).as_deref(), scope, "{file}");
+    }
 }
 
 #[test]
