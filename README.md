@@ -846,6 +846,17 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+On Windows systems with multiple GPUs, select the hardware adapter used by the
+shader test harness with a case-insensitive substring of its DXGI name:
+
+```powershell
+$env:VICTORY_SHADER_ADAPTER = 'NVIDIA'
+cargo test -p victory-shader --lib
+Remove-Item Env:VICTORY_SHADER_ADAPTER
+```
+
+The default is the Windows-selected adapter. Explicit WARP runs still use WARP.
+
 Run the title:
 
 ```powershell
