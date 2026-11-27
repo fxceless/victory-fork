@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod placement;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -155,13 +157,13 @@ pub(crate) fn cards() -> bool {
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// 1,650 MB of the card's budget free. With `VICTORY_CARD_SIDE=1` the sizes
+/// no switch of their own says are the placement's
+/// ([`placement::buffer_limits`]).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
@@ -178,11 +180,12 @@ fn card_limits() -> (u64, u64) {
         // 64 KiB of the card's memory a copy and as much again for one
         // shaders write, and more copies for the passes before and after
         // each submission to go through. Not tried in a game yet.
-        let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-            Some(kib) if kib > 0 => kib << 10,
-            _ => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
-        };
-        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        placement::buffer_limits(
+            number("VICTORY_CARD_BUFFERS_MIN_KB"),
+            number("VICTORY_CARD_BUFFERS_MIN_MB"),
+            number("VICTORY_CARD_BUFFERS_MB"),
+            placement::set(),
+        )
     })
 }
 
@@ -276,11 +279,18 @@ static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
+///
+/// With `VICTORY_CARD_SIDE=1` the windows' room too ([`window_card_most`]),
+/// both capped (`placement::kept_room`).
 pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    placement::kept_room(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed),
+        placement::set().map(|_| (window_card_most(), WINDOW_CARD_BYTES.load(Ordering::Relaxed))),
+    )
 }
 
 /// The copies in the card's memory.
@@ -443,11 +453,21 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
+///
+/// 1,280 MB unless the switch says; with `VICTORY_CARD_SIDE=1` the
+/// placement's total for the card's budget, up to a higher line
+/// ([`window_line`]).
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1280) << 20
-    })
+    *MOST.get_or_init(|| placement::mb_or("VICTORY_CARD_WINDOWS_MB", |set| set.windows_most).unwrap_or(1280 << 20))
+}
+
+/// The card's use, in bytes of its `budget`, up to which a window goes to
+/// the card: eight tenths, a fifth kept free; with the placement and the
+/// texture queue keeping the windows' room ([`card_room_kept`]) 97
+/// hundredths, as a title buffer's copy whose room was kept.
+fn window_line(budget: u64) -> u64 {
+    if card_room_kept_on() && placement::set().is_some() { budget / 100 * 97 } else { budget / 10 * 8 }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -540,7 +560,7 @@ fn window_card_room(size: u64, how: &str) -> bool {
         }
     };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > window_line(budget)
     {
         say(1, "no room on the card for");
         return false;

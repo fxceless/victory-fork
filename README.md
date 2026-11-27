@@ -798,6 +798,7 @@ Rendering:
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
+- `VICTORY_CARD_SIDE=1` (off) puts what shaders touch on the card's side: every title buffer's copy (from 64 KiB) and the windows of title memory (in GPU upload heaps where the device has them, as now), totals by the card's budget, the texture queue keeping their room; a switch of its own still sets each size. On an RTX 5090 (32 GB, with #854): the frame 183 and 186 ms -> 154 and 158 ms in alternated runs; the smaller cards' sizes are not measured.
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
