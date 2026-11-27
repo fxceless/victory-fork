@@ -517,6 +517,9 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    // VICTORY_SAMPLE_LINE: where this thread spends its time.
+    #[cfg(target_arch = "x86_64")]
+    crate::lineprof::line_thread();
     loop {
         {
             let mut work = lock(&WORK.0);

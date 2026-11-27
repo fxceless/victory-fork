@@ -57,6 +57,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod lineprof;
 mod launch;
 pub mod list;
 pub mod object;
