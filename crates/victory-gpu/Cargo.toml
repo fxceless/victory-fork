@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+victory-core.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

@@ -124,6 +124,22 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// `VICTORY_SHADER_SAVE`: writes a shader as the title gave it (`<stem>.cdxil`) and as
+/// translated (`<stem>.dxil`). A `dir` inside a VIctory source tree is refused, with a
+/// warning, and nothing is written (asset policy).
+#[cfg(windows)]
+fn save_shader_dump(dir: &std::path::Path, stem: &str, container: &[u8], dxil: Option<&[u8]>) {
+    if let Err(e) = victory_core::ensure_outside_repo(dir) {
+        tracing::warn!(error = %e, "VICTORY_SHADER_SAVE: skipping the shader dump");
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), container);
+    if let Some(dxil) = dxil {
+        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), dxil);
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -148,13 +164,13 @@ impl Shader {
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
-                    }
+                    save_shader_dump(
+                        std::path::Path::new(&dir),
+                        &stem,
+                        &self.container,
+                        done.as_ref().ok().map(|t| &t.host.dxil[..]),
+                    );
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -881,6 +897,22 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_dump_inside_the_repo_is_skipped() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let inside = tempfile::tempdir_in(&repo).unwrap();
+        let dir = inside.path().join("dump");
+        save_shader_dump(&dir, "abc.ps", b"cdxil", Some(b"dxil"));
+        assert!(!dir.exists());
+
+        // The same call outside the tree writes both files.
+        let outside = tempfile::tempdir().unwrap();
+        save_shader_dump(outside.path(), "abc.ps", b"cdxil", Some(b"dxil"));
+        assert!(outside.path().join("abc.ps.cdxil").is_file());
+        assert!(outside.path().join("abc.ps.dxil").is_file());
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

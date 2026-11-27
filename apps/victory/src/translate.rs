@@ -442,8 +442,7 @@ fn translate(
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .take(70)
                 .collect();
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            dump_match(dir, &name, &hash, &bytes[..]);
         }
     }
     if !lock(seen).insert(code) {
@@ -487,11 +486,33 @@ fn translate(
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                dump_fail(Path::new(&dir), &stem, was, &bytes[..]);
             }
         }
     }
+}
+
+/// `VICTORY_DUMP_MATCH`: writes one container as `<dir>/<name>.<hash>.cdxil`. A `dir`
+/// inside a VIctory source tree is refused, with a warning, and nothing is written.
+fn dump_match(dir: &str, name: &str, hash: &str, bytes: &[u8]) {
+    let dir = Path::new(dir);
+    if let Err(e) = victory_core::ensure_outside_repo(dir) {
+        tracing::warn!(error = %e, "VICTORY_DUMP_MATCH: skipping the dump");
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{name}.{hash}.cdxil")), bytes);
+}
+
+/// `VICTORY_FAIL_DUMP`: writes one container as `<dir>/<stem>_<was>.cdxil`. A `dir`
+/// inside a VIctory source tree is refused, with a warning, and nothing is written.
+fn dump_fail(dir: &Path, stem: &str, was: usize, bytes: &[u8]) {
+    if let Err(e) = victory_core::ensure_outside_repo(dir) {
+        tracing::warn!(error = %e, "VICTORY_FAIL_DUMP: skipping the dump");
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{stem}_{was}.cdxil")), bytes);
 }
 
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
@@ -883,4 +904,35 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_dump_inside_the_repo_is_skipped() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let inside = tempfile::tempdir_in(&repo).unwrap();
+        let dir = inside.path().join("dump");
+        dump_match(dir.to_str().unwrap(), "Title", "0123456789abcdef", b"cdxil");
+        assert!(!dir.exists());
+
+        let outside = tempfile::tempdir().unwrap();
+        dump_match(outside.path().to_str().unwrap(), "Title", "0123456789abcdef", b"cdxil");
+        assert!(outside.path().join("Title.0123456789abcdef.cdxil").is_file());
+    }
+
+    #[test]
+    fn fail_dump_inside_the_repo_is_skipped() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let inside = tempfile::tempdir_in(&repo).unwrap();
+        let dir = inside.path().join("dump");
+        dump_fail(&dir, "no_DXIL_part", 0, b"cdxil");
+        assert!(!dir.exists());
+
+        let outside = tempfile::tempdir().unwrap();
+        dump_fail(outside.path(), "no_DXIL_part", 0, b"cdxil");
+        assert!(outside.path().join("no_DXIL_part_0.cdxil").is_file());
+    }
 }
