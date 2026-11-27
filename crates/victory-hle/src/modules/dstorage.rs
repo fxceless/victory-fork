@@ -141,12 +141,14 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() > 0 {
+        let mut files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        files.push((file as usize, name.clone()));
+    }
     put(out, file)
 }
 
@@ -476,9 +478,16 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
+/// The files opened while the walls trace is on, by the address of our file
+/// object, with their paths (a request names its file by that address). A
+/// released file's address can be used again, so the newest entry is the one
+/// that counts.
 static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+/// The path of the file last opened at address `source`.
+fn walls_file_name(files: &[(usize, String)], source: usize) -> Option<&str> {
+    files.iter().rev().find(|f| f.0 == source).map(|f| f.1.as_str())
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -490,8 +499,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
         "memory".to_string()
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        walls_file_name(&files, request.source as usize).unwrap_or("?").to_string()
     };
     let hr = match result {
         Ok(()) => 0,
@@ -1458,6 +1466,27 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_reused_address_names_the_newest_file() {
+        let files = [
+            (0x1000, "old.bin".to_string()),
+            (0x2000, "other.bin".to_string()),
+            (0x1000, "new.bin".to_string()),
+        ];
+        assert_eq!(walls_file_name(&files, 0x1000), Some("new.bin"));
+        assert_eq!(walls_file_name(&files, 0x2000), Some("other.bin"));
+        assert_eq!(walls_file_name(&files, 0x3000), None);
+    }
+
+    #[test]
+    fn no_file_names_are_kept_with_the_walls_trace_off() {
+        assert_eq!(walls_trace(), 0, "run without VICTORY_WALLS_TRACE");
+        let (_dir, file) = file_with(b"data");
+        assert!(!file.is_null());
+        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(files.is_empty());
     }
 
     #[test]
