@@ -41,6 +41,7 @@ static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) ambient: OnceLock<Option<crate::ambient::Pass>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -1425,6 +1426,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            ambient: OnceLock::new(),
             adapter,
         })
     }
