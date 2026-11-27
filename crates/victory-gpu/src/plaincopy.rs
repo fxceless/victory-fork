@@ -45,6 +45,26 @@ core::arch::global_asm!(
     "    mov rdi, r10",
     "    xor eax, eax",
     "    ret",
+    ".globl victory_write_guarded",
+    ".globl victory_write_guarded_at",
+    ".globl victory_write_guarded_fault",
+    "victory_write_guarded:",
+    "    mov r9, rsi",
+    "    mov r10, rdi",
+    "    mov rdi, rcx",
+    "    mov rsi, rdx",
+    "    mov rcx, r8",
+    "victory_write_guarded_at:",
+    "    rep movsb",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    mov eax, 1",
+    "    ret",
+    "victory_write_guarded_fault:",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    xor eax, eax",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -52,6 +72,9 @@ unsafe extern "C" {
     fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_copy_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
+    fn victory_write_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_write_guarded_at: u8;
+    static victory_write_guarded_fault: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
@@ -71,12 +94,37 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// Whether writes of host memory back into title memory are made in place
+/// (`VICTORY_WRITE_PLAIN=1`; off by default). Symmetric to [`on`]: avoids
+/// `NtWriteVirtualMemory` / `WriteProcessMemory` syscalls (and wineserver IPC
+/// under Wine/Proton) on copy-back, falling back to the kernel write if a
+/// destination page is unmapped or read-only.
+pub(crate) fn write_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_WRITE_PLAIN").is_some_and(|v| v == "1");
+        if on {
+            install();
+            tracing::info!(
+                "writes back into title memory are made in place, with NtWriteVirtualMemory behind them for a \
+                 page that is not writable (VICTORY_WRITE_PLAIN=1)"
+            );
+        }
+        on
+    })
+}
+
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
 /// under [`LEAST`] bytes, since the last line; and the fills of under
 /// [`LEAST`] bytes made in place ([`copy_short`]).
 static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Writes made in place, their bytes, the writes that met an unwritable page
+/// (and fell back to `NtWriteVirtualMemory`), and the writes skipped because
+/// their destination faulted lately ([`WRITE_RECENT`]), since the last line.
+static WRITE_COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -127,6 +175,29 @@ fn note_fault(from: usize, len: usize) {
     RECENT[last & 1023].store(last, Relaxed);
 }
 
+/// The 64 KiB blocks of title memory a write in place faulted on lately.
+static WRITE_RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+static WRITE_EMPTIED: AtomicU64 = AtomicU64::new(0);
+
+fn write_faulted_lately(to: usize, len: usize) -> bool {
+    let now = now_ms();
+    let emptied = WRITE_EMPTIED.load(Relaxed);
+    if now.saturating_sub(emptied) >= 2_000 && WRITE_EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
+        for place in &WRITE_RECENT {
+            place.store(0, Relaxed);
+        }
+        return false;
+    }
+    let (first, last) = blocks(to, len);
+    WRITE_RECENT[first & 1023].load(Relaxed) == first || WRITE_RECENT[last & 1023].load(Relaxed) == last
+}
+
+fn note_write_fault(to: usize, len: usize) {
+    let (first, last) = blocks(to, len);
+    WRITE_RECENT[first & 1023].store(first, Relaxed);
+    WRITE_RECENT[last & 1023].store(last, Relaxed);
+}
+
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
@@ -141,16 +212,23 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at the copy's own instruction.
-        if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
+        // Only at our own guarded copy/write instructions.
         const READ: usize = 0;
-        let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
-        let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
-        if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
-            return EXCEPTION_CONTINUE_EXECUTION;
+        const WRITE: usize = 1;
+        if context.Rip == (&raw const victory_copy_guarded_at) as u64 {
+            let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
+            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
+            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+                context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        } else if context.Rip == (&raw const victory_write_guarded_at) as u64 {
+            let write = r.NumberParameters >= 1 && r.ExceptionInformation[0] == WRITE;
+            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && write;
+            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+                context.Rip = (&raw const victory_write_guarded_fault) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
         EXCEPTION_CONTINUE_SEARCH
     }
@@ -179,6 +257,21 @@ fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
+    false
+}
+
+/// Copies `len` bytes from readable host memory `from` into title memory `to`;
+/// false if a destination page is missing or unwritable.
+#[cfg(target_arch = "x86_64")]
+fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
+    install();
+    // SAFETY: `from` is readable host memory; a destination write fault ends
+    // the copy with 0 instead of crashing ([`install`]).
+    unsafe { victory_write_guarded(to, from, len) != 0 }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn guarded_write(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
@@ -244,19 +337,49 @@ pub(crate) const fn least() -> usize {
     LEAST
 }
 
-/// With the frame line: what [`copy`] did per frame over `frames`.
-pub(crate) fn line(frames: f64) {
-    if !on() {
-        return;
+/// With [`write_on`]: copies host memory at `from` back into title memory at
+/// `to`; false if off or a destination page was not writable (the caller then
+/// writes through `NtWriteVirtualMemory`, as before).
+pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !write_on() {
+        return false;
     }
-    let [copies, bytes, gone, lately, small, fills] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
-    tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
-         that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
-         (VICTORY_FILLS_PLAIN): {fills:.0}",
-        bytes / 1e6
-    );
+    if write_faulted_lately(to as usize, len) {
+        WRITE_COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded_write(to, from, len);
+    if whole {
+        WRITE_COUNT[0].fetch_add(1, Relaxed);
+        WRITE_COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        WRITE_COUNT[2].fetch_add(1, Relaxed);
+        note_write_fault(to as usize, len);
+    }
+    whole
+}
+
+/// With the frame line: what [`copy`] and [`write`] did per frame over `frames`.
+pub(crate) fn line(frames: f64) {
+    if on() {
+        let [copies, bytes, gone, lately, small, fills] =
+            [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+             that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
+             faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
+             (VICTORY_FILLS_PLAIN): {fills:.0}",
+            bytes / 1e6
+        );
+    }
+    if write_on() {
+        let [writes, bytes, gone, lately] = [0, 1, 2, 3].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "writes back into title memory made in place per frame (VICTORY_WRITE_PLAIN=1): {writes:.0}, {:.1} MB; {gone:.1} met an unwritable page; \
+             left to NtWriteVirtualMemory untried: {lately:.0} whose destination faulted in the last two seconds",
+            bytes / 1e6
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -381,5 +504,31 @@ mod tests {
         }
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Guarded in-process writes succeed on writable pages and cleanly return
+    /// false on unmapped or read-only pages without crashing.
+    #[test]
+    fn guarded_write_copies_writable_and_falls_back_on_unwritable_pages() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        // SAFETY: memory of the test's own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READONLY) }.is_null());
+        let src: Vec<u8> = (0..PAGE).map(|i| (i * 17 + 9) as u8).collect();
+        // Writable page: full write succeeds.
+        assert!(guarded_write(base, src.as_ptr(), PAGE));
+        assert_eq!(unsafe { std::slice::from_raw_parts(base, PAGE) }, &src[..]);
+        // Crossing into reserved hole: returns false without crashing.
+        assert!(!guarded_write(base.wrapping_add(PAGE / 2), src.as_ptr(), PAGE));
+        // Read-only page: returns false without crashing.
+        assert!(!guarded_write(base.wrapping_add(2 * PAGE), src.as_ptr(), 64));
+        // Register preservation: subsequent write still succeeds.
+        let alt = vec![0x5Au8; 128];
+        assert!(guarded_write(base, alt.as_ptr(), alt.len()));
+        assert_eq!(unsafe { std::slice::from_raw_parts(base, alt.len()) }, &alt[..]);
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }
