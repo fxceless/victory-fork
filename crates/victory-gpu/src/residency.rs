@@ -1,4 +1,4 @@
-﻿//! Host-memory admission for speculative texture work and reusable upload storage.
+//! Host-memory admission for speculative texture work and reusable upload storage.
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -18,6 +18,7 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
@@ -50,6 +51,7 @@ fn sample_commit(now: u64) -> u64 {
             .is_ok()
         && let Some(status) = memory_status()
     {
+        AVAILABLE_PHYSICAL.store(status.ullAvailPhys, Ordering::Relaxed);
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
@@ -76,7 +78,9 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    has_upload_reserve(commit, bake)
+        && (bake || !small_host() || AVAILABLE_PHYSICAL.load(Ordering::Relaxed) >= GIB)
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -87,12 +91,27 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    has_growth_reserve(commit, bake)
+        && (bake || !small_host() || AVAILABLE_PHYSICAL.load(Ordering::Relaxed) >= 1536 * MIB)
+}
+
+/// Automatic on <=16 GiB hosts; force for repeatable testing on larger PCs.
+/// `VICTORY_MEMORY_PROFILE=16gb-8gb` changes only discretionary caches/work.
+pub(crate) fn small_host() -> bool {
+    static SMALL: OnceLock<bool> = OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let profile = std::env::var("VICTORY_MEMORY_PROFILE").unwrap_or_else(|_| "auto".into());
+        if !matches!(profile.as_str(), "auto" | "16gb-8gb") {
+            tracing::warn!(%profile, "unknown VICTORY_MEMORY_PROFILE; using automatic detection");
+        }
+        crate::budget::small_host(memory_status().map(|s| s.ullTotalPhys), profile == "16gb-8gb")
+    })
 }
 
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    *LIMITED.get_or_init(|| small_host() || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
@@ -143,19 +162,19 @@ pub(crate) fn pressured() -> bool {
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    let commit = sample_commit(now);
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || commit < 1536 * MIB
+        || (small_host() && AVAILABLE_PHYSICAL.load(Ordering::Relaxed) < GIB)
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
-    if critical {
-        bytes.min(16 << 20)
-    } else if pressure || (limited && staging >= GIB) {
-        bytes.min(64 << 20)
-    } else {
-        bytes
-    }
+    prefetch_limit_for(bytes, pressure, critical, limited, staging, small_host())
+}
+
+fn prefetch_limit_for(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64, small: bool) -> u64 {
+    crate::budget::prefetch(bytes, pressure, critical, limited, staging, small)
 }
 
 #[cfg(test)]
@@ -189,13 +208,13 @@ mod tests {
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
-        assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
-        assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
-        assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+        assert_eq!(prefetch_limit_for(512 << 20, false, false, true, GIB, false), 64 << 20);
+        assert_eq!(prefetch_limit_for(512 << 20, false, false, true, GIB - 1, false), 512 << 20);
+        assert_eq!(prefetch_limit_for(512 << 20, false, false, false, 2 * GIB, false), 512 << 20);
+        assert_eq!(prefetch_limit_for(0, true, true, false, 0, false), 0);
+        assert_eq!(prefetch_limit_for(8 << 20, true, true, false, 0, false), 8 << 20);
+        assert_eq!(prefetch_limit_for(512 << 20, true, false, false, 0, false), 64 << 20);
+        assert_eq!(prefetch_limit_for(512 << 20, true, true, false, 0, false), 16 << 20);
+        assert_eq!(prefetch_limit_for(192 << 20, false, false, false, 0, false), 192 << 20);
     }
 }

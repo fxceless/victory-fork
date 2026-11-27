@@ -1428,14 +1428,16 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let small = crate::residency::small_host();
+    let kept_bytes: usize = if small { 64 << 20 } else { 512 << 20 };
+    if small && v.capacity() > kept_bytes { return; }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if total > kept_bytes && (small || kept > 0) {
             break;
         }
         kept += 1;

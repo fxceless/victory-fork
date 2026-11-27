@@ -10270,6 +10270,11 @@ impl Host {
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                    if crate::residency::small_host() && p.ahead.len() >= 2 {
+                        settle_now(WHY_SYNC);
+                        let finished = FINISHED.load(Ordering::Acquire);
+                        return p.ahead.iter().position(|(_, flown)| *flown <= finished);
+                    }
                     let list = self.new_list().ok()?;
                     list.close();
                     p.ahead.push((list, 0));

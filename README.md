@@ -1,5 +1,10 @@
 # VIctory fork
 
+Local experimental branch: 16 GiB RAM / 8 GiB VRAM safeguards, generic Series S
+launcher and native title upscaling controls. See [the source comparison, fixes
+and validation status](docs/local-low-memory.md). Full Rust build and gameplay
+qualification are pending; nothing from this local branch has been published.
+
 **As of 27 November 2026 this repository is based on
 [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) by
 [trustno1-coder](https://github.com/trustno1-coder).** Its tree at commit
