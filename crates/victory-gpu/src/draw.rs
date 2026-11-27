@@ -209,13 +209,15 @@ fn bake_named(
 /// counted, and those it samples while they still wait for their upload
 /// are logged; `1`, those are also uploaded before the draw, on the thread
 /// that records it, up to `VICTORY_BAKE_SOURCES_MB` (64) megabytes a draw,
-/// and only while the card has room for textures (`resource::room`).
+/// and only while that many more stay within the card's budget by what is
+/// in use (`resource::within_budget`, not the texture line of
+/// `resource::room`, which counts room kept for copies not made yet).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BakeMode {
     Off,
     Count,
     Upload,
-    /// [`BakeMode::Upload`] also while the card has no room
+    /// [`BakeMode::Upload`] also past the card's budget
     /// (`VICTORY_BAKE_SOURCES=full`), as fork pull request #1264 had it:
     /// at the boat save every such upload was skipped for room (run 316: 55
     /// of 55), the card being at its line through the whole world. Still
@@ -2534,13 +2536,14 @@ impl State {
     /// above. `VICTORY_BAKE_SOURCES=count`: counted and logged
     /// ([`State::log_bake_sources`]). `=1`: those still waiting in the
     /// queue are also uploaded now, into `list` ahead of the draw, while
-    /// the card has room, up to `VICTORY_BAKE_SOURCES_MB` a draw. That run
+    /// the card's budget holds them ([`crate::resource::within_budget`]),
+    /// up to `VICTORY_BAKE_SOURCES_MB` a draw. That run
     /// is this thread's: the worker, if it runs, stops and hands over what
     /// it recorded first ([`crate::heap_worker::urgent`]), as for the
     /// budgeted bake run. A source missing here is baked as nothing for the
     /// rest of the run: black or blotched skin.
     fn bake_sources_pass(&self, list: &HostList, p: &HostPipeline) {
-        let (mode, _) = bake_sources_mode();
+        let (mode, most) = bake_sources_mode();
         let Some(tables) = bake_tables(p) else {
             return;
         };
@@ -2563,7 +2566,7 @@ impl State {
         let mut done = [0u64; 4];
         let mut skipped = false;
         if matches!(mode, BakeMode::Upload | BakeMode::Full) && waiting {
-            if mode == BakeMode::Full || crate::resource::room() {
+            if mode == BakeMode::Full || crate::resource::within_budget(most) {
                 let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
                 host.texture_slots_requeue(&sources.unmade, crate::frame::current());
                 PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
@@ -2859,9 +2862,19 @@ impl State {
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
         // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
-        // as if the card had room, within its own bytes.
+        // as if the card had room, within its own bytes; with `=1` it asks
+        // the card's budget, as its draw did before the run began
+        // (`resource::within_budget`; `resource::room` refused 309 of 336
+        // such sources with the card under its budget on an RX 9070 XT).
         let forced = only && bake_sources_mode().0 == BakeMode::Full;
-        let mut room = forced || crate::resource::room();
+        let room_now = || {
+            if only {
+                crate::resource::within_budget(bake_sources_mode().1)
+            } else {
+                crate::resource::room()
+            }
+        };
+        let mut room = forced || room_now();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -3234,7 +3247,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = forced || crate::resource::room();
+                room = forced || room_now();
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
