@@ -597,6 +597,7 @@ fn every_f32_comparison_answers_nans_as_ieee() {
             pairs.push([a, b, 0, 0]);
         }
     }
+    #[allow(clippy::double_comparisons, clippy::neg_cmp_op_on_partial_ord)]
     let ieee = |op: u16, a: f32, b: f32| -> bool {
         let un = a.is_nan() || b.is_nan();
         match op {
