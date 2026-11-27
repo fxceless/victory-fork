@@ -1280,6 +1280,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Tests: what slots of a view heap hold.
+#[cfg(test)]
+impl HostHeap {
+    /// The host resource slot `index` holds.
+    pub(crate) fn kept_at(&self, index: u32) -> Option<ID3D12Resource> {
+        let piece = &self.kept[(index % KEPT_PIECES) as usize];
+        piece.lock().unwrap_or_else(|e| e.into_inner()).get((index / KEPT_PIECES) as usize).cloned().flatten()
+    }
+
+    /// The bytes of slot `index`'s descriptor (the shader-visible heap's
+    /// CPU side: readable on the hosts the tests run on).
+    pub(crate) fn slot_bytes(&self, index: u32) -> Vec<u8> {
+        // SAFETY: a slot of the heap, `step` bytes.
+        unsafe { std::slice::from_raw_parts(self.cpu(index).ptr as *const u8, self.step as usize) }.to_vec()
+    }
+}
+
+/// Tests: the bytes of the descriptor [`make`] makes of `view` (none if it
+/// cannot), in a heap the shaders do not see.
+#[cfg(test)]
+pub(crate) fn made_bytes(view: &View) -> Option<Vec<u8>> {
+    let device = &host()?.device;
+    // SAFETY: plain heap creation and queries; the slot is ours.
+    unsafe {
+        let heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+            .ok()?;
+        let at = heap.GetCPUDescriptorHandleForHeapStart();
+        make(view, at)?;
+        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Some(std::slice::from_raw_parts(at.ptr as *const u8, step as usize).to_vec())
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.

@@ -589,6 +589,14 @@ impl Drop for State {
     }
 }
 
+/// Tests: the dynamic slots of the tables this list made, in order.
+#[cfg(test)]
+impl State {
+    pub(crate) fn dynamic_ranges(&self) -> Vec<(u32, u32)> {
+        self.dynamic.iter().map(|&(_, _, first, n)| (first, n)).collect()
+    }
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept

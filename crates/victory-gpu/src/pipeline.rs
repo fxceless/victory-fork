@@ -829,6 +829,8 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
+#[cfg(all(test, windows))]
+mod list_bench;
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).

@@ -155,6 +155,14 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::profile::seen(crate::profile::Seen::Record);
 }
 
+/// Tests: the dynamic slots of the tables list `this` made, in order.
+#[cfg(test)]
+pub(crate) fn dynamic_ranges(this: This) -> Vec<(u32, u32)> {
+    // SAFETY: one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).dynamic_ranges()
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
