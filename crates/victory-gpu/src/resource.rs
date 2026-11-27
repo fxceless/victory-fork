@@ -1798,6 +1798,24 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Whether two half-open byte ranges share a byte: `[a_start, a_start +
+/// a_len)` and `[b_start, b_start + b_len)`. A range of no bytes shares
+/// none, and the ranges end at the last address there is.
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Whether [`let_go_idle`] and [`note_unmapped`] let host copies go at
+/// all: `VICTORY_TEXTURE_SWEEP=0` keeps every one.
+#[cfg(windows)]
+fn sweeping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1825,11 +1843,14 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !sweeping() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // What the title unmapped since the last sweep ([`note_unmapped`]): a
+    // placed texture filled from there has lost its source and goes now
+    // rather than after the idle time.
+    let unmapped = take_unmapped();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1841,10 +1862,24 @@ pub(crate) fn let_go_idle() {
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
+        // A placed texture whose source the title unmapped: no need to wait
+        // out the idle time to know its host copy is out of date. The
+        // overlap test runs over the ranges alone, so a texture nothing
+        // touched costs one bounds check and a table of at most
+        // [`KEPT_RANGES`] ranges costs what `all` costs.
+        let source_gone = if unmapped.all {
+            r.host.placed.load(Relaxed)
+        } else if unmapped.ranges.is_empty() || !r.host.placed.load(Relaxed) {
+            false
+        } else {
+            let size = footprint(&r.desc).map_or(0, |f| f.size);
+            unmapped_due(&unmapped.ranges, r.data() as u64, size)
+        };
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                (source_gone
+                    || crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES))
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1938,6 +1973,116 @@ pub(crate) fn targets_census() -> [u64; 12] {
         }
     }
     c
+}
+
+/// The ranges of title memory the title unmapped since the last sweep,
+/// merged and sorted, or `all` when there were more of them than
+/// [`KEPT_RANGES`] allows and every placed texture's source must be
+/// assumed gone.
+///
+/// Unmapping is not rare: loading a save unmapped some five thousand times
+/// a second, and walking the texture table for each of those (18,639
+/// entries then) took 975 ms of every second the load ran -- on the same
+/// thread that was doing the unmapping, so the load itself stalled and the
+/// save never loaded. It let go of 59 host copies in the whole load, so
+/// almost every one of those walks found nothing. The ranges are recorded
+/// here instead, without touching the table, and acted on by
+/// [`let_go_idle`], which already walks it once a frame.
+#[cfg(windows)]
+#[derive(Default)]
+struct Unmapped {
+    /// Sorted, non-overlapping, non-adjacent `(start, len)` halves.
+    ranges: Vec<(u64, u64)>,
+    /// More ranges arrived than [`KEPT_RANGES`]: stop counting, assume all.
+    all: bool,
+}
+
+/// How many unmapped ranges are kept between sweeps. Past this the sweep
+/// treats every placed texture as due, which is sound: what a host copy
+/// needs to go is that nothing else holds it, and a source no longer
+/// existing only ever adds a reason.
+#[cfg(windows)]
+const KEPT_RANGES: usize = 64;
+
+#[cfg(windows)]
+static UNMAPPED: std::sync::Mutex<Unmapped> = std::sync::Mutex::new(Unmapped {
+    ranges: Vec::new(),
+    all: false,
+});
+
+/// Whether `[start, start + len)` shares a byte with any recorded range.
+#[cfg(windows)]
+fn unmapped_due(ranges: &[(u64, u64)], start: u64, len: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(b_start, b_len)| ranges_overlap(start, len, b_start, b_len))
+}
+
+/// Records that the title unmapped or moved `[base, base + len)` of its
+/// memory (`crate::title_memory_remapped`): the host copies of placed
+/// textures filled from there have nothing left to come from.
+///
+/// This only records. It costs a lock and a merge over at most
+/// [`KEPT_RANGES`] ranges, whatever the size of the texture table, because
+/// the title calls it from the thread that is doing the unmapping and it
+/// does thousands of these a second while it loads.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
+pub(crate) fn note_unmapped(base: u64, len: u64) {
+    if !sweeping() || len == 0 {
+        return;
+    }
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if u.all {
+        return;
+    }
+    if merge_into(&mut u.ranges, base, len) {
+        u.all = true;
+        u.ranges = Vec::new();
+    }
+}
+
+/// Puts `[base, base + len)` into the sorted, merged `ranges`, joining what
+/// it overlaps or touches. Whether it is true that the list is full and the
+/// caller must fall back to treating everything as due.
+#[cfg(windows)]
+fn merge_into(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64) -> bool {
+    if ranges.len() >= KEPT_RANGES {
+        return true;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let (mut start, mut end) = (base, base.saturating_add(len));
+    let mut put = false;
+    for &(b_start, b_len) in ranges.iter() {
+        let b_end = b_start.saturating_add(b_len);
+        if b_end < start {
+            // Wholly before: keep it, and keep looking.
+            out.push((b_start, b_len));
+        } else if b_start > end {
+            // Wholly after: the new range goes in first, once.
+            if !put {
+                out.push((start, end - start));
+                put = true;
+            }
+            out.push((b_start, b_len));
+        } else {
+            // Overlapping or touching: one range covers both.
+            start = start.min(b_start);
+            end = end.max(b_end);
+        }
+    }
+    if !put {
+        out.push((start, end - start));
+    }
+    *ranges = out;
+    false
+}
+
+/// Takes what [`note_unmapped`] recorded, leaving nothing recorded.
+#[cfg(windows)]
+fn take_unmapped() -> Unmapped {
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *u)
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -3019,6 +3164,98 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// The unmapped ranges are merged as they arrive, so the sweep sees a
+    /// handful of ranges however many times the title unmapped -- five
+    /// thousand times a second while it loads.
+    #[test]
+    fn unmapped_ranges_merge_whatever_order_they_arrive_in() {
+        let mut r = Vec::new();
+        assert!(!merge_into(&mut r, 100, 10));
+        assert_eq!(r, vec![(100, 10)]);
+        // After: goes behind, and the list stays sorted.
+        assert!(!merge_into(&mut r, 200, 10));
+        assert_eq!(r, vec![(100, 10), (200, 10)]);
+        // Before: goes in front.
+        assert!(!merge_into(&mut r, 0, 10));
+        assert_eq!(r, vec![(0, 10), (100, 10), (200, 10)]);
+        // Overlapping in the middle: one range covers both.
+        assert!(!merge_into(&mut r, 105, 10));
+        assert_eq!(r, vec![(0, 10), (100, 15), (200, 10)]);
+        // Touching end to end: also one range, since together they are
+        // contiguous memory the title unmapped.
+        assert!(!merge_into(&mut r, 115, 5));
+        assert_eq!(r, vec![(0, 10), (100, 20), (200, 10)]);
+        // Bridging the gap between two ranges: all three become one.
+        assert!(!merge_into(&mut r, 10, 90));
+        assert_eq!(r, vec![(0, 120), (200, 10)]);
+        // Swallowing the last one too.
+        assert!(!merge_into(&mut r, 119, 200));
+        assert_eq!(r, vec![(0, 319)]);
+    }
+
+    /// Past the cap there is no point counting: the sweep is told to assume
+    /// every placed texture's source is gone, which is sound because a
+    /// source that does not exist only ever adds a reason to let the host
+    /// copy go, never a reason to keep it.
+    #[test]
+    fn unmapped_ranges_fall_back_to_everything_past_the_cap() {
+        let mut r = Vec::new();
+        for i in 0..KEPT_RANGES as u64 {
+            assert!(!merge_into(&mut r, i * 1024, 16), "range {i} fits");
+        }
+        assert_eq!(r.len(), KEPT_RANGES);
+        assert!(merge_into(&mut r, 1 << 40, 16), "one range past the cap must say so");
+        // A range that only extends one already there is not a new one, so
+        // a title stuck on one address never reaches the cap.
+        let mut r = Vec::new();
+        for i in 0..(KEPT_RANGES as u64 * 4) {
+            assert!(!merge_into(&mut r, 0, i + 1), "the same range grown is not a new range");
+        }
+        assert_eq!(r, vec![(0, KEPT_RANGES as u64 * 4)]);
+    }
+
+    /// Which textures the sweep treats as having lost their source.
+    #[test]
+    fn a_texture_is_due_only_when_an_unmapped_range_covers_it() {
+        let r = vec![(0x1000, 0x100), (0x2000, 0x100)];
+        assert!(unmapped_due(&r, 0x1000, 0x100), "the whole range");
+        assert!(unmapped_due(&r, 0x1080, 0x10), "a piece inside it");
+        assert!(unmapped_due(&r, 0x0F00, 0x200), "a range covering it");
+        assert!(unmapped_due(&r, 0x10F0, 0x20), "one byte of it");
+        assert!(!unmapped_due(&r, 0x1100, 0x100), "starting where it ends");
+        assert!(!unmapped_due(&r, 0x0F00, 0x100), "ending where it starts");
+        assert!(!unmapped_due(&r, 0x1500, 0x100), "in the gap between them");
+        assert!(!unmapped_due(&[], 0x1000, 0x100), "no ranges at all");
+        assert!(!unmapped_due(&r, 0x1000, 0), "a texture of no bytes");
+    }
+
+    #[test]
+    fn ranges_overlap_handles_boundaries_zero_len_and_overflow() {
+        // Side by side, in both orders: nothing shared.
+        assert!(!ranges_overlap(0, KIB_64, KIB_64, KIB_64));
+        assert!(!ranges_overlap(KIB_64, KIB_64, 0, KIB_64));
+        // A byte of one inside the other: shared.
+        assert!(ranges_overlap(0, KIB_64, KIB_64 - 1, KIB_64));
+        assert!(ranges_overlap(KIB_64 - 1, KIB_64, 0, KIB_64));
+        // One wholly inside the other: shared, and either way round.
+        assert!(ranges_overlap(0, 4 * KIB_64, KIB_64, KIB_64));
+        assert!(ranges_overlap(KIB_64, KIB_64, 0, 4 * KIB_64));
+        // Nothing at all shares nothing, wherever it is.
+        assert!(!ranges_overlap(0, 0, 0, KIB_64));
+        assert!(!ranges_overlap(0, KIB_64, 0, 0));
+        assert!(!ranges_overlap(0, 0, 0, 0));
+        assert!(!ranges_overlap(u64::MAX, 0, u64::MAX, 0));
+        // A range running off the end of the address space does not wrap
+        // into a false `true`: `saturating_add` stops it at the last
+        // address, so what starts there ends there too. No title address
+        // comes near, and nothing panics.
+        assert!(!ranges_overlap(u64::MAX, u64::MAX, 0, 1));
+        assert!(!ranges_overlap(0, 1, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX, 1, u64::MAX, 1));
+        assert!(ranges_overlap(u64::MAX - 1, 1, u64::MAX - 1, 1));
+        assert!(ranges_overlap(u64::MAX - 1, u64::MAX, u64::MAX - 1, 1));
     }
 
     #[test]

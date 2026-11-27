@@ -2007,6 +2007,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // Host copies of placed textures there have nothing left to come from.
+    // Record the range; the sweep lets go of them, so that the thread doing
+    // the unmapping does not walk the texture table thousands of times a
+    // second ([`crate::resource::note_unmapped`]).
+    crate::resource::note_unmapped(at as u64, len as u64);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
