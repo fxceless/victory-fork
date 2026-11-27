@@ -50,6 +50,31 @@ impl SigElement {
         }
     }
 
+    fn canonical_name(&self) -> &str {
+        match self.kind {
+            1 => "SV_VertexID",
+            2 => "SV_InstanceID",
+            3 => "SV_Position",
+            4 => "SV_RenderTargetArrayIndex",
+            5 => "SV_ViewportArrayIndex",
+            6 => "SV_ClipDistance",
+            7 => "SV_CullDistance",
+            10 => "SV_PrimitiveID",
+            12 => "SV_SampleIndex",
+            13 => "SV_IsFrontFace",
+            14 => "SV_Coverage",
+            15 => "SV_InnerCoverage",
+            16 => "SV_Target",
+            17 => "SV_Depth",
+            18 => "SV_DepthLessEqual",
+            19 => "SV_DepthGreaterEqual",
+            20 => "SV_StencilRef",
+            28 => "SV_Barycentrics",
+            30 => "SV_CullPrimitive",
+            _ => &self.name,
+        }
+    }
+
     fn sig_comp(&self) -> u32 {
         match self.comp {
             1 | 5 => 1, // bool and u32
@@ -59,8 +84,12 @@ impl SigElement {
         }
     }
 
+    fn effective_col(&self) -> u8 {
+        if self.row.is_some() { self.col } else { 0 }
+    }
+
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.col
+        ((1u8 << self.cols) - 1) << self.effective_col()
     }
 }
 
@@ -70,9 +99,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out.extend((elements.len() as u32).to_le_bytes());
     out.extend(8u32.to_le_bytes());
     // Validator 1.6 writes one name per element in element order, repeats
-    // included, except that system values share theirs (it keys names by
-    // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // included, except that system values share their canonical DXIL name
+    // (it keys names by the semantic's string, which is one static string per
+    // system value); the rows are sorted stably by register only (preserving
+    // element order within a shared row; unallocated last).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -83,17 +113,18 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
+                let name = e.canonical_name();
                 offsets.push(next);
-                next += e.name.len() as u32 + 1;
-                names.push(&e.name);
+                next += name.len() as u32 + 1;
+                names.push(name);
             }
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.col;
+        let used = e.usage << e.effective_col();
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -418,5 +449,27 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn unallocated_signature_element_uses_column_zero() {
+        let depth = SigElement {
+            name: "SV_DEPTH".into(),
+            index: 0,
+            kind: 17, // SV_Depth
+            comp: 9,
+            interp: 0,
+            cols: 1,
+            row: None,
+            col: 0xff,
+            usage: 0x1,
+            half: false,
+        };
+        let bytes = signature(&[depth], false);
+        // Header (8 bytes) + 1 row (32 bytes): bytes 24..26 of row are [mask, rw].
+        assert_eq!(bytes[8 + 24], 0x1);
+        assert_eq!(bytes[8 + 25], 0xe);
+        // Canonical name emitted as "SV_Depth\0".
+        assert_eq!(&bytes[40..], b"SV_Depth\0");
     }
 }
