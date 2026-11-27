@@ -2112,13 +2112,11 @@ impl<'a> Tracer<'a> {
             }
             let mut found = false;
             for c in copies {
-                let Term::Value(c) = c else { continue };
-                let Some(site) = self.defs[c.0 as usize] else {
-                    continue;
-                };
+                let Term::Value(c) = c else { return None };
+                let site = self.defs[c.0 as usize]?;
                 let load = self.inst(site);
                 if !load.name().starts_with("s_load_") {
-                    continue;
+                    return None;
                 }
                 // Dword k of the operand is dword `first + k` of each load.
                 let dword = load.writes.iter().position(|x| x.1 == c)?;
@@ -2181,8 +2179,17 @@ impl<'a> Tracer<'a> {
                 continue;
             }
             // An entry value, or a number some instruction computed.
-            let Some(inst) = self.def(v) else { continue };
-            if inst.name().starts_with("global_load_") {
+            let Some(site) = self.defs[v.0 as usize] else {
+                continue;
+            };
+            let inst = self.inst(site);
+            if matches!(
+                inst.fields,
+                Fields::Flat { .. }
+                    | Fields::Buffer { .. }
+                    | Fields::Ds { .. }
+                    | Fields::Image { .. }
+            ) {
                 return false;
             }
             let Fields::Valu(f) = &inst.fields else {
@@ -2194,7 +2201,7 @@ impl<'a> Tracer<'a> {
                 _ => continue,
             };
             if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
-                continue;
+                return false;
             }
             for op in f.src.iter().take(sources) {
                 match *op {
@@ -2202,11 +2209,17 @@ impl<'a> Tracer<'a> {
                     Operand::Scalar { code, .. } if code != NULL => {
                         out.extend(inst.read(Reg::S(code)).map(|s| self.origin(s)));
                     }
-                    _ => {}
+                    Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_) => {
+                        return false;
+                    }
+                    _ => return false,
                 }
             }
-            // Lanes outside EXEC keep the old value.
-            if let Some(Operand::Vector { reg, .. }) = f.dst {
+            // Lanes outside EXEC keep the old value; unguarded moves overwrite every reaching lane.
+            let guarded = self
+                .lanes
+                .is_none_or(|st| st.guards[site.0][site.1].is_some());
+            if guarded && let Some(Operand::Vector { reg, .. }) = f.dst {
                 work.extend(inst.read(Reg::V(reg)));
             }
         }
@@ -3844,5 +3857,87 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn lane_copies_refuses_mixed_lds_constant_or_non_sload_arms() {
+        // Selecting per lane between a null constant descriptor (0) and an s_load
+        // descriptor must not collapse to Source::Loaded and bypass waterfall tracking.
+        let mut words_const = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], 0, s[0..3], vcc_lo (VOP3: src0=128 (0), src1=k, src2=106 (vcc))
+        for k in 0..4u32 {
+            words_const.push(0xD501_0000 | (10 + k));
+            words_const.push(128 | (k << 9) | (106 << 18));
+        }
+        words_const.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_const.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_const.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        // No waterfall loop around the buffer_load, so per_lane/waterfall must refuse
+        // instead of lane_copies silently collapsing it to Source::Loaded.
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
+
+        // Selecting per lane between an entry SGPR (not s_load_) and an s_load descriptor
+        // must also not collapse to Source::Loaded.
+        let mut words_entry = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], s[4..7], s[0..3], vcc_lo (s[4..7] are entry SGPRs)
+        for k in 0..4u32 {
+            words_entry.push(0xD501_0000 | (10 + k));
+            words_entry.push((4 + k) | (k << 9) | (106 << 18));
+        }
+        words_entry.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_entry.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_entry.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
+
+        // Selecting per lane between ds_read_b128 (LDS) and an s_load descriptor must
+        // refuse the LDS read rather than letting lane_copies ignore ds_read_b128.
+        let mut words_lds = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            0xDBFC_0000,
+            0x0400_0001, // ds_read_b128 v[4:7], v1
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        ];
+        // v_cndmask_b32 v[10..13], v[4..7], s[0..3], vcc_lo
+        for k in 0..4u32 {
+            words_lds.push(0xD501_0000 | (10 + k));
+            words_lds.push((256 + 4 + k) | (k << 9) | (106 << 18));
+        }
+        words_lds.extend((0..4).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
+        words_lds.extend([
+            0xE030_1000,
+            0x8004_0D06, // buffer_load_dword v13, v6, s[16:19], 0 offen
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words_lds.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        assert!(track(&p, &[param(Table, 9, 1)], HwStage::Ps, Some(&st)).is_err());
     }
 }
