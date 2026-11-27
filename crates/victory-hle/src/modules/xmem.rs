@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -187,6 +187,18 @@ fn virtual_alloc(
         // caller's last byte can be in the next 64 KiB watch block.
         let start = if base.is_null() { at } else { base };
         on_commit(start as usize, size);
+    }
+    if order_constants()
+        && !at.is_null()
+        && constrained
+        && kind & MEM_RESERVE_PLACEHOLDER != 0
+        && flags & ADDRESS_32BIT != 0
+    {
+        LOW_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(at as usize, size);
+        tracing::info!(size, "tracked a low graphics placeholder for ordering");
     }
     at
 }
@@ -498,7 +510,48 @@ fn split_late() -> bool {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+fn order_constants() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        on_wine() && std::env::var_os("VICTORY_CONSTANTS_ORDER").is_some_and(|value| value == "1")
+    });
+    *ON
+}
+
+static LOW_RESERVATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+struct Section {
+    handle: HANDLE,
+    pages: usize,
+    exposed: Vec<AtomicUsize>,
+}
+
+impl Section {
+    fn new(handle: HANDLE, pages: usize, track: bool) -> Self {
+        let exposed = if track {
+            (0..pages.div_ceil(usize::BITS as usize))
+                .map(|_| AtomicUsize::new(0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self { handle, pages, exposed }
+    }
+
+    fn expose(&self, first: usize, count: usize) {
+        if self.exposed.is_empty() {
+            return;
+        }
+        let bits = usize::BITS as usize;
+        for page in first..first + count {
+            self.exposed[page / bits].fetch_or(1 << (page % bits), Ordering::Relaxed);
+        }
+    }
+
+    fn fresh(&self, page: usize) -> bool {
+        let bits = usize::BITS as usize;
+        self.exposed[page / bits].load(Ordering::Relaxed) & (1 << (page % bits)) == 0
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -508,7 +561,7 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -600,7 +653,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, n, order_constants()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -653,7 +706,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -700,6 +753,8 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
+        // A caller may open a view after dropping the table lock.
+        slice.section.expose(slice.index, 1);
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -825,6 +880,78 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
 }
 
+/// Moves only fresh slices. Page numbers used by the title stay the
+/// same. The page table lock serializes planning with new views and
+/// DirectStorage reads of the table.
+fn order_fresh_slices(physical: &mut Physical, pages: &[usize], offset: usize, count: usize) -> usize {
+    let Some(section) = pages
+        .first()
+        .and_then(|page| physical.pages.get(page))
+        .map(|slice| slice.section.clone())
+    else {
+        return 0;
+    };
+    if section.exposed.is_empty()
+        || section.pages != count
+        || offset.checked_add(pages.len()).is_none_or(|stop| stop > count)
+        || pages.iter().copied().collect::<HashSet<_>>().len() != pages.len()
+    {
+        return 0;
+    }
+
+    let mut owned = vec![None; count];
+    let mut planned = HashMap::with_capacity(count);
+    for (&page, slice) in &physical.pages {
+        if Arc::ptr_eq(&section, &slice.section) {
+            if owned[slice.index].replace(page).is_some() {
+                return 0;
+            }
+            planned.insert(page, slice.index);
+        }
+    }
+    let mut moved = 0;
+    for (i, page) in pages.iter().enumerate() {
+        let want = offset + i;
+        let (Some(&have), Some(other)) = (planned.get(page), owned[want]) else {
+            return 0;
+        };
+        if have == want {
+            continue;
+        }
+        if !section.fresh(have) || !section.fresh(want) {
+            return 0;
+        }
+        planned.insert(*page, want);
+        planned.insert(other, have);
+        owned.swap(have, want);
+        moved += 1;
+    }
+    if moved != 0 {
+        for (page, index) in planned {
+            physical.pages.get_mut(&page).expect("known under the table lock").index = index;
+        }
+    }
+    moved
+}
+
+fn order_low_reservation(physical: &mut Physical, base: usize, pages: &[usize]) {
+    let reservation = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .range(..=base)
+        .next_back()
+        .map(|(&first, &size)| (first, size));
+    let Some((first, size)) = reservation else { return };
+    let offset = base - first;
+    if !offset.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) {
+        return;
+    }
+    let moved = order_fresh_slices(physical, pages, offset / PAGE, size / PAGE);
+    if moved != 0 {
+        tracing::info!(pages = pages.len(), moved, "ordered fresh low graphics pages within their section");
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -856,6 +983,9 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    if order_constants() {
+        order_low_reservation(&mut physical, base, pages);
+    }
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -979,6 +1109,7 @@ fn alias(to: usize, from: usize, len: usize) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    slice.section.expose(slice.index, len.div_ceil(PAGE));
     use victory_gpu::framelog::{T, add};
     let started = std::time::Instant::now();
     // Splits the placeholder around the range (failing harmlessly when the
@@ -1003,7 +1134,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         // SAFETY: acts only on a placeholder.
         let view = unsafe {
             MapViewOfFile3(
-                slice.section.0,
+                slice.section.handle,
                 GetCurrentProcess(),
                 base as *const c_void,
                 (slice.index * PAGE) as u64,
@@ -1054,7 +1185,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     add(T::RemapNotesUs, committed.elapsed().as_micros() as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
@@ -1292,6 +1423,39 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_graphics_order_is_contiguous_and_rejects_exposed_slices_atomically() {
+        const COUNT: usize = 4;
+        // SAFETY: the fixture creates and owns this anonymous section.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                (COUNT * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = Arc::new(Section::new(handle, COUNT, true));
+        let mut physical = Physical::default();
+        for index in 0..COUNT {
+            physical.pages.insert(index + 100, Slice { section: section.clone(), index });
+        }
+        let indices = |physical: &Physical| {
+            (100..104).map(|page| physical.pages[&page].index).collect::<Vec<_>>()
+        };
+        assert_eq!(order_fresh_slices(&mut physical, &[100, 101], 2, COUNT), 2);
+        assert_eq!(indices(&physical), [2, 3, 0, 1]);
+        section.expose(2, 2);
+        assert_eq!(order_fresh_slices(&mut physical, &[103, 100], 0, COUNT), 0);
+        assert_eq!(indices(&physical), [2, 3, 0, 1]);
+        assert_eq!(order_fresh_slices(&mut physical, &[102, 103], 0, COUNT), 0);
+        assert_eq!(order_fresh_slices(&mut physical, &[102, 102], 0, COUNT), 0);
+        assert_eq!(indices(&physical), [2, 3, 0, 1]);
+    }
 
     #[test]
     fn commit_notifications_cover_both_blocks_of_an_unaligned_request() {
