@@ -847,6 +847,13 @@ pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// Saves the early list soon if draws asked for new pipelines
+/// (`library::save_soon`); called by the host's sweep.
+#[cfg(windows)]
+pub(crate) fn save_early_list_soon() {
+    library::save_soon();
+}
+
 /// The pipeline library's part of the report when the host device is
 /// removed (`library::removal_note`).
 #[cfg(windows)]

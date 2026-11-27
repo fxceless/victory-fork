@@ -287,6 +287,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    crate::pipeline::save_early_list_soon();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
