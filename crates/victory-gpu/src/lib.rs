@@ -60,6 +60,8 @@ mod inplace;
 mod launch;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod pacing;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;

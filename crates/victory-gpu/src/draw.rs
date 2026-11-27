@@ -934,7 +934,13 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+    let taken = DROPPED.swap(0, Ordering::Relaxed);
+    DROPPED_TAKEN.fetch_add(taken, Ordering::Relaxed);
+    taken
+}
+static DROPPED_TAKEN: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn dropped_total() -> u64 {
+    DROPPED_TAKEN.load(Ordering::Relaxed) + DROPPED.load(Ordering::Relaxed)
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);

@@ -1318,6 +1318,8 @@ extern "system" fn present(
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    #[cfg(windows)]
+    let pacing = crate::pacing::on().then(|| PRESENTS_HELD.load(Ordering::Relaxed) + crate::host::submissions_in_flight());
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1355,6 +1357,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    if let Some(depth) = pacing {
+        crate::pacing::title(frame, presenting, sent_behind, depth);
+    }
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(

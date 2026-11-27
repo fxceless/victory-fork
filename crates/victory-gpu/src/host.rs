@@ -6875,6 +6875,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
+            crate::pacing::finished(last);
             bury(last);
         }
         self.log_messages();
@@ -7324,6 +7325,7 @@ impl Host {
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
+                crate::pacing::finished(last);
                 bury(last);
             }
             line().landed.extend(landed);
@@ -7596,6 +7598,7 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
+        crate::pacing::finished(this_submission);
         bury(this_submission);
         let gpu = prepared.elapsed();
         submission_us(0, (prepared - started).as_micros() as u64);
@@ -10793,6 +10796,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        crate::pacing::log();
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -11215,13 +11219,17 @@ impl Host {
                 ),
             ]);
             copy.close();
-            match slot {
+            let flown = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
+                    flown
                 }
-                None => self.execute(&[copy]),
-            }
+                None => {
+                    self.execute(&[copy]);
+                    0
+                }
+            };
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -11235,6 +11243,11 @@ impl Host {
                 ONCE.call_once(|| {
                     tracing::error!("Present answered {:#010x} (said once): the first call to report it, frame {frame}", shown.0 as u32);
                 });
+            }
+            if crate::pacing::on() {
+                let mut stats = windows::Win32::Graphics::Dxgi::DXGI_FRAME_STATISTICS::default();
+                let stats = p.swap_chain.GetFrameStatistics(&mut stats).ok().map(|()| (stats.PresentCount, stats.SyncQPCTime));
+                crate::pacing::shown(frame, flown, stats);
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
