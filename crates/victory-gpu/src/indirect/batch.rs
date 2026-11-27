@@ -15,7 +15,7 @@
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::{Clamp, uav_barrier};
-use crate::host::transition;
+use crate::host::{AddressHash, transition};
 
 /// The jobs of one pass.
 pub(crate) const JOBS: u32 = 256;
@@ -202,8 +202,9 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// The job of a record (source, offset, kind), keyed by one word that
+    /// packs them.
+    known: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<AddressHash>>,
 }
 
 impl Table {
@@ -227,7 +228,10 @@ impl Table {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        // The key packs the bits that tell records apart into one word: the
+        // offset in words (30), the kind (4), the source (2). `offset` is a
+        // multiple of 4, so `offset >> 2` never loses a record's identity.
+        let key = (u64::from(offset >> 2) << 6) | (u64::from(kind) << 2) | u64::from(source);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
@@ -293,5 +297,46 @@ pub(super) fn record(
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
         l.ResourceBarrier(&[after]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CPU cost of filling a batch's table and re-reading its records,
+    /// which `place` is called for on every indirect execution
+    /// (`VICTORY_INDIRECT_BATCH` is on by default). Run with
+    /// `cargo test -p victory-gpu -- --ignored bench_table_place`; the writes
+    /// to the table are the same on both sides of a change, so the ratio of
+    /// the numbers is the improvement of the lookup.
+    #[test]
+    #[ignore]
+    fn bench_table_place() {
+        const ROUNDS: u32 = 2048;
+        let mut memory = vec![0u32; TABLE as usize / 4 + 1];
+        let start = std::time::Instant::now();
+        let mut sink: u64 = 0;
+        for _ in 0..ROUNDS {
+            // SAFETY: the vector holds the table and outlives its use.
+            let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 4096, [7, 9, 0, 0]) };
+            for i in 0..JOBS {
+                sink += t.place(7, (1024 + 16 * i) as u64, 0).unwrap_or(0);
+            }
+            // The records the title's tile classes read again, three times.
+            for _ in 0..3 {
+                for i in 0..JOBS {
+                    sink += t.place(7, (1024 + 16 * i) as u64, 0).unwrap_or(0);
+                }
+            }
+        }
+        let calls = ROUNDS as u64 * (JOBS as u64 + 3 * JOBS as u64);
+        println!(
+            "table place: {:.2} ns/call ({} rounds, {} calls, sink={})",
+            start.elapsed().as_nanos() as f64 / calls as f64,
+            ROUNDS,
+            calls,
+            sink
+        );
     }
 }
