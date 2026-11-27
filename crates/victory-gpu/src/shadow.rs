@@ -5359,6 +5359,68 @@ mod card_merge_tests {
         assert_eq!(&sib.bytes()[20..28], &after_write);
         assert_eq!(sib.bytes()[40], 0xE1);
     }
+
+    /// An otherwise-current sibling with an overlapping pending GPU span must
+    /// not have its pending bytes overwritten by relay propagation; its later
+    /// copy-back completion then owns those bytes in title memory.
+    #[test]
+    fn relay_merge_skips_sibling_with_overlapping_pending_gpu_span_and_completion_owns_bytes() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const PAGE: usize = super::PAGE;
+        let mapped = MappedSection::new(PAGE, &[(0, PAGE), (0, PAGE)]);
+        let (v_owner, v_sib) = (mapped.views[0].0, mapped.views[1].0);
+
+        // SAFETY: `v_owner` is a writable 1-page section view.
+        unsafe {
+            std::ptr::write_bytes(v_owner as *mut u8, 0x11, PAGE);
+        }
+
+        let owner = RegisteredShadow::new(&buffer, 0xC001, v_owner as u64, PAGE);
+        let sib = RegisteredShadow::new(&buffer, 0xC002, v_sib as u64, PAGE);
+
+        // Make both copies current on `[0, PAGE)`.
+        owner.shadow.update(v_owner, PAGE);
+        sib.shadow.update(v_sib, PAGE);
+
+        // `sib` has an in-flight GPU write spanning `[120, 160)` whose snapshot
+        // captures `[0x11; PAGE]`, followed by shader output `[0xDD; 8]` at `[128, 136)`
+        // and `[0xEE; 8]` at `[144, 152)`.
+        sib.shadow.writing(v_sib + 120, 40);
+        super::take_snapshots();
+        // SAFETY: simulates shader writes into `sib`'s host copy before copy-back lands.
+        unsafe {
+            std::ptr::write_bytes(sib.shadow.data.add(128), 0xDD, 8);
+            std::ptr::write_bytes(sib.shadow.data.add(144), 0xEE, 8);
+        }
+
+        // Relay merge on `owner` writes `[0xAA; 8]` into `[128, 136)`, overlapping `sib`'s pending span.
+        let merged = [0xAAu8; 8];
+        assert!(owner.shadow.put_back_own_always(v_owner + 128, &merged));
+
+        // Because `sib` has an overlapping pending GPU span, relay propagation leaves its bytes untouched.
+        assert_eq!(&sib.bytes()[128..136], &[0xDD; 8]);
+        assert_eq!(&sib.bytes()[144..152], &[0xEE; 8]);
+        let mut title = [0u8; 8];
+        assert!(crate::host::read_into((v_owner + 128) as *const u8, &mut title));
+        assert_eq!(title, merged);
+
+        // Later completion of `sib`'s pending span settles the bytes: contested `[128, 136)` syncs to
+        // title memory's `[0xAA; 8]` via `back_piece`, while `[144, 152)` lands `[0xEE; 8]` in title memory.
+        let written = sib.shadow.copy_back(v_sib + 120, 40);
+        assert_eq!(written, 8);
+        sib.shadow.copy_back_done(&[(v_sib + 120, v_sib + 160)]);
+
+        assert_eq!(&sib.bytes()[128..136], &[0xAA; 8]);
+        assert!(crate::host::read_into((v_owner + 144) as *const u8, &mut title));
+        assert_eq!(title, [0xEE; 8]);
+        // `sib`'s page stamp was not prematurely advanced during relay propagation, so refresh sees both.
+        assert_eq!(sib.shadow.update(v_sib, PAGE), PAGE);
+        owner.shadow.update(v_owner, PAGE);
+        assert_eq!(&owner.bytes()[144..152], &[0xEE; 8]);
+        assert_eq!(&sib.bytes()[144..152], &[0xEE; 8]);
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
