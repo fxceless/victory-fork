@@ -11457,7 +11457,9 @@ impl Host {
     /// fills and no shader writes. `None` where the device has no such
     /// heaps or turns the buffer down (then the caller's usual buffer).
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        if !self.gpu_upload() {
+        // A failed mapping probe applies to every later window on this device.
+        static WORKS: OnceLock<bool> = OnceLock::new();
+        if !self.gpu_upload() || WORKS.get() == Some(&false) {
             return None;
         }
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11496,7 +11498,6 @@ impl Host {
                 // is the card's, mapped through the bus. Both ways must
                 // write it and it must read back the same, or no copy goes
                 // to such a heap in this run.
-                static WORKS: OnceLock<bool> = OnceLock::new();
                 let works = *WORKS.get_or_init(|| {
                     let n = (size as usize).min(8192);
                     let pattern: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
