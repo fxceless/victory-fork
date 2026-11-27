@@ -1888,15 +1888,25 @@ fn wide_in(workers: &'static Workers, jobs: Vec<Job>) {
         return;
     }
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    // (`VICTORY_LINE_WAITS`: the line's calls followed.)
+    let followed = crate::linewait::wide_call();
+    let count = jobs.len();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
+            let followed = followed.clone();
             queue.push_back(Box::new(move || {
+                if let Some(f) = &followed {
+                    f.job_begins();
+                }
                 job();
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
+                    if let Some(f) = &followed {
+                        f.last_done();
+                    }
                     left.1.notify_all();
                 }
             }));
@@ -1910,9 +1920,14 @@ fn wide_in(workers: &'static Workers, jobs: Vec<Job>) {
             None => break,
         }
     }
+    let stood = followed.as_ref().map(|_| crate::linewait::stamp());
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(n);
+    if let (Some(f), Some(stood)) = (&followed, stood) {
+        f.waited(count, stood);
     }
 }
 

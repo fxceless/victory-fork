@@ -3360,6 +3360,11 @@ static RELAY_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 /// again.
 static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 
+/// The thread that told of landings last, and the one that took the
+/// submission lock last (`VICTORY_LINE_WAITS`).
+static LANDED_BY: crate::linewait::Holder = crate::linewait::Holder::new();
+static SUBMITTED_BY: crate::linewait::Holder = crate::linewait::Holder::new();
+
 /// With [`relay`], the order of what we put on the queue: the number of
 /// sends of changed ranges to copies in the card's memory so far
 /// (`Host::card_before`). Held from the taking of the ranges until their
@@ -4728,6 +4733,7 @@ pub(crate) fn settle_now(why: usize) {
         return;
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    SUBMITTED_BY.mark();
     host.settle(&mut submitted, why);
 }
 
@@ -4820,6 +4826,7 @@ fn late_helper() {
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            SUBMITTED_BY.mark();
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -4872,10 +4879,12 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    let followed = crate::linewait::began();
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
+    crate::linewait::waited(crate::linewait::LANDINGS, followed, LANDED_BY.get());
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
@@ -6912,6 +6921,7 @@ impl Host {
             *poke = true;
         }
         LINE_MOVED.notify_all();
+        LANDED_BY.mark();
         LINE_LANDED.notify_all();
     }
 
@@ -7000,7 +7010,9 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
+                    let line = crate::linewait::began();
                     WaitForSingleObject(self.event, INFINITE);
+                    crate::linewait::waited(crate::linewait::CARD, line, crate::linewait::BY_CARD);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -7244,7 +7256,9 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
+                            let line = crate::linewait::began();
                             WaitForSingleObject(self.event, INFINITE);
+                            crate::linewait::waited(crate::linewait::CARD, line, crate::linewait::BY_CARD);
                             stood(waiting);
                             working(true);
                         }
@@ -7354,7 +7368,20 @@ impl Host {
         crate::profile::seen(crate::profile::Seen::Submit);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::linewait::on() && !crate::queue::behind() {
+            crate::linewait::mark_submitting();
+        }
+        let mut submitted = match self.submitted.try_lock() {
+            Ok(submitted) => submitted,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let (line, by) = (crate::linewait::began(), SUBMITTED_BY.get());
+                let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                crate::linewait::waited(crate::linewait::SUBMISSION_LOCK, line, by);
+                submitted
+            }
+        };
+        SUBMITTED_BY.mark();
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -7561,7 +7588,9 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
+                        let line = crate::linewait::began();
                         WaitForSingleObject(self.event, INFINITE);
+                        crate::linewait::waited(crate::linewait::CARD, line, crate::linewait::BY_CARD);
                         stood(started);
                         working(true);
                     }
@@ -10852,6 +10881,7 @@ impl Meter {
             }
         }
         crate::shadow::back_line(frames);
+        crate::linewait::line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {

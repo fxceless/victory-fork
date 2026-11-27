@@ -57,6 +57,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod linewait;
 mod launch;
 pub mod list;
 pub mod object;

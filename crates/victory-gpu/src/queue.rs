@@ -509,20 +509,29 @@ static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::n
 #[cfg(windows)]
 fn wake() {
     *lock(&WORK.0) = true;
+    WAKER.mark();
     WORK.1.notify_one();
 }
+
+/// The thread that gave [`worker`] something to look at last
+/// (`VICTORY_LINE_WAITS`).
+#[cfg(windows)]
+static WAKER: crate::linewait::Holder = crate::linewait::Holder::new();
 
 /// The thread of [`behind`]: runs what queues hold as far as it is free
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    crate::linewait::mark_line();
     loop {
         {
             let mut work = lock(&WORK.0);
+            let line = if *work { None } else { crate::linewait::began() };
             while !*work {
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
+            crate::linewait::waited(crate::linewait::NOTHING_IN_LINE, line, WAKER.get());
             *work = false;
         }
         let started = std::time::Instant::now();

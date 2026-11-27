@@ -139,6 +139,10 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The thread that took [`SYNCING`] last (`VICTORY_LINE_WAITS`).
+#[cfg(windows)]
+static SYNCING_BY: crate::linewait::Holder = crate::linewait::Holder::new();
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
@@ -189,7 +193,17 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
-    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = match SYNCING.try_lock() {
+        Ok(one) => one,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let (line, by) = (crate::linewait::began(), SYNCING_BY.get());
+            let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+            crate::linewait::waited(crate::linewait::HEAP_TURN, line, by);
+            one
+        }
+    };
+    SYNCING_BY.mark();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -320,6 +334,25 @@ pub(crate) fn sync_beside() -> bool {
 #[cfg(windows)]
 static BESIDE: (std::sync::Mutex<u8>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
 
+/// When the last pass handed over began, a `crate::linewait::stamp`
+/// (`VICTORY_LINE_WAITS`).
+#[cfg(windows)]
+static BESIDE_BEGAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The submitting thread waits under `state` until no pass is out (timed
+/// for `VICTORY_LINE_WAITS`).
+#[cfg(windows)]
+fn beside_done(mut state: std::sync::MutexGuard<'static, u8>) -> std::sync::MutexGuard<'static, u8> {
+    let line = if *state == 0 { None } else { crate::linewait::began().map(|_| crate::linewait::stamp()) };
+    while *state != 0 {
+        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(line) = line {
+        crate::linewait::heap_waited(line, BESIDE_BEGAN.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    state
+}
+
 /// Since the line last took them: passes run beside, microseconds the
 /// submitting thread waited for one at [`sync_end`], passes it found done.
 #[cfg(windows)]
@@ -335,6 +368,7 @@ pub(crate) fn sync_begin() {
             .name("victory-heap-sync".into())
             .spawn(|| {
                 crate::framelog::keep_on_fast_cores("victory-heap-sync");
+                crate::linewait::HEAP_THREAD.mark();
                 loop {
                     {
                         let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -342,6 +376,9 @@ pub(crate) fn sync_begin() {
                             state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
                         }
                         *state = 2;
+                        if crate::linewait::on() {
+                            BESIDE_BEGAN.store(crate::linewait::stamp(), std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     sync_heaps();
                     make_waiting();
@@ -356,12 +393,10 @@ pub(crate) fn sync_begin() {
         make_waiting();
         return;
     }
-    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     // (One submission at a time holds the submission lock, and each ends
     // with [`sync_end`]: nothing is running here now.)
-    while *state != 0 {
-        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
-    }
+    let mut state = beside_done(state);
     *state = 1;
     BESIDE_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     BESIDE.1.notify_all();
@@ -373,14 +408,12 @@ pub(crate) fn sync_begin() {
 pub(crate) fn sync_end() {
     use std::sync::atomic::Ordering::Relaxed;
     let waiting = std::time::Instant::now();
-    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
     if *state == 0 {
         BESIDE_COUNTS[2].fetch_add(1, Relaxed);
         return;
     }
-    while *state != 0 {
-        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
-    }
+    drop(beside_done(state));
     BESIDE_COUNTS[1].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
 }
 

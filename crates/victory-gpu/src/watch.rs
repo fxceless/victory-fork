@@ -93,6 +93,25 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// The journal, its lock timed for `VICTORY_LINE_WAITS` when it is taken.
+fn journal() -> std::sync::MutexGuard<'static, Journal> {
+    let j = match JOURNAL.try_lock() {
+        Ok(j) => j,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let (line, by) = (crate::linewait::began(), JOURNAL_HOLDER.get());
+            let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            crate::linewait::waited(crate::linewait::JOURNAL, line, by);
+            j
+        }
+    };
+    JOURNAL_HOLDER.mark();
+    j
+}
+
+/// The thread that took the journal last (`VICTORY_LINE_WAITS`).
+static JOURNAL_HOLDER: crate::linewait::Holder = crate::linewait::Holder::new();
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -117,7 +136,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -188,7 +207,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -232,7 +251,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -268,7 +287,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -279,7 +298,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept || len == 0 {
         return;
     }
@@ -306,7 +325,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     j.asked += 1;
     let now = j.asked;
@@ -331,7 +350,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// never). Read only, for `crate::backreads`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stamp(page: usize) -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
+    journal().written.get(&page).copied().unwrap_or(0)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -469,7 +488,7 @@ pub(crate) fn subpages(start: usize, end: usize) -> Vec<(usize, u64, u64, u16)> 
         return Vec::new();
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     j.sub.range(first..last).map(|(&p, &(asked, before, bits))| (p, asked, before, bits)).collect()
 }
 
@@ -507,7 +526,7 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -546,7 +565,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
@@ -843,8 +862,22 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    let g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let (line, by) = (crate::linewait::began(), GUARDS_HOLDER.get());
+            let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            crate::linewait::waited(crate::linewait::GUARDS, line, by);
+            g
+        }
+    };
+    GUARDS_HOLDER.mark();
+    g
 }
+
+/// The thread that took the guards' lock last (`VICTORY_LINE_WAITS`).
+static GUARDS_HOLDER: crate::linewait::Holder = crate::linewait::Holder::new();
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
@@ -1263,7 +1296,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if taken.contains(&0) {
         return false;
     }
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     // The bits first, then the journal, both under its lock ([`published`]).
     let by_bits = !j.ahead.iter().any(|&(a, b)| a <= first && last <= b);
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
@@ -1307,7 +1340,7 @@ pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u
         return false;
     }
     let ahead = {
-        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = journal();
         if !j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]) {
             return false;
         }
@@ -1943,6 +1976,7 @@ impl Drop for Remapping {
 pub fn title_memory_remapping() -> Remapping {
     let asked = std::time::Instant::now();
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    REMAPPER.mark();
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
     Remapping(held, asked)
@@ -1956,8 +1990,17 @@ pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    if let Some(reading) = title_memory_reading_now() {
+        return reading;
+    }
+    let (line, by) = (crate::linewait::began(), REMAPPER.get());
+    let reading = Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()));
+    crate::linewait::waited(crate::linewait::REMAPPING, line, by);
+    reading
 }
+
+/// The thread that changed a mapping last (`VICTORY_LINE_WAITS`).
+static REMAPPER: crate::linewait::Holder = crate::linewait::Holder::new();
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
@@ -2711,7 +2754,7 @@ mod tests {
 
     /// Whether `[start, end)` is known by its bits.
     fn known(start: usize, end: usize) -> bool {
-        published(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), start, end)
+        published(&journal(), start, end)
     }
 
     /// The pages of an answer of [`writes`] written after the asking `since`.
@@ -2902,7 +2945,7 @@ mod tests {
         // Noted for good, as with `VICTORY_ABSENT_MS=told`, and looked at
         // as the asking after the notes does.
         assert_eq!(guard_at(from, to, 1, u64::MAX), Some(Vec::new()));
-        publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &[], from, to, true);
+        publish(&journal(), &[], from, to, true);
         assert!(known(from, to), "holes in a placeholder, noted for good");
         let before = light_counts();
         let (three, written) = writes_as(from, to, true, 2).expect("a view");
@@ -2940,7 +2983,7 @@ mod tests {
         assert!(!placeholder(plain / BLOCK));
         assert_eq!(guard_at(plain, plain + BLOCK, 1, u64::MAX), Some(vec![plain / PAGE]));
         assert_eq!(guard_at(plain, plain + BLOCK, 2, u64::MAX), Some(Vec::new()), "noted");
-        publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &[], plain, plain + BLOCK, true);
+        publish(&journal(), &[], plain, plain + BLOCK, true);
         assert!(!known(plain, plain + BLOCK));
         // Nor does its note live for good: committed with no word, it is
         // found when the note is old.
