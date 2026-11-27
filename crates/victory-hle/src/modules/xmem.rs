@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -530,6 +530,9 @@ impl Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    /// Freed page numbers available for reuse, keeping every live page number
+    /// inside the title's 21-bit `number >> 4` field across long sessions.
+    free_pages: VecDeque<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
@@ -539,6 +542,42 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    /// Reserves `n` distinct page numbers below `PAGE_NUMBER_LIMIT`, reusing
+    /// freed numbers first and bumping `next_page` for the remainder.
+    /// Returns `None` without mutating state if fewer than `n` numbers remain.
+    fn take_page_numbers(&mut self, n: usize) -> Option<Vec<usize>> {
+        let from_free = self.free_pages.len().min(n);
+        let from_bump = n - from_free;
+        let bump_frames = from_bump.checked_mul(FRAMES)?;
+        let new_next = self.next_page.checked_add(bump_frames)?;
+        if new_next > PAGE_NUMBER_LIMIT {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..from_free {
+            out.push(self.free_pages.pop_front()?);
+        }
+        let first = self.next_page;
+        self.next_page = new_next;
+        for i in 0..from_bump {
+            out.push(first + i * FRAMES);
+        }
+        Some(out)
+    }
+
+    /// Removes `number` from `pages` and recycles it only if it was live so
+    /// duplicate or unknown frees can never hand out the same number twice.
+    fn release_page(&mut self, number: usize) -> bool {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push_back(number);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -597,23 +636,29 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
+    let Some(numbers) = physical.take_page_numbers(n) else {
+        drop(physical);
+        tracing::warn!(n, "XMemAllocatePhysicalPages: 21-bit page number space exhausted");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
+    for (index, number) in numbers.into_iter().enumerate() {
         let slice = Slice {
             section: section.clone(),
             index,
         };
-        let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
+    drop(physical);
+    // For the GPU side's in-place census: only a committed section can be
+    // opened as a host heap. Keep `section` alive for the call.
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    let _ = section;
     1
 }
 
@@ -621,6 +666,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+/// Exclusive upper bound on page numbers that survive the title's 21-bit
+/// `number >> 4` / `<< 4` round-trip (`0x200_0000`, max `0x1ff_fff0`).
+const PAGE_NUMBER_LIMIT: usize = (1usize << 21) * FRAMES;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -630,7 +678,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.release_page(unsafe { *pages.add(i) });
     }
     1
 }
@@ -1765,5 +1813,66 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn freed_physical_page_numbers_are_recycled_without_duplicates() {
+        let a = allocate(3);
+        let peak_before = physical().next_page;
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        // Duplicate frees of the same or unknown numbers must not enqueue duplicates.
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        let unknown = [0x10usize, 0x20usize];
+        assert_eq!(XMemFreePhysicalPages(2, unknown.as_ptr()), 1);
+
+        let b = allocate(3);
+        // Reused freed numbers without advancing `next_page`.
+        assert_eq!(physical().next_page, peak_before);
+        // All returned numbers must be distinct and survive the title's 21-bit shift.
+        let mut unique = b.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3);
+        for &num in &b {
+            assert_eq!(num % FRAMES, 0);
+            assert!(num > 0 && num < PAGE_NUMBER_LIMIT);
+            assert_eq!(((num >> 4) & 0x1f_ffff) << 4, num);
+        }
+        // New pages are backed by fresh storage (writable and zero-initialized).
+        assert!(write_physical(&b, 0, &[0xAB; 16]));
+        assert_eq!(&page_bytes(b[0])[..16], &[0xAB; 16]);
+        assert_eq!(XMemFreePhysicalPages(3, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn page_number_allocator_enforces_21_bit_limit_without_partial_mutation() {
+        let mut state = Physical {
+            next_page: PAGE_NUMBER_LIMIT - 2 * FRAMES,
+            free_pages: VecDeque::from([0x10_0000]),
+            ..Default::default()
+        };
+        // Only 3 numbers remain (1 free + 2 bump): asking for 4 fails atomically.
+        assert_eq!(state.take_page_numbers(4), None);
+        assert_eq!(state.next_page, PAGE_NUMBER_LIMIT - 2 * FRAMES);
+        assert_eq!(state.free_pages.len(), 1);
+
+        let got = state.take_page_numbers(3).expect("exact capacity succeeds");
+        assert_eq!(
+            got,
+            vec![
+                0x10_0000,
+                PAGE_NUMBER_LIMIT - 2 * FRAMES,
+                PAGE_NUMBER_LIMIT - FRAMES,
+            ]
+        );
+        for &num in &got {
+            assert_eq!(((num >> 4) & 0x1f_ffff) << 4, num);
+        }
+        assert_eq!(state.next_page, PAGE_NUMBER_LIMIT);
+        assert_eq!(state.take_page_numbers(1), None);
+
+        // Once a page is freed back, allocating again succeeds without exceeding the limit.
+        state.free_pages.push_back(got[1]);
+        assert_eq!(state.take_page_numbers(1), Some(vec![got[1]]));
     }
 }
