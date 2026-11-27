@@ -87,8 +87,11 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
-        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` to the
+        /// run log's `max` of "host wave lanes" and `VICTORY_VIEW_LIMIT` to
+        /// its `null_slot` of "host view heaps hold" (not `views`: the
+        /// translator is keyed on the slot, so the heap's size misses
+        /// every entry).
         #[arg(long)]
         warm: Option<PathBuf>,
     },

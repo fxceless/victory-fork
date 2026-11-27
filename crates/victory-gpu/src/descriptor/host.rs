@@ -1063,11 +1063,13 @@ pub(crate) fn probe_view_limit() {
         } else {
             PORTABLE_VIEWS
         };
+        let null_slot = views - 1;
         tracing::info!(
             views,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+            null_slot,
+            "host view heaps hold {views} views; view indices are clamped to the null slot at the end ({null_slot}) from the first shader on"
         );
-        victory_shader::emit::set_view_heap_limit(views - 1);
+        victory_shader::emit::set_view_heap_limit(null_slot);
     });
 }
 
