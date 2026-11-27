@@ -1164,38 +1164,45 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(BTreeMap<(usize, usize), (u32, u64)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
-    /// often it declares it.
+    /// often it declares it. Index exact ranges; overlapping ranges remain
+    /// independent, as before.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        match self.0.iter_mut().find(|f| f.0 == range) {
-            Some(f) => {
-                if f.2 != number {
-                    f.1 += 1;
-                    f.2 = number;
+        use std::collections::btree_map::Entry;
+        match self.0.entry(range) {
+            Entry::Occupied(mut entry) => {
+                let (count, last) = entry.get_mut();
+                if *last != number {
+                    *count += 1;
+                    *last = number;
                 }
             }
-            None => self.0.push((range, 1, number)),
+            Entry::Vacant(entry) => {
+                entry.insert((1, number));
+            }
         }
     }
 
     /// One submission that declared `ranges` (each once) is copied back:
-    /// the ranges no other submission still holds.
+    /// the ranges no other submission still holds, in input order.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        use std::collections::btree_map::Entry;
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
-                Some(at) => {
-                    self.0[at].1 = self.0[at].1.saturating_sub(1);
-                    if self.0[at].1 == 0 {
-                        self.0.swap_remove(at);
+            match self.0.entry(*range) {
+                Entry::Occupied(mut entry) => {
+                    let count = &mut entry.get_mut().0;
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        entry.remove();
                         free.push(*range);
                     }
                 }
                 // Not counted (declared before anything counted): free.
-                None => free.push(*range),
+                Entry::Vacant(_) => free.push(*range),
             }
         }
         free
@@ -1428,6 +1435,60 @@ mod relay_tests {
         assert_eq!(flights.done(&[a]), vec![a]);
         // A range never counted is free at once.
         assert_eq!(flights.done(&[b]), vec![b]);
+    }
+
+    /// Compare indexed bookkeeping with the previous vector algorithm,
+    /// including duplicate declarations, overlapping and unknown ranges,
+    /// and completions that arrive in a different order.
+    #[test]
+    fn indexed_flights_match_vector_reference() {
+        let mut seed = 0x6a09_e667u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..32 {
+            let mut indexed = Flights::default();
+            let mut reference: Vec<((usize, usize), u32, u64)> = Vec::new();
+            for _ in 0..2048 {
+                let start = (next() % 128) as usize * 64;
+                let range = (start, start + (next() % 8 + 1) as usize * 64);
+                let number = u64::from(next() % 16);
+                if next() >> 31 == 0 {
+                    indexed.declare(range, number);
+                    match reference.iter_mut().find(|f| f.0 == range) {
+                        Some(f) if f.2 != number => {
+                            f.1 += 1;
+                            f.2 = number;
+                        }
+                        Some(_) => {}
+                        None => reference.push((range, 1, number)),
+                    }
+                } else {
+                    let ranges = [range, (start + 32, range.1 + 32)];
+                    let mut free = Vec::new();
+                    for r in ranges {
+                        match reference.iter().position(|f| f.0 == r) {
+                            Some(at) => {
+                                reference[at].1 = reference[at].1.saturating_sub(1);
+                                if reference[at].1 == 0 {
+                                    reference.swap_remove(at);
+                                    free.push(r);
+                                }
+                            }
+                            None => free.push(r),
+                        }
+                    }
+                    assert_eq!(indexed.done(&ranges), free);
+                }
+                assert_eq!(indexed.0.len(), reference.len());
+                for &(r, count, last) in &reference {
+                    assert_eq!(indexed.0.get(&r), Some(&(count, last)));
+                }
+            }
+        }
     }
 
     /// The merge moves exactly the bytes the card changed, into title
