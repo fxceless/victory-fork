@@ -21,7 +21,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
-// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
+// Optional pads read straight from HID over USB or Bluetooth.
 #[cfg(any(windows, test))]
 mod dualsense;
 
@@ -57,7 +57,7 @@ const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
-const PADS: usize = 4;
+pub(super) const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const MOUSE: usize = PADS + 2;
@@ -89,24 +89,24 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub struct PadState {
+    pub buttons: u32,
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    pub left_x: f32,
+    pub left_y: f32,
+    pub right_x: f32,
+    pub right_y: f32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct KeyState {
-    scan_code: u32,
-    code_point: u32,
-    virtual_key: u8,
-    dead_key: bool,
+pub(super) struct KeyState {
+    pub(super) scan_code: u32,
+    pub(super) code_point: u32,
+    pub(super) virtual_key: u8,
+    pub(super) dead_key: bool,
 }
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
@@ -114,7 +114,7 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// GameInput v0: cumulative motion; scroll axes are not sampled.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct MouseState {
+pub(super) struct MouseState {
     buttons: u32,
     position_x: i64,
     position_y: i64,
@@ -144,17 +144,21 @@ fn apply_mouse_sample(
 }
 
 /// Host input, or a fake in tests.
-trait Source: Send {
+pub(super) trait Source: Send {
     fn mouse(&mut self) -> Option<MouseState> { None }
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
+    /// Connection check for rumble; scripted sources need not sample a frame.
+    fn pad_connected(&mut self, slot: usize) -> bool {
+        self.pad(slot).is_some()
+    }
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
+pub(super) fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -178,7 +182,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
 /// pushed further.
-fn merged(a: PadState, b: PadState) -> PadState {
+pub(super) fn merged(a: PadState, b: PadState) -> PadState {
     let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
     PadState {
         buttons: a.buttons | b.buttons,
@@ -455,7 +459,9 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let one_pad = one_pad();
+        let source = super::gameinput_script::wrap_from_env(source, one_pad);
+        let hub = Hub::new(source, one_pad);
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -1011,7 +1017,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
+            if source.pad_connected(slot) {
                 source.rumble(slot, speed(low), speed(high));
             }
         }
@@ -1266,7 +1272,7 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            // Native host slots first; optional HID pads fill the free slots.
             if slot == 0 {
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
                 self.pads = super::dualsense::slots(

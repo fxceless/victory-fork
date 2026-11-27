@@ -17,6 +17,9 @@
 
 #[cfg(windows)]
 mod ambient;
+pub mod bench;
+#[cfg(windows)]
+mod framelog;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

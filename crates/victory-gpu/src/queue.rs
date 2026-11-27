@@ -1048,7 +1048,7 @@ extern "system" fn present(
         return S_OK;
     }
     #[cfg(windows)]
-    if planes > 0
+    let shown = if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
@@ -1072,7 +1072,7 @@ extern "system" fn present(
                     (over_res, over_tex, over_state)
                 })
             });
-        show_planes(
+        let shown = show_planes(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
@@ -1083,12 +1083,17 @@ extern "system" fn present(
             crate::resource::host_transition(over_res, over_state);
         }
         let _ = host;
-    }
+        shown
+    } else {
+        None
+    };
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    #[cfg(windows)]
+    crate::bench::on_present(frame, crate::draw::drawn(), shown);
     S_OK
 }
 
@@ -1119,15 +1124,14 @@ fn show_planes(
     state: u32,
     overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
     what: Shown,
-) {
-    let Some(host) = crate::host::host() else {
-        return;
-    };
+) -> Option<bool> {
+    let host = crate::host::host()?;
     let shown = host.present_planes(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (shown, what.resource);
+    let _ = what.resource;
+    shown
 }
 
 /// Diagnostics: logs a presented frame that is black after one that was

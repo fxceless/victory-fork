@@ -688,7 +688,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
-                if let Some((texture, state)) = texture {
+                let black = if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
                     let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
@@ -696,13 +696,18 @@ impl Work for Job {
                         let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
                         (&ov.texture, st)
                     });
-                    super::show_planes(&texture.texture, state, over, shown);
-                }
+                    super::show_planes(&texture.texture, state, over, shown)
+                } else {
+                    None
+                };
                 QUEUED.fetch_sub(1, Relaxed);
                 // The lists behind it are the ones sent next: none is held
                 // back any more.
                 PRESENTS_GONE[1].fetch_add(1, Relaxed);
                 crate::list::thin::moved();
+                // Use the display worker's draw count, after the preceding
+                // queued submissions have run and with this frame's probe.
+                crate::bench::on_present(shown.frame, crate::draw::drawn(), black);
             }
         }
         // (The mark was this submission's alone.)

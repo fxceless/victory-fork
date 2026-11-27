@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+use crate::framelog::{self, GpuTiming, Stage};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -733,7 +735,10 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
-    let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let [idle, behind, stood] = [0, 1, 2].map(|i| {
+        let stage = (i == 0).then_some(Stage::CardIdle);
+        framelog::reset_interval(&CARD_CLOCK_US[i], stage) as f64 / 1000.0 / frames
+    });
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -750,6 +755,19 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Unretired portion of the counters mirrored into the benchmark totals.
+pub(crate) fn bench_interval(stage: Stage) -> u64 {
+    let counter = match stage {
+        Stage::Prepare => &SUBMISSION_US[0],
+        Stage::CardWait => &SUBMISSION_US[1],
+        Stage::CardIdle => &CARD_CLOCK_US[0],
+        Stage::Copy => &PREPARING[0],
+        Stage::CopyBack => &COPY_BACK[0],
+        _ => return 0,
+    };
+    counter.load(Ordering::Relaxed)
+}
 
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
@@ -811,6 +829,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            crate::bench::on_device_removed();
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
         }
@@ -2783,6 +2802,7 @@ struct Sent {
     /// Its number among the submissions started.
     number: u64,
     card: Option<CardPlan>,
+    timing: Option<GpuTiming>,
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
@@ -2802,6 +2822,7 @@ struct Flight {
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
+    timing: Option<GpuTiming>,
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
@@ -4712,7 +4733,13 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+        mut timing: Option<&mut crate::framelog::GpuTiming>,
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4775,6 +4802,9 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.mark_preparation(list, false, false);
+                    }
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4852,6 +4882,9 @@ impl Host {
                         for run in runs {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
+                    }
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.mark_preparation(list, false, true);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -4935,6 +4968,9 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.mark_preparation(list, true, false);
+                    }
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4959,6 +4995,9 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    if let Some(timing) = timing {
+                        timing.mark_preparation(list, true, true);
+                    }
                     list.Close()?;
                     list.cast()
                 })()
@@ -4982,6 +5021,21 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+    }
+
+    /// Reads benchmark timestamps only after the GPU has finished writing them.
+    fn finish_bench_timing(&self, timing: Option<GpuTiming>, fence: u64) {
+        if let Some(timing) = timing {
+            // SAFETY: a plain query of the submission fence.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= fence && completed != u64::MAX {
+                timing.finish();
+            } else if completed != u64::MAX {
+                // The normal wait failed; the lists may still be on the card.
+                // Keep their resources alive rather than recycling the slot.
+                std::mem::forget(timing);
+            }
+        }
     }
 
     /// The plan's submission has run and its results were read
@@ -5411,6 +5465,7 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
+                    self.finish_bench_timing(flight.timing, flight.fence);
                     for detached in &mut flight.lists {
                         detached.release_tables();
                     }
@@ -5695,6 +5750,7 @@ impl Host {
                 lists,
                 order,
                 card: sent.card,
+                timing: sent.timing,
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -5751,6 +5807,7 @@ impl Host {
                 lists: Vec::new(),
                 order: Vec::new(),
                 card: sent.card,
+                timing: sent.timing,
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
@@ -5895,6 +5952,7 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
+                        self.finish_bench_timing(flight.timing, flight.fence);
                         for detached in &mut flight.lists {
                             detached.release_tables();
                         }
@@ -6187,7 +6245,8 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut bench_timing = GpuTiming::take(self);
+        let card = self.card_before(&declared, &picked, flown, bench_timing.as_mut());
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
             two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
@@ -6196,6 +6255,12 @@ impl Host {
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
+        }
+        if let Some(timing) = bench_timing.as_mut() {
+            let [begin, end] = timing.bracket_lists();
+            lists.insert(0, Some(begin));
+            lists.push(Some(end));
+            firsts.iter_mut().skip(1).for_each(|first| *first += 1);
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
@@ -6264,6 +6329,7 @@ impl Host {
             let sent = Sent {
                 number: this_submission,
                 card,
+                timing: bench_timing,
                 back,
                 own,
                 texture_back_ranges,
@@ -6276,6 +6342,9 @@ impl Host {
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+            if bench_timing.is_some() && let Some(first) = firsts.first_mut() {
+                *first = 0;
+            }
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -6370,6 +6439,7 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        self.finish_bench_timing(bench_timing, *submitted);
         submitting(3, runs.len());
         stage.next("submit: copying back");
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -9616,6 +9686,9 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// Readbacks of benchmark frames shown without the synchronous probe.
+    #[cfg(feature = "diagnostics")]
+    bench_probes: std::collections::VecDeque<(u64, u64, ID3D12Resource)>,
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
@@ -9685,14 +9758,17 @@ impl Meter {
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            let stage = [Stage::Prepare, Stage::CardWait][i];
+            framelog::reset_interval(&SUBMISSION_US[i], Some(stage)) as f64 / 1000.0 / frames
         });
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+            let stage = (i == 0).then_some(Stage::Copy);
+            framelog::reset_interval(&PREPARING[i], stage) as f64 / scale / frames
         });
         let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+            let stage = (i == 0).then_some(Stage::CopyBack);
+            framelog::reset_interval(&COPY_BACK[i], stage) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
@@ -10161,7 +10237,7 @@ impl Host {
     }
 
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
-    /// over it (Series S two-plane presentation), and returns them to their states.
+    /// over it, and returns both resources to their states.
     pub(crate) fn present_planes(
         &self,
         texture: &ID3D12Resource,
@@ -10384,6 +10460,27 @@ impl Host {
                 crate::capture::probe(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
+            let bench_probe = if crate::bench::active() && (slot.is_some() || composed) {
+                if composed {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let probe = crate::capture::probe(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    probe
+                } else {
+                    crate::capture::probe(&self.device, list, texture)
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "diagnostics")]
             let watched = if composed {
                 None
             } else {
@@ -10424,6 +10521,10 @@ impl Host {
                 }
             };
             #[cfg(feature = "diagnostics")]
+            if let Some(probe) = bench_probe {
+                p.bench_probes.push_back((frame, flown, probe));
+            }
+            #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
             }
@@ -10459,6 +10560,24 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Reads finished asynchronous probes, excluding menu and warmup frames.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bench_black_frames(&self, first: Option<u64>, last: u64) -> u64 {
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = presenter.as_mut() else {
+            return 0;
+        };
+        let finished = FINISHED.load(Ordering::Acquire);
+        let mut black = 0;
+        while p.bench_probes.front().is_some_and(|&(frame, flown, _)| frame <= last && flown <= finished) {
+            let (frame, _, buffer) = p.bench_probes.pop_front().expect("a finished probe");
+            if first.is_some_and(|first| frame >= first) && crate::capture::black(&buffer) {
+                black += 1;
+            }
+        }
+        black
     }
 
     /// Lets the swap chain and what presents with it go, once everything
@@ -10535,6 +10654,8 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                #[cfg(feature = "diagnostics")]
+                bench_probes: std::collections::VecDeque::new(),
                 hwnd,
                 meter: Meter::new(),
                 composer: None,

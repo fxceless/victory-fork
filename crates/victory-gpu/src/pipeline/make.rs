@@ -440,6 +440,7 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+    crate::framelog::add(crate::framelog::Stage::PipelineWait, waited.as_micros() as u64);
 }
 
 const NOT_QUEUED: u8 = 0;

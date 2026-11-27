@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod bench_loop;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,15 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Deterministic traversal benchmark runner and closed-loop optimizer.
+    BenchLoop(Box<bench_loop::Args>),
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::BenchLoop(args) => bench_loop::run(*args),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

@@ -2622,7 +2622,10 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    Option<std::time::Instant>,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2631,6 +2634,9 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(start) = self.1 {
+            crate::framelog::add(crate::framelog::Stage::Remap, start.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -2779,10 +2785,11 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    let start = crate::bench::active().then(std::time::Instant::now);
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, start)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -3111,6 +3118,7 @@ pub(crate) fn install() {
         }
         if unlocked() && PROTECTED.any(block, block + 1) {
             if open_unlocked(block) {
+                crate::framelog::add(crate::framelog::Stage::GuardFault, 1);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3155,6 +3163,7 @@ pub(crate) fn install() {
             if opened != 0 {
                 g.opened(block);
                 drop(g);
+                crate::framelog::add(crate::framelog::Stage::GuardFault, 1);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
