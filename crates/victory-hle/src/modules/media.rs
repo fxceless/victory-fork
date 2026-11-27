@@ -38,6 +38,29 @@ const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 
 // The URL rule.
 
+fn is_sep(b: u8) -> bool {
+    b == b'/' || b == b'\\'
+}
+
+fn strip_two_seps(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    (b.len() >= 2 && is_sep(b[0]) && is_sep(b[1])).then(|| &s[2..])
+}
+
+fn strip_nt_prefix(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    (b.len() >= 4 && is_sep(b[0]) && b[1] == b'?' && b[2] == b'?' && is_sep(b[3])).then(|| &s[4..])
+}
+
+fn strip_unc_prefix(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 4 && b[..3].eq_ignore_ascii_case(b"UNC") && is_sep(b[3]) {
+        &s[4..]
+    } else {
+        s
+    }
+}
+
 /// Where a resolver may read `url` from: `Ok` with the NUL-terminated
 /// string to hand to the host, or `Err((scheme, host))` for anything that
 /// is not a local file.
@@ -48,13 +71,24 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
     };
     let host_of = |rest: &str| rest.split(['/', '\\']).next().unwrap_or("").to_string();
+    let unc_host = |rest: &str| {
+        let rest = rest
+            .strip_prefix("?\\")
+            .or_else(|| rest.strip_prefix("?/"))
+            .or_else(|| rest.strip_prefix(".\\"))
+            .or_else(|| rest.strip_prefix("./"))
+            .unwrap_or(rest);
+        host_of(strip_unc_prefix(rest))
+    };
     let path = if let Some(rest) = text.strip_prefix(r"\\?\") {
         if !drive(rest) {
-            return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
+            return Err(("unc".into(), host_of(strip_unc_prefix(rest))));
         }
         text.clone()
-    } else if let Some(rest) = text.strip_prefix(r"\\").or_else(|| text.strip_prefix("//")) {
-        return Err(("unc".into(), host_of(rest)));
+    } else if let Some(rest) = strip_two_seps(&text) {
+        return Err(("unc".into(), unc_host(rest)));
+    } else if let Some(rest) = strip_nt_prefix(&text) {
+        return Err(("unc".into(), host_of(strip_unc_prefix(rest))));
     } else if drive(&text) {
         text.clone()
     } else if let Some((scheme, rest)) = text.split_once(':').filter(|(s, _)| {
@@ -63,22 +97,60 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
                 .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
     }) {
         let scheme = scheme.to_ascii_lowercase();
-        let authority = rest.strip_prefix("//");
+        let authority = strip_two_seps(rest);
         if scheme != "file" {
             return Err((scheme, authority.map(host_of).unwrap_or_default()));
         }
-        let path = match authority {
-            Some(rest) => {
-                let host = host_of(rest);
-                if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-                    return Err((scheme, host));
+        let (had_localhost, after_authority) = match authority {
+            Some(after_two) => {
+                if let Some(after_third) = after_two.strip_prefix('/') {
+                    if after_third.as_bytes().first().is_some_and(|&b| is_sep(b)) {
+                        return Err((
+                            scheme,
+                            unc_host(after_third.trim_start_matches(['/', '\\'])),
+                        ));
+                    }
+                    (false, after_third)
+                } else if after_two.starts_with('\\') {
+                    return Err((scheme, unc_host(after_two.trim_start_matches(['/', '\\']))));
+                } else {
+                    let host = host_of(after_two);
+                    if !host.eq_ignore_ascii_case("localhost") {
+                        return Err((scheme, host));
+                    }
+                    let tail = &after_two[host.len()..];
+                    let tail = tail.strip_prefix(['/', '\\']).unwrap_or(tail);
+                    if tail.as_bytes().first().is_some_and(|&b| is_sep(b)) {
+                        return Err((scheme, unc_host(tail.trim_start_matches(['/', '\\']))));
+                    }
+                    (true, tail)
                 }
-                &rest[host.len()..]
             }
-            None => rest,
+            None => {
+                if let Some(nt) = strip_nt_prefix(rest) {
+                    return Err((scheme, host_of(strip_unc_prefix(nt))));
+                }
+                let tail = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
+                if tail.as_bytes().first().is_some_and(|&b| is_sep(b)) {
+                    return Err((scheme, unc_host(tail.trim_start_matches(['/', '\\']))));
+                }
+                (false, tail)
+            }
         };
-        let path = percent_decode(path.trim_start_matches(['/', '\\'])).replace('/', "\\");
+        let path = percent_decode(after_authority).replace('/', "\\");
+        if path.starts_with('\\') {
+            return Err((scheme, unc_host(path.trim_start_matches('\\'))));
+        }
+        if let Some(nt) = path
+            .strip_prefix(r"??\")
+            .or_else(|| path.strip_prefix(r"?\"))
+        {
+            return Err((scheme, host_of(strip_unc_prefix(nt))));
+        }
         if !drive(&path) {
+            if had_localhost {
+                return Err((scheme, "localhost".into()));
+            }
             // A local file without a drive: the host resolves it as is.
             return Ok(with_nul(url));
         }
@@ -521,6 +593,65 @@ mod tests {
             r"C:\Windows\a.wav"
         );
         assert_eq!(text(&local(&wide("clip.mp4")).unwrap()), "clip.mp4");
+    }
+
+    #[test]
+    fn mixed_slash_nt_and_file_unc_bypasses_are_refused() {
+        let refused = |url: &str| local(&wide(url)).unwrap_err();
+        assert_eq!(
+            refused(r"\/evil.example\share\a.mp4"),
+            ("unc".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"/\evil.example/share/a.mp4"),
+            ("unc".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"\??\UNC\evil.example\share\a.mp4"),
+            ("unc".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"\\?\unc\evil.example\share\a.mp4"),
+            ("unc".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"\\.\UNC\evil.example\share\a.mp4"),
+            ("unc".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"file://\evil.example\share\a.mp4"),
+            ("file".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused(r"file:\\evil.example\share\a.mp4"),
+            ("file".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused("file:////evil.example/share/a.mp4"),
+            ("file".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused("file:///%5c%5cevil.example/share/a.mp4"),
+            ("file".into(), "evil.example".into())
+        );
+        assert_eq!(
+            refused("file://localhost/share/a.mp4"),
+            ("file".into(), "localhost".into())
+        );
+
+        // Valid local forms remain accepted.
+        assert_eq!(
+            text(&local(&wide(r"\\?\C:\Windows\a.wav")).unwrap()),
+            r"\\?\C:\Windows\a.wav"
+        );
+        assert_eq!(
+            text(&local(&wide("file://localhost/C:/Windows/a.wav")).unwrap()),
+            r"C:\Windows\a.wav"
+        );
+        assert_eq!(
+            text(&local(&wide("file:clip.mp4")).unwrap()),
+            "file:clip.mp4"
+        );
     }
 
     #[test]
