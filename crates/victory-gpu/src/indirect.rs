@@ -1906,7 +1906,8 @@ void main() {
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
         let at = PIECE + 1234;
-        // SAFETY (each): inside the mapping.
+        // SAFETY: at is offset PIECE + 1234, strictly inside the mapped
+        // buffer of size 3 * PIECE.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
         assert_eq!(run(&mut warp, 0), [7, 7, 7]);

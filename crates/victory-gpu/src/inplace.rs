@@ -1132,7 +1132,10 @@ fn describe(heap: &ID3D12Heap) -> String {
 /// (committed, read-write, write-watched): a part of it opened.
 unsafe fn private(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 64 * K64;
-    // SAFETY (the whole function): the allocation below, `SIZE` bytes.
+    // SAFETY: Verifies allocation succeeded before use; all pointer offsets
+    // and buffer sizes stay strictly within the 64 KiB page boundaries of the
+    // SIZE allocation; and all D3D12 placed buffers and heaps are explicitly
+    // dropped before releasing the backing virtual memory with VirtualFree.
     unsafe {
         let base = mem::VirtualAlloc(std::ptr::null(), SIZE, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
         if base.is_null() {
@@ -1199,8 +1202,10 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
 /// pages: reserved (as it is made today) and committed.
 unsafe fn section(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 32 * K64;
-    // SAFETY (the whole function): the sections, placeholder and views
-    // made below.
+    // SAFETY: Checks handles, placeholder allocation, and mapped views for
+    // null; ensures offsets and slice lengths remain within the mapped section
+    // and placeholder bounds; unmaps all active views and drops D3D12 heaps
+    // before closing file mapping handles and releasing placeholder memory.
     unsafe {
         let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -1275,7 +1280,11 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
     let bytes = mb << 20;
     let shared = || memory().map_or(0, |m| m[3] >> 20);
     let ms = |speed: Option<f64>| speed.map_or("?".to_owned(), |ms| format!("{ms:.1}"));
-    // SAFETY (the whole function): the allocation and the section below.
+    // SAFETY: Validates VirtualAlloc and CreateFileMappingW outputs against
+    // null; ensures placed buffers stay within allocated and section
+    // capacities; and explicitly drops all placed buffers and opened D3D12
+    // heaps before releasing private memory with VirtualFree or closing
+    // the section handle.
     unsafe {
         let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
         if !base.is_null() {
