@@ -3064,7 +3064,7 @@ impl State {
                     }
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    host.texture_slot_gone(index, write);
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
