@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -9632,6 +9632,7 @@ struct Presenter {
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 struct Meter {
+    sampler: crate::frame_report::Sampler,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -9646,6 +9647,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            sampler: crate::frame_report::Sampler::default(),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -9663,6 +9665,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        self.sampler.presented();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -10451,9 +10454,17 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
+            if result.is_err() || result == DXGI_STATUS_OCCLUDED {
+                crate::frame_report::rejected_present();
+                if result.is_err() {
+                    tracing::warn!(?result, frame, "host Present failed; not counted as a presented frame");
+                    return None;
+                }
+                return Some(false);
+            }
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
             p.menu.frame();

@@ -12,6 +12,8 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [string]$Runner,
+    [switch]$Warm,
+    [ValidateRange(1, 64)][int]$WarmJobs = 2,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -42,6 +44,10 @@ try {
     foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
     Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
     try {
+        if ($Warm) {
+            & $victory warm --used --jobs $WarmJobs
+            if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up exited with code $LASTEXITCODE; game was not started." }
+        }
         & $victory run $Exe --console $Console --execute
         if ($LASTEXITCODE -ne 0) { throw "VIctory exited with code $LASTEXITCODE." }
     } finally { Pop-Location }

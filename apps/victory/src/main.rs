@@ -6,6 +6,8 @@
 mod census;
 mod inspect;
 #[cfg(windows)]
+mod frame_report;
+#[cfg(windows)]
 mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
