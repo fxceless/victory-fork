@@ -260,6 +260,49 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+/// Runs one synthetic GFX10 compute snippet from hexadecimal words supplied by the environment.
+#[test]
+fn terminal_rdna_compute() {
+    let parse = |name, default: &str| {
+        std::env::var(name)
+            .unwrap_or_else(|_| default.to_owned())
+            .split_whitespace()
+            .map(|word| u32::from_str_radix(word.trim_start_matches("0x"), 16).expect("hex dword"))
+            .collect::<Vec<_>>()
+    };
+    let words = parse("RDNA_WORDS", "be861900 7e000206");
+    let inputs: [u32; 4] = parse("RDNA_INPUTS", "80 0 0 0")
+        .try_into()
+        .expect("four input dwords");
+    let shader = build_valu_cs(&words);
+    let host = Host::new(false).expect("requested D3D12 hardware adapter");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        constants[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected binding {other:?}"),
+        };
+    }
+    let output = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch and read back")[0][0];
+    println!("v0 = 0x{output:08x} ({output} unsigned, {} signed)", output as i32);
+    if std::env::var_os("RDNA_WORDS").is_none() && std::env::var_os("RDNA_INPUTS").is_none() {
+        assert_eq!(output, 0xffff_ff80);
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

@@ -117,7 +117,29 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                if let Ok(requested) = std::env::var("VICTORY_SHADER_ADAPTER") {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    let requested = requested.to_lowercase();
+                    let mut index = 0;
+                    loop {
+                        let adapter = factory.EnumAdapters1(index).map_err(|e| {
+                            format!("cannot select hardware adapter {requested:?}: {e}")
+                        })?;
+                        let desc = adapter.GetDesc1().map_err(err)?;
+                        let end = desc.Description.iter().position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        let name = String::from_utf16_lossy(&desc.Description[..end]);
+                        if desc.Flags & 2 == 0 && name.to_lowercase().contains(&requested) {
+                            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                .map_err(err)?;
+                            break;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                }
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
