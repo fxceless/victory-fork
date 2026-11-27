@@ -834,10 +834,15 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+The title needs several GiB of available Windows commit at startup, and the
+world can use substantially more. One 16 GB system reported about 23 GB of
+private committed memory in the world. [Memory measurements (#366)](https://github.com/fxceless/victory-fork/issues/366)
+
+If loading appears to stall, check **Committed** under **Task Manager →
+Performance → Memory**. The diagnostics build warns once if the process has
+less than 2 GiB of available commit. If the system is near its commit limit or
+`crashes.log` reports Windows error 1455, close other applications or check the
+Windows paging file size and available disk space, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
