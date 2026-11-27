@@ -225,6 +225,10 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
   is hashed over a whole 64 KiB); `VICTORY_CARD_HASH_LEN=1` hashes the buffer's own bytes instead
   and has not run in a game yet. The card now idles 12 to 40 ms a frame: the thread that prepares
   submissions is the limit.
+  With a minimum below 1 MiB, `VICTORY_CARD_BUFFERS_HEADROOM_MB=256` keeps the last 256 MiB
+  of the configured buffer cap available to later title buffers of 1 MiB or more. A smaller
+  buffer stays in PC memory if its 64 KiB-rounded allocation would use that space. The default
+  headroom is 0. This option addresses the allocation order reported in [#1163](https://github.com/fxceless/victory-fork/issues/1163).
 - **`changed_runs` by masks** (the default; `VICTORY_CHANGED_RUNS=0` the old walk, `=alt` in turn):
   64 bytes at a time as one mask of differing bytes. 3.8 ms less work a frame on the submitting
   thread at equal draws; the frame's gain is inside the noise. A first form (64 equal bytes, then

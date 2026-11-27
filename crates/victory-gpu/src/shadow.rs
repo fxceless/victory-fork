@@ -144,17 +144,37 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
-/// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
-fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
+const MIB: u64 = 1 << 20;
+
+struct CardLimits {
+    least: u64,
+    most: u64,
+    headroom: u64,
+}
+
+impl CardLimits {
+    /// Charge the padded allocation. Small title buffers leave headroom after
+    /// accounting for all live and in-progress allocations, including large ones.
+    fn reserve(&self, used: &AtomicU64, len: u64, size: u64) -> Result<u64, u64> {
+        let limit = if self.least < MIB && len < MIB {
+            self.most.saturating_sub(self.headroom)
+        } else {
+            self.most
+        };
+        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            live.checked_add(size).filter(|&total| total <= limit)
+        })
+    }
+}
+
+/// Byte limits on primary title-buffer card copies. Hashes and windows are
+/// accounted separately. By default the minimum is 1 MiB and the cap 1024 MiB.
+fn card_limits() -> &'static CardLimits {
+    static LIMITS: std::sync::OnceLock<CardLimits> = std::sync::OnceLock::new();
+    LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default).saturating_mul(MIB)
         };
         // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
         // the shader writes of the smaller buffers are then found by the
@@ -171,12 +191,16 @@ fn card_limits() -> (u64, u64) {
         // a 288-byte and a 900 KiB buffer in 1.4 to 2 ms). What it costs:
         // 64 KiB of the card's memory a copy and as much again for one
         // shaders write, and more copies for the passes before and after
-        // each submission to go through. Not tried in a game yet.
+        // each submission to go through.
         let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-            Some(kib) if kib > 0 => kib << 10,
+            Some(kib) if kib > 0 => kib.saturating_mul(1 << 10),
             _ => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
         };
-        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        CardLimits {
+            least,
+            most: mb("VICTORY_CARD_BUFFERS_MB", 1024),
+            headroom: mb("VICTORY_CARD_BUFFERS_HEADROOM_MB", 0),
+        }
     })
 }
 
@@ -220,7 +244,7 @@ pub(crate) fn placed_line() {
         mb(v[3].1),
         v[4].0,
         mb(v[4].1),
-        card_limits().0 >> 10,
+        card_limits().least >> 10,
     );
 }
 
@@ -242,7 +266,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// the frame went from about 240 to 370-470 ms.
 ///
 /// With the switch, the texture queue's rule (`resource::room`) counts the
-/// part of [`card_limits`]' second number that no copy has taken yet as
+/// unused part of the title-buffer cap ([`card_limits`]) as
 /// used, and a copy may be made up to nine tenths of the budget: the room
 /// it takes was kept for it. After the burst what is kept is what the
 /// burst left of the limit (87 MB of 1,024 in run 189).
@@ -274,7 +298,7 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_limits().most.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -362,12 +386,12 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    let limits = card_limits();
+    if size < limits.least || size >= 1 << 30 {
         return None;
     }
     let host = host()?;
@@ -379,7 +403,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // the world loads, before the textures fill the card; the texture
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // shrinks by the copies' bytes, at most the title-buffer cap.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
@@ -400,7 +424,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
                 budget >> 20,
                 (budget / 100 * hundredths) >> 20,
                 CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
-                most >> 20,
+                limits.most >> 20,
                 n,
                 bytes >> 20,
                 crate::frame::current()
@@ -408,8 +432,18 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    if let Err(live) = limits.reserve(&CARD_BYTES[0], len, size) {
+        if size <= limits.most.saturating_sub(live) {
+            // This copy fits the total cap; only the small-buffer headroom refused it.
+            static SKIPPED: AtomicU64 = AtomicU64::new(0);
+            let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(256) {
+                tracing::info!(
+                    "small title buffers kept in PC memory for large card copies: {n}, {} MiB live, {} MiB cap, {} MiB headroom (VICTORY_CARD_BUFFERS_HEADROOM_MB)",
+                    live >> 20, limits.most >> 20, limits.headroom >> 20,
+                );
+            }
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -675,9 +709,67 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod headroom_tests;
+
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{AtomicU64, CardLimits, CardSpan, MIB, Ordering, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    #[test]
+    fn headroom_protects_late_large_copies_after_an_early_large_allocation() {
+        // Synthetic order at the 1 GiB cap in #1163. The late 17 copies
+        // total 151 MiB; no game allocation trace is needed for this test.
+        for (headroom, expected_small, expected_late) in [(0, 334, 0), (192, 142, 151)] {
+            let limits = CardLimits { least: PIECE as u64, most: 1024 * MIB, headroom: headroom * MIB };
+            let used = AtomicU64::new(0);
+            let place = |len: u64| {
+                let charged = len.next_multiple_of(PIECE as u64);
+                if limits.reserve(&used, len, charged).is_ok() { charged } else { 0 }
+            };
+            for _ in 0..69 {
+                assert_eq!(place(10 * MIB), 10 * MIB);
+            }
+            let small: u64 = std::iter::repeat_n(63 << 10, 2896)
+                .chain(std::iter::repeat_n(512 << 10, 306)).map(place).sum();
+            let late: u64 = std::iter::repeat_n(9 * MIB, 16).chain([7 * MIB]).map(place).sum();
+            assert_eq!((small, late), (expected_small * MIB, expected_late * MIB));
+            assert_eq!(used.into_inner(), 690 * MIB + small + late);
+        }
+    }
+
+    #[test]
+    fn concurrent_reservations_charge_only_admitted_bytes() {
+        const PAGE: u64 = PIECE as u64;
+        let limits = CardLimits { least: PAGE, most: 4 * MIB, headroom: MIB };
+        let used = AtomicU64::new(0);
+        // The small gate leaves 1 MiB even if many callers try at once.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..32 {
+                        let _ = limits.reserve(&used, PAGE - 1, PAGE);
+                    }
+                });
+            }
+        });
+        assert_eq!(used.load(Ordering::Relaxed), 3 * MIB);
+        assert_eq!(limits.reserve(&used, MIB - 1, MIB), Err(3 * MIB));
+        assert_eq!(limits.reserve(&used, MIB, MIB), Ok(3 * MIB));
+        assert_eq!(limits.reserve(&used, MIB, MIB), Err(4 * MIB));
+
+        let default_minimum = CardLimits { least: MIB, ..limits };
+        used.store(3 * MIB, Ordering::Relaxed);
+        assert!(default_minimum.reserve(&used, MIB - 1, MIB).is_ok());
+        let oversized = CardLimits { headroom: u64::MAX, ..limits };
+        used.store(0, Ordering::Relaxed);
+        assert!(oversized.reserve(&used, 1, PAGE).is_err());
+        assert!(oversized.reserve(&used, MIB, MIB).is_ok());
+        let max_cap = CardLimits { most: u64::MAX, ..limits };
+        used.store(u64::MAX - PAGE, Ordering::Relaxed);
+        assert!(max_cap.reserve(&used, MIB, MIB).is_err());
+        assert_eq!(used.into_inner(), u64::MAX - PAGE);
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -4648,7 +4740,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && size >= card_limits().least;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4657,7 +4749,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match card_for(len, size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
