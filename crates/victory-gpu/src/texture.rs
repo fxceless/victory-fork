@@ -562,6 +562,67 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
     })
 }
 
+// Diagnostics: texture checks by branch of `refresh_timed`,
+// `[checks, bytes counted]` each: 0 write-watched memory read whole, 1
+// write-watched and unwritten, 2 guarded and unwritten (skipped), 3 guarded
+// and unwritten but read in its hash turn, 4 read through the kernel while
+// the runtime remapped (`refresh_unlocked`), 5 that read failing, 6 partly
+// mapped and skipped (30 frames), 7 partly mapped and read, 8 hashed in
+// place and unchanged, 9 hashed in place and changed, 10 through the copy;
+// and 11 textures read more than once in one frame (reads past the first,
+// their bytes). Logged every ten seconds as totals since the start.
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Diagnostics: the check under way reads a guarded, unwritten texture
+    /// in its hash turn only.
+    static TURN_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+static CHECKS: [[std::sync::atomic::AtomicU64; 2]; 12] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 12];
+
+#[cfg(feature = "diagnostics")]
+fn checked(what: usize, bytes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CHECKS[what][0].fetch_add(1, Relaxed);
+    CHECKS[what][1].fetch_add(bytes as u64, Relaxed);
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|at| at.elapsed().as_secs() >= 10) {
+        *last = Some(std::time::Instant::now());
+        let text: Vec<String> = CHECKS
+            .iter()
+            .map(|c| format!("{}/{}", c[0].load(Relaxed), c[1].load(Relaxed) >> 20))
+            .collect();
+        tracing::info!(
+            "texture checks so far (checks/MB): watched-read {} watched-unwritten {} guarded-unwritten {} guarded-turn-read {} unlocked-read {} unlocked-failed {} partial-skipped {} partial-read {} inplace-unchanged {} inplace-changed {} through-copy {} read-again-same-frame {}",
+            text[0], text[1], text[2], text[3], text[4], text[5], text[6], text[7], text[8], text[9], text[10], text[11]
+        );
+    }
+}
+
+/// Diagnostics: a texture was read (`bytes`) in this frame; reads of one
+/// texture past its first in a frame are counted (`CHECKS[11]`).
+#[cfg(feature = "diagnostics")]
+fn read_in_frame(texture: usize, bytes: usize) {
+    static SEEN: Mutex<Option<(u64, HashMap<usize, u32>)>> = Mutex::new(None);
+    let frame = crate::frame::current();
+    let again = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(|| (frame, HashMap::new()));
+        if seen.0 != frame {
+            *seen = (frame, HashMap::new());
+        }
+        let n = seen.1.entry(texture).or_insert(0);
+        *n += 1;
+        *n > 1
+    };
+    if again {
+        checked(11, bytes);
+    }
+}
+
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1127,6 +1188,10 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        #[cfg(feature = "diagnostics")]
+        if read > 0 {
+            read_in_frame(self as *const Self as usize, read);
+        }
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
@@ -1140,9 +1205,13 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                #[cfg(feature = "diagnostics")]
+                checked(1, 0);
                 return 0;
             }
             last.asked = now;
+            #[cfg(feature = "diagnostics")]
+            checked(0, size);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -1174,8 +1243,12 @@ impl Staging {
             let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
                 && last.ahead.is_none_or(|at| frame > at + 1);
             if unwritten && !turn {
+                #[cfg(feature = "diagnostics")]
+                checked(2, 0);
                 return 0;
             }
+            #[cfg(feature = "diagnostics")]
+            TURN_READ.with(|t| t.set(unwritten));
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1188,7 +1261,12 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                #[cfg(feature = "diagnostics")]
+                TURN_READ.with(|t| t.set(false));
+                let read = self.refresh_unlocked(last, size);
+                #[cfg(feature = "diagnostics")]
+                checked(if read > 0 { 4 } else { 5 }, read);
+                return read;
             };
             mapped
         } else {
@@ -1204,6 +1282,10 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
+                #[cfg(feature = "diagnostics")]
+                TURN_READ.with(|t| t.set(false));
+                #[cfg(feature = "diagnostics")]
+                checked(6, 0);
                 return 0;
             }
             last.partial = Some(frame);
@@ -1227,9 +1309,17 @@ impl Staging {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             let _ = changed;
+            #[cfg(feature = "diagnostics")]
+            TURN_READ.with(|t| t.set(false));
+            #[cfg(feature = "diagnostics")]
+            checked(7, size);
             return size;
         }
         if through_copy() {
+            #[cfg(feature = "diagnostics")]
+            TURN_READ.with(|t| t.set(false));
+            #[cfg(feature = "diagnostics")]
+            checked(10, size);
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1250,11 +1340,17 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        #[cfg(feature = "diagnostics")]
+        let turn_only = TURN_READ.with(|t| t.replace(false));
         if last.hash == Some(hash) {
+            #[cfg(feature = "diagnostics")]
+            checked(if turn_only { 3 } else { 8 }, size);
             return size;
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        #[cfg(feature = "diagnostics")]
+        checked(if turn_only { 3 } else { 9 }, size);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
