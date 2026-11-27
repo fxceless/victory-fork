@@ -16,7 +16,7 @@
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -529,8 +529,8 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+#[cfg(windows)]
+pub(super) fn parse_shader_hashes(value: &str, var: &str) -> HashSet<String> {
     value
         .split(',')
         .map(str::trim)
@@ -541,7 +541,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             } else {
                 tracing::warn!(
                     hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    "{var} expects 16-digit shader hashes"
                 );
                 None
             }
@@ -551,10 +551,10 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static HASHES: OnceLock<HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_shader_hashes(&value, "VICTORY_SKIP_PIPELINES")
     });
     if hashes.is_empty() {
         return None;
@@ -869,13 +869,19 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_shader_hashes(" , ", "VICTORY_SKIP_PIPELINES").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
+            super::parse_shader_hashes(
+                " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677, 0123456789abcdef,",
+                "VICTORY_SKIP_PIPELINES",
+            ),
+            HashSet::from([
+                "0123456789abcdef".to_owned(),
+                "0011223344556677".to_owned(),
+            ])
         );
     }
 
