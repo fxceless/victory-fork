@@ -148,6 +148,12 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// With [`tabled_all`], by title slot: the frame (plus one; 0: never) in
+    /// which a draw last bound a table the slot is one of, whatever the
+    /// slot held ([`HostHeap::table_slot`]). Apart from `tabled`, which is
+    /// the texture queue's: these stamps are read by the pass over records
+    /// copied in as bytes and by nothing else.
+    table_any: Vec<std::sync::atomic::AtomicU32>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -691,6 +697,55 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether the pass over records copied in as bytes leaves every slot of
+/// a table a draw binds to its draws, not only those that hold texture
+/// views (`VICTORY_TABLED_ALL=1`; off by default).
+///
+/// The title writes its per-draw tables into its heap as bytes, every
+/// frame. A table that holds a constant buffer is made afresh for its draw
+/// in slots of our own, so the title's slots of it are read by nothing
+/// unless a shader picks them by index. The pass (`super::sync_heaps`)
+/// cannot know that. It leaves a table's TEXTURE slots to the draws that
+/// read them, and took every other changed record there for one a shader
+/// may pick: a buffer view "left for later" (its host slot made null),
+/// which the once-a-frame pass over buffer views picked by index
+/// (`State::heap_buffers`) then makes, with its memory looked at, on a
+/// recording thread.
+///
+/// With the switch a draw stamps the title's own slots of every table it
+/// binds ([`HostHeap::table_slot`]; stamps of their own, the texture
+/// queue's are not touched), and the pass leaves a stamped slot alone for
+/// [`tabled_all_frames`] frames. What it risks: a slot that was a table's
+/// and is then picked by index only is not seen by the pass until those
+/// frames are over.
+pub(crate) fn tabled_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_ALL").is_some_and(|v| v == "1"))
+}
+
+/// For how many frames after a draw bound its table a slot is left to its
+/// draws by [`tabled_all`] (`VICTORY_TABLED_ALL_FRAMES`, 1 to 240; the
+/// default is [`TABLED_ALL_FRAMES`]).
+fn tabled_all_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TABLED_ALL_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(TABLED_ALL_FRAMES, |n| n.clamp(1, TABLED_FRAMES))
+    })
+}
+
+/// [`tabled_all_frames`]'s default. The title makes its per-draw tables in
+/// a ring of its heap's slots, so a slot is written again some frames after
+/// a draw last bound its table, and the stamp has to outlast that. In the
+/// prologue's cell (some 4,200 draws a frame) the pass mirrored, a frame:
+/// 18,645 records without the switch, 13,016 with 2 frames, 9,697 with 8,
+/// 1,765 with 60 and 218 with 240; the frame was 84 to 96 ms, 73 to 77,
+/// 64 to 73, 56 to 59 and 54 to 59 ms. 60 has nearly all of it for a
+/// quarter of the time a slot can go unseen.
+const TABLED_ALL_FRAMES: u64 = 60;
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1194,6 +1249,9 @@ impl HostHeap {
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            table_any: (0..if sampler || !tabled_all() { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: {
@@ -1865,6 +1923,81 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// Title slot `index` is one of a table a draw binds, whatever it
+    /// holds (with [`tabled_all`]): the pass over records copied in as
+    /// bytes leaves it to its draws for [`tabled_all_frames`] frames.
+    pub(crate) fn table_slot(&self, index: u32) {
+        if tabled_all() {
+            self.table_slot_in(index, crate::frame::current());
+        }
+    }
+
+    /// [`HostHeap::table_slot`] in frame `frame`.
+    fn table_slot_in(&self, index: u32, frame: u64) {
+        if let Some(stamp) = self.table_any.get(index as usize) {
+            // Never 0, which is "never a table's".
+            let now = (frame as u32).wrapping_add(1).max(1);
+            if stamp.load(std::sync::atomic::Ordering::Relaxed) != now {
+                stamp.store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// How many frames before `frame` a draw last bound a table title slot
+    /// `index` is one of ([`HostHeap::table_slot`]), if within the last
+    /// `frames` frames.
+    fn table_slot_age(&self, index: u32, frame: u64, frames: u64) -> Option<u64> {
+        let stamp = self.table_any.get(index as usize).map_or(0, |s| s.load(std::sync::atomic::Ordering::Relaxed));
+        let now = (frame as u32).wrapping_add(1).max(1);
+        let age = u64::from(now.wrapping_sub(stamp));
+        (stamp != 0 && age <= frames).then_some(age)
+    }
+
+    /// Whether a draw bound a table title slot `index` is one of within
+    /// the last `frames` frames before `frame`.
+    #[cfg(test)]
+    fn table_slot_lately(&self, index: u32, frame: u64, frames: u64) -> bool {
+        self.table_slot_age(index, frame, frames).is_some()
+    }
+
+    /// If [`tabled_all`]'s own stamp leaves title slot `index` to its
+    /// draws in frame `frame` (a draw bound a table the slot is one of
+    /// within [`tabled_all_frames`] frames): the first frame in which it
+    /// no longer does, unless a draw binds the table again.
+    fn table_slot_until(&self, index: u32, frame: u64) -> Option<u64> {
+        let frames = tabled_all_frames();
+        self.table_slot_age(index, frame, frames).map(|age| frame.saturating_add(frames + 1 - age))
+    }
+
+    /// Whether the pass over records copied in as bytes leaves title slot
+    /// `index` to its draws in frame `frame`: a table's texture slot lately
+    /// ([`HostHeap::tabled_lately`]), or with [`tabled_all`] any slot of a
+    /// table a draw bound within [`tabled_all_frames`] frames.
+    fn left_to_draws(&self, index: u32, frame: u64) -> bool {
+        self.tabled_lately(index, frame) || self.table_slot_until(index, frame).is_some()
+    }
+
+    /// For a changed record the pass leaves in title slot `index` in frame
+    /// `frame` ([`HostHeap::left_to_draws`]): `retry_at` made the frame its
+    /// page is to be read again in, if that is before the frame it holds.
+    ///
+    /// Only what the switch's own stamp left is asked for again. A record
+    /// left by the texture queue's rule is taken when its page is next
+    /// written, with the switch as without it: that rule is not this
+    /// switch's to change. (Read again when the rule's 240 frames ended, a
+    /// slot that had gone on showing the texture its draws made is made
+    /// anew from a record nothing has read since, and waits in the queue
+    /// of textures picked by index. In one of two runs that did so the
+    /// cell's window frame drew flat yellow from its first minute to its
+    /// last; in none of nine without.)
+    fn retry_left(&self, index: u32, frame: u64, retry_at: Option<&mut u64>) {
+        if let Some(at) = retry_at
+            && let Some(until) = self.table_slot_until(index, frame)
+        {
+            *at = (*at).min(until);
+        }
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1895,9 +2028,14 @@ impl HostHeap {
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+        self.tabled_age(index, frame).is_some()
+    }
+
+    fn tabled_age(&self, index: u32, frame: u64) -> Option<u64> {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        let age = u64::from(now.wrapping_sub(stamp));
+        (tabled_out() && stamp != 0 && age <= TABLED_FRAMES).then_some(age)
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -2281,7 +2419,13 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+    pub(crate) fn mirror_copied(
+        &self,
+        index: u32,
+        handle: u64,
+        record: &[u8],
+        retry_at: Option<&mut u64>,
+    ) -> bool {
         if index >= self.count {
             return false;
         }
@@ -2295,7 +2439,8 @@ impl HostHeap {
         // made and brought up to date once more by the pass over buffer
         // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
         // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
+        let tables = sync_tables();
+        if retry_at.is_none() && !tables && self.left_to_draws(index, crate::frame::current()) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
@@ -2316,6 +2461,14 @@ impl HostHeap {
             // A slot never looked at that holds nothing: as it was.
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
                 return false;
+            }
+            if !tables && retry_at.is_some() {
+                let frame = crate::frame::current();
+                if self.left_to_draws(index, frame) {
+                    self.retry_left(index, frame, retry_at);
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
             }
             *last = print;
         }
@@ -2344,8 +2497,25 @@ impl HostHeap {
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        retry_at: Option<&mut u64>,
     ) -> (u64, u64) {
-        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let now = (crate::frame::current(), sync_tables());
+        self.mirror_copied_page_in(slots, (start, step), from, page, now, retry_at)
+    }
+
+    /// [`HostHeap::mirror_copied_page`] in frame `frame`; `tables`: the
+    /// slots of tables are mirrored too ([`sync_tables`]). `retry_at`: made
+    /// the first frame in which a changed record left to its draws here is
+    /// left no longer, if that is before the frame it holds.
+    fn mirror_copied_page_in(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+        (frame, tables): (u64, bool),
+        mut retry_at: Option<&mut u64>,
+    ) -> (u64, u64) {
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
         let walking = std::time::Instant::now();
@@ -2376,9 +2546,10 @@ impl HostHeap {
                 if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
                     continue;
                 }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
+                // A table's slot lately: left to its draws. With the retry
+                // enabled, the page is read again when the stamp can expire.
+                if !tables && self.left_to_draws(index as u32, frame) {
+                    self.retry_left(index as u32, frame, retry_at.as_deref_mut());
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
@@ -4850,6 +5021,104 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A slot of a table a draw bound is left to its draws for the frames
+    /// asked and no longer, and a slot no draw bound is never left.
+    #[test]
+    fn a_tables_slot_is_left_to_its_draws_for_the_frames_asked_and_no_longer() {
+        let Some(mut heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // (The stamps are only there with the switch: here whatever it says.)
+        heap.table_any = (0..8).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let frame = 1_000;
+        heap.table_slot_in(5, frame);
+        for frames in [1, 8, TABLED_FRAMES] {
+            assert!(heap.table_slot_lately(5, frame, frames));
+            assert!(heap.table_slot_lately(5, frame + frames, frames), "the last frame of {frames}");
+            assert!(!heap.table_slot_lately(5, frame + frames + 1, frames), "the frame after {frames}");
+        }
+        // Bound again: the frames count from there.
+        heap.table_slot_in(5, frame + 100);
+        assert!(heap.table_slot_lately(5, frame + 108, 8));
+        assert!(!heap.table_slot_lately(5, frame + 109, 8));
+        // Never bound, and past the heap's slots: never left.
+        assert!(!heap.table_slot_lately(6, frame, TABLED_FRAMES));
+        assert!(!heap.table_slot_lately(99, frame, TABLED_FRAMES));
+        // The texture queue's stamps are another matter.
+        assert!(!heap.tabled_lately(5, frame));
+    }
+
+    /// The pass over a changed page of the title's heap leaves a changed
+    /// record of a table's slot up to the last of the frames asked, takes
+    /// it in the frame after, and takes one no draw bound at once.
+    #[test]
+    fn the_pass_takes_a_tables_slot_when_its_frames_are_over_and_not_before() {
+        let Some(mut heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // (The stamps are only there with the switch: here whatever it says.)
+        heap.table_any = (0..8).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        // A page of a title heap: eight records, two of them written (no
+        // views of ours, so mirroring them makes nothing).
+        const STEP: usize = 32;
+        let mut page = vec![0u8; 8 * STEP];
+        (page[5 * STEP + 16], page[6 * STEP + 16]) = (1, 1);
+        let start = page.as_ptr() as u64;
+        let walk = |heap: &HostHeap, page: &[u8], frame: u64| {
+            heap.mirror_copied_page_in(0..8, (start, STEP as u64), start as usize, page, (frame, false), None)
+        };
+        // The same, and the frame the page is to be read again in.
+        let retry = |heap: &HostHeap, page: &[u8], frame: u64| {
+            let mut at = u64::MAX;
+            let done =
+                heap.mirror_copied_page_in(0..8, (start, STEP as u64), start as usize, page, (frame, false), Some(&mut at));
+            (done, at)
+        };
+        let (frame, frames) = (1_000, tabled_all_frames());
+        heap.table_slot_in(5, frame);
+        // Slot 6 at once; slot 5 is its draws', and due in the frame after
+        // the last of its frames.
+        assert_eq!(retry(&heap, &page, frame), ((8, 1), frame + frames + 1));
+        assert_eq!(retry(&heap, &page, frame + 1), ((8, 0), frame + frames + 1));
+        assert_eq!(walk(&heap, &page, frame + frames), (8, 0), "the last frame");
+        // The frame after: taken, once, and nothing is left to read again.
+        assert_eq!(retry(&heap, &page, frame + frames + 1), ((8, 1), u64::MAX), "the frame after");
+        assert_eq!(retry(&heap, &page, frame + frames + 2), ((8, 0), u64::MAX));
+        // Written again while a draw binds its table: left again, as long.
+        page[5 * STEP + 16] = 2;
+        heap.table_slot_in(5, frame + frames + 3);
+        assert_eq!(walk(&heap, &page, frame + 2 * frames + 3), (8, 0));
+        assert_eq!(walk(&heap, &page, frame + 2 * frames + 4), (8, 1));
+        // With tables' slots mirrored too (`VICTORY_HEAP_SYNC_TABLES=1`) the
+        // stamp holds nothing back.
+        page[5 * STEP + 16] = 3;
+        heap.table_slot_in(5, frame + 2 * frames + 5);
+        assert_eq!(
+            heap.mirror_copied_page_in(
+                0..8,
+                (start, STEP as u64),
+                start as usize,
+                &page,
+                (frame + 2 * frames + 5, true),
+                None
+            ),
+            (8, 1)
+        );
+        // A table's texture slot (the texture queue's stamp, which is there
+        // without the switch too): left as before, and its page is not
+        // asked for again on its account.
+        page[7 * STEP + 16] = 1;
+        heap.tabled_in(7, false, frame + 2 * frames + 6);
+        assert_eq!(retry(&heap, &page, frame + 2 * frames + 6), ((8, 0), u64::MAX));
+        // Both stamps: asked for again when the switch's own ends, and
+        // then left to the texture queue's rule with nothing more asked.
+        heap.table_slot_in(7, frame + 2 * frames + 6);
+        assert_eq!(retry(&heap, &page, frame + 2 * frames + 6), ((8, 0), frame + 3 * frames + 7));
+        if frames < TABLED_FRAMES {
+            assert_eq!(retry(&heap, &page, frame + 3 * frames + 7), ((8, 0), u64::MAX));
+        }
     }
 
     #[test]

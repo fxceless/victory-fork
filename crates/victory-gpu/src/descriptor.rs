@@ -63,6 +63,8 @@ pub(crate) struct Heap {
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    #[cfg(windows)]
+    table_retries: Option<std::sync::Mutex<TableRetries>>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -170,6 +172,73 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Pages with a changed descriptor that the table stamp left to a draw.
+/// Only one deadline per page is needed: that read finds the current bytes
+/// and reschedules any slots still left to their draws.
+#[cfg(windows)]
+#[derive(Default)]
+struct TableRetries {
+    pages: std::collections::BTreeMap<usize, u64>,
+    next: Option<u64>,
+}
+
+#[cfg(windows)]
+impl TableRetries {
+    fn include_due(&mut self, frame: u64, start: usize, end: usize, ranges: &mut Vec<(usize, usize)>) {
+        if self.next.is_none_or(|at| at > frame) {
+            return;
+        }
+        self.next = None;
+        let dirty = ranges.len();
+        for (&page, &at) in &self.pages {
+            if at <= frame {
+                let from = page.max(start);
+                let to = (page + crate::watch::PAGE).min(end);
+                if from < to {
+                    ranges.push((from, to));
+                }
+            } else {
+                self.next = Some(self.next.map_or(at, |next| next.min(at)));
+            }
+        }
+        if ranges.len() == dirty {
+            return;
+        }
+        // Use the original page order even when a deferred read overlaps
+        // a fresh write. Mirroring placed views can invalidate other slots.
+        ranges.sort_unstable();
+        let mut kept = 0;
+        for i in 0..ranges.len() {
+            let (from, to) = ranges[i];
+            if kept > 0 && from <= ranges[kept - 1].1 {
+                ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+            } else {
+                ranges[kept] = (from, to);
+                kept += 1;
+            }
+        }
+        ranges.truncate(kept);
+    }
+
+    fn after_read(&mut self, page: usize, retry_at: u64) {
+        if retry_at == u64::MAX {
+            self.pages.remove(&page);
+        } else {
+            self.pages.insert(page, retry_at);
+            self.next = Some(self.next.map_or(retry_at, |next| next.min(retry_at)));
+        }
+    }
+
+    fn after_failed_read(&mut self, page: usize, frame: u64) {
+        // The page still owes a read. Do not loop on it within this frame
+        // if the title unmapped it. Unrelated read failures keep their
+        // existing behavior.
+        if self.pages.get(&page).is_some_and(|&at| at <= frame) {
+            self.after_read(page, frame.saturating_add(1));
+        }
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -211,7 +280,15 @@ pub(crate) fn sync_heaps() {
             end as usize
         };
         let asking = std::time::Instant::now();
-        let ranges = written.take(start as usize, looked_end);
+        let mut ranges = written.take(start as usize, looked_end);
+        let mut retries = heap
+            .table_retries
+            .as_ref()
+            .map(|r| r.lock().unwrap_or_else(|e| e.into_inner()));
+        let retry_frame = retries.as_ref().map(|_| crate::frame::current());
+        if let (Some(retries), Some(frame)) = (&mut retries, retry_frame) {
+            retries.include_due(frame, start as usize, looked_end, &mut ranges);
+        }
         SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -227,12 +304,20 @@ pub(crate) fn sync_heaps() {
                 SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
                 if read {
                     pages += 1;
+                    let mut retry_at = u64::MAX;
+                    let mut record_retry = retries.as_ref().map(|_| &mut retry_at);
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(
+                            slots,
+                            (start, step),
+                            from,
+                            &page_bytes,
+                            record_retry.as_deref_mut(),
+                        );
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -252,10 +337,15 @@ pub(crate) fn sync_heaps() {
                         looked += 1;
                         // Only a record that is not the one last seen there
                         // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
+                        if host.mirror_copied(index as u32, handle, record, record_retry.as_deref_mut()) {
                             mirrored += 1;
                         }
                     }
+                    if let Some(retries) = &mut retries {
+                        retries.after_read(page, retry_at);
+                    }
+                } else if let (Some(retries), Some(frame)) = (&mut retries, retry_frame) {
+                    retries.after_failed_read(page, frame);
                 }
                 page += crate::watch::PAGE;
             }
@@ -1415,6 +1505,9 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        table_retries: (placed && visible && desc.kind == VIEWS_KIND && host::tabled_all())
+            .then(std::sync::Mutex::default),
     });
     #[cfg(windows)]
     if visible {
@@ -1674,6 +1767,176 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn table_retries_merge_dirty_pages_and_reschedule_failed_reads() {
+        const PAGE: usize = crate::watch::PAGE;
+        let mut retries = TableRetries::default();
+        retries.after_read(PAGE, 8);
+        retries.after_read(2 * PAGE, 8);
+        retries.after_read(3 * PAGE, 9);
+
+        let mut dirty = vec![(2 * PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)];
+        retries.include_due(7, 0, 5 * PAGE, &mut dirty);
+        assert_eq!(dirty, [(2 * PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)]);
+        retries.include_due(8, 0, 5 * PAGE, &mut dirty);
+        assert_eq!(dirty, [(PAGE, 3 * PAGE), (4 * PAGE, 5 * PAGE)]);
+        retries.after_failed_read(PAGE, 8);
+        retries.after_read(2 * PAGE, u64::MAX);
+
+        let mut due = Vec::new();
+        retries.include_due(8, 0, 5 * PAGE, &mut due);
+        assert!(due.is_empty());
+        retries.include_due(9, 0, 5 * PAGE, &mut due);
+        assert_eq!(due, [(PAGE, 2 * PAGE), (3 * PAGE, 4 * PAGE)]);
+        retries.after_read(PAGE, u64::MAX);
+        retries.after_read(3 * PAGE, 20);
+
+        due.clear();
+        retries.include_due(19, 0, 5 * PAGE, &mut due);
+        assert!(due.is_empty());
+        retries.include_due(20, 0, 5 * PAGE, &mut due);
+        assert_eq!(due, [(3 * PAGE, 4 * PAGE)]);
+    }
+
+    /// A skipped write must still reach an indexed slot once it leaves a
+    /// table, even if nothing writes its descriptor page a second time.
+    #[cfg(windows)]
+    #[test]
+    fn table_slot_expiry_retries_consumed_dirty_page() {
+        const CHILD: &str = "VICTORY_TEST_TABLE_SLOT_EXPIRY";
+        const TEST: &str = "descriptor::tests::table_slot_expiry_retries_consumed_dirty_page";
+        let enabled = match std::env::var(CHILD).as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => {
+                for mode in ["0", "1"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                        .env(CHILD, mode)
+                        .env("VICTORY_TABLED_ALL", mode)
+                        .env("VICTORY_TABLED_TEXTURES", "0")
+                        .env("VICTORY_HEAP_SYNC", "1")
+                        .env("VICTORY_HEAP_SYNC_TABLES", "0")
+                        .env("VICTORY_HEAP_SYNC_PAGE", "1")
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "VICTORY_TABLED_ALL={mode}: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                return;
+            }
+        };
+        assert_eq!(host::tabled_all(), enabled);
+
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+            VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = crate::watch::PAGE;
+        const SLOT: u32 = 5;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        // Every kernel page touched, and the watch started afresh, before
+        // anything is counted. On Windows the write watch also reports a
+        // page's first touch when that is a read: the pass reads the whole
+        // 64 KiB page that holds the slot, and the fifteen kernel pages of
+        // it nothing had written then counted as written (seen on Windows
+        // 11 26200; the "no descriptor writes after the first sync" check
+        // below found 15 with the switch off).
+        // SAFETY: the allocation is PAGE bytes, committed and writable.
+        unsafe { memory.cast::<u8>().write_bytes(0, PAGE) };
+        // SAFETY: the allocation, which was made with a write watch.
+        assert_eq!(unsafe { ResetWriteWatch(memory, PAGE) }, 0);
+        let mut title_heap: This = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: (PAGE / 32) as u32,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement { address: memory as u64, size: PAGE as u64 };
+        assert_eq!(create(desc, placement, &mut title_heap), S_OK);
+        let heap = heap(title_heap);
+        let host = heap.host().expect("D3D12 host for descriptor sync");
+        assert!(heap.written.is_some(), "write-watched placed heap");
+        let dirty_pages = || {
+            let mut addresses = [0usize; PAGE / 4096];
+            let mut count = addresses.len();
+            let mut granularity = 0;
+            // SAFETY: the allocation and all three result arguments are live.
+            // Flags 0 checks write watch without consuming its changes.
+            let status = unsafe {
+                GetWriteWatch(
+                    0,
+                    memory,
+                    PAGE,
+                    addresses.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            };
+            assert_eq!(status, 0);
+            count
+        };
+        let handle = heap.handle(SLOT).expect("test title slot");
+        assert!(!host.buffer_slots().contains(&SLOT));
+
+        // Stamp the previously unknown slot just as a fresh table does.
+        host.table_slot(SLOT);
+        let table_frame = crate::frame::current();
+        let mut elsewhere = [0u64; 4];
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // buffer
+        resource[4] = 64; // width
+        let mut srv = [0u32; 16];
+        srv[..10].copy_from_slice(&[42, 1, 5768, 0, 0, 0, 16, 0, 0, 0]);
+        create_placed_srv(std::ptr::null(), &resource, &srv, elsewhere.as_mut_ptr() as u64);
+        // SAFETY: both slots hold 32 bytes. Only the source was made via
+        // the descriptor API, so the destination can be found only by sync.
+        unsafe { std::ptr::copy_nonoverlapping(elsewhere.as_ptr().cast::<u8>(), handle as *mut u8, 32) };
+        let key = view_and_key(handle).expect("copied descriptor").1;
+        assert_eq!(dirty_pages(), 1, "the raw descriptor copy must dirty its page");
+        sync_heaps();
+        assert_eq!(host.buffer_slots().contains(&SLOT), !enabled);
+
+        // Origin waits with a zero timeout and TOKEN_ON_TIMEOUT advance
+        // the production frame counter without presenting or sleeping.
+        for _ in 0..241 {
+            crate::frame::wait(std::ptr::null(), 0, 0, std::ptr::null(), 2, std::ptr::null_mut());
+        }
+        assert_eq!(crate::frame::current(), table_frame + 241);
+        assert_eq!(dirty_pages(), 0, "no descriptor writes after the first sync");
+        sync_heaps();
+        let registered_without_another_write = host.buffer_slots().contains(&SLOT);
+        assert_eq!(view_and_key(handle).expect("descriptor after expiry").1, key);
+
+        // Control: dirtiness elsewhere on the same page must rediscover
+        // the unmodified descriptor if the normal expiry failed to retry it.
+        // SAFETY: the byte is inside the allocated page and outside SLOT.
+        unsafe { memory.cast::<u8>().add(31).write_volatile(1) };
+        assert_eq!(dirty_pages(), 1, "the recovery control must re-dirty the page");
+        sync_heaps();
+        let registered_after_redirty = host.buffer_slots().contains(&SLOT);
+        assert_eq!(view_and_key(handle).expect("descriptor after re-dirty").1, key);
+        slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(registered_after_redirty, "a dirty page must discover the copied slot");
+        assert!(registered_without_another_write, "stamp expiry must discover the copied slot without re-dirtying its page");
     }
 
     #[test]

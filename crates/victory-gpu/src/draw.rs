@@ -3853,12 +3853,17 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         tally(19, 1);
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+        match host.mirror(index, handle, true) {
+            Some(view) => {
+                readable(list, u.kind, &view);
+                // Up to date by this draw: not the texture pass's to make.
+                if crate::descriptor::host::is_texture_view(&view) {
+                    host.texture_slot_tabled(index, true);
+                } else {
+                    host.table_slot(index);
+                }
             }
+            None => host.table_slot(index),
         }
     }
 
@@ -4137,6 +4142,11 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                // The title's own slot is a table's, whatever it holds
+                // (`VICTORY_TABLED_ALL`).
+                if let Some(title) = title_first {
+                    host.table_slot(title + k);
+                }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // Where shaders wrote (`VICTORY_CARD_FILLS`): copied
