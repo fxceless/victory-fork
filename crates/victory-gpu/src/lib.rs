@@ -86,6 +86,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+mod texture_budget;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

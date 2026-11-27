@@ -698,6 +698,7 @@ struct Waiting {
     due: u64,
     /// The frame it was written in.
     written: u64,
+    fair_since: u64,
     /// Which write of the queue put it here: the pass hands it back with
     /// what it did, so a slot written again meanwhile stays as written.
     write: u64,
@@ -743,7 +744,15 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, fair_since: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+    }
+
+    fn reserve_oldest_due(&mut self, frame: u64) -> Option<(u32, u64)> {
+        let (&index, entry) = self.slots.iter_mut()
+            .filter(|(_, w)| w.due <= frame)
+            .min_by_key(|(_, w)| (w.fair_since, w.write))?;
+        entry.fair_since = frame;
+        Some((index, entry.write))
     }
 
     fn remove(&mut self, index: u32) {
@@ -899,7 +908,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, fair_since: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1388,8 +1397,23 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        self.texture_slots_due_budget(frame, max, false)
+    }
+
+    pub(crate) fn texture_slots_due_budget(&self, frame: u64, max: usize, oldest_first: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut due = if max == 0 { Vec::new() } else { textures.due(frame, max) };
+        if oldest_first && !due.is_empty()
+            && let Some(oldest) = textures.reserve_oldest_due(frame)
+        {
+            if let Some(position) = due.iter().position(|&entry| entry == oldest) {
+                due.remove(position);
+            } else if due.len() == max {
+                due.pop();
+            }
+            due.insert(0, oldest);
+        }
+        (due, textures.census(frame))
     }
 
     /// See [`TextureQueue::requeue`].
@@ -4966,4 +4990,16 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
     }
+}
+
+#[test]
+fn reserved_texture_turns_rotate_across_due_slots() {
+    let mut queue = TextureQueue::default();
+    queue.written(2, 1, 1, false);
+    queue.written(3, 2, 2, false);
+    queue.written(4, 0, 40, false);
+    assert_eq!(queue.reserve_oldest_due(8).map(|entry| entry.0), Some(2));
+    assert_eq!(queue.reserve_oldest_due(16).map(|entry| entry.0), Some(3));
+    assert_eq!(queue.reserve_oldest_due(24).map(|entry| entry.0), Some(2));
+    assert_eq!(queue.reserve_oldest_due(40).map(|entry| entry.0), Some(4));
 }
