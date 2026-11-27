@@ -922,6 +922,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    lower::amd::begin(c.digest);
     let l = lower::lower(&lower::Parts {
         native,
         p,

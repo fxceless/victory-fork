@@ -6,6 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+pub(super) mod amd;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
