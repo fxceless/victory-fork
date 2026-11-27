@@ -62,10 +62,9 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 }
 
 /// Appends a failure that is not an exception (the host GPU's) to the crash
-/// log, with the title's last debug output, and prints it.
+/// log, with the notes and the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
+    let text = format!("{text}\n{}{}", noted(), title_output());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -106,6 +105,40 @@ fn title_output() -> String {
         return String::new();
     };
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
+}
+
+/// What other parts of the runtime add to what the crash log keeps (the
+/// report of an unhandled exception, a [`log_crash`] failure), a line each:
+/// what the process was doing that the failure does not say (the GPU side
+/// names the pipeline the host driver was compiling).
+static NOTES: std::sync::Mutex<Vec<fn() -> String>> = std::sync::Mutex::new(Vec::new());
+
+/// Adds `note`'s line to everything the crash log keeps (once, however
+/// often it is called). It runs on the reporting thread (for an exception,
+/// the faulting one), so it must not wait for a lock that thread may hold.
+pub fn note_on_crash(note: fn() -> String) {
+    let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if !notes.iter().any(|&n| std::ptr::fn_addr_eq(n, note)) {
+        notes.push(note);
+    }
+}
+
+/// The notes' lines; none if another thread is adding a note right now.
+fn crash_notes() -> Vec<String> {
+    let notes = match NOTES.try_lock() {
+        Ok(notes) => notes,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+    };
+    notes.iter().map(|note| note()).collect()
+}
+
+/// The notes as report lines.
+fn noted() -> String {
+    crash_notes()
+        .iter()
+        .map(|note| format!("  {note}\n"))
+        .collect()
 }
 
 /// Installs the handlers; call once before running title code.
@@ -510,6 +543,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
+        for note in crash_notes() {
+            line(format!("  {note}"));
+        }
         let said = title_output();
         eprint!("{said}");
         text.push_str(&said);
@@ -664,6 +700,34 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    #[test]
+    fn crash_notes_are_added_once_and_said_in_order() {
+        fn first() -> String {
+            "first note".into()
+        }
+        fn second() -> String {
+            "second note".into()
+        }
+        note_on_crash(first);
+        note_on_crash(second);
+        note_on_crash(first);
+        let notes = crash_notes();
+        assert_eq!(
+            notes.iter().filter(|n| *n == "first note").count(),
+            1,
+            "{notes:?}"
+        );
+        let at = |text| notes.iter().position(|n| n == text);
+        assert!(at("first note") < at("second note"), "{notes:?}");
+        // A failure that is not an exception (`log_crash`) keeps them too.
+        let lines = noted();
+        assert!(lines.contains("  first note\n  second note\n"), "{lines}");
+        // A reporting thread holding the list is not made to wait for it.
+        let held = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crash_notes().is_empty());
+        drop(held);
+    }
 
     #[test]
     #[inline(never)]

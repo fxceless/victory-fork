@@ -20,7 +20,12 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
-    victory_gpu::on_failure(host_gpu_failed);
+    {
+        victory_gpu::on_failure(host_gpu_failed);
+        // A crash in the host driver's shader compiler names only the
+        // driver: the crash log also says which pipelines were being made.
+        victory_loader::note_on_crash(victory_gpu::pipeline::crash_note);
+    }
     device::create(adapter, parameters, iid, out)
 }
 

@@ -854,6 +854,14 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// A line for the crash log: the pipeline library calls running, the
+/// reporting thread's marked, so that a crash in the host driver's shader
+/// compiler names the pipeline (`library::crash_note`).
+#[cfg(windows)]
+pub fn crash_note() -> String {
+    library::crash_note()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]

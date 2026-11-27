@@ -279,6 +279,52 @@ impl Drop for Call {
     }
 }
 
+/// Appends `calls` to `text` as the reports list them, the call of thread
+/// `reporting` (if any) marked as that thread's.
+fn list_calls(
+    text: &mut String,
+    calls: &[(u32, &'static str, String, u64)],
+    reporting: Option<u32>,
+) {
+    use std::fmt::Write;
+    let now = crate::host::now_us();
+    if calls.is_empty() {
+        text.push_str("no call running");
+    }
+    for (i, (thread, what, name, since)) in calls.iter().enumerate() {
+        let _ = write!(
+            text,
+            "{}{what} of {name} running for {:.1} ms on thread {thread}{}",
+            if i == 0 { "" } else { ", " },
+            now.saturating_sub(*since) as f64 / 1000.0,
+            if reporting == Some(*thread) {
+                " (the reporting thread)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// For the crash log: the library calls running when the run failed. A
+/// fault inside the host driver's compiler names only the driver's code;
+/// the call on the reporting thread (in the report of an exception, the
+/// faulting thread) names the pipeline it was compiling (its shaders). It
+/// does not wait for [`CALLS`]: the reporting thread may be the one holding
+/// it.
+pub(crate) fn crash_note() -> String {
+    let calls = match CALLS.try_lock() {
+        Ok(calls) => calls,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return "pipeline library: its list of calls is in use".into();
+        }
+    };
+    let mut text = String::from("pipeline library: ");
+    list_calls(&mut text, &calls, Some(crate::host::thread_id()));
+    text
+}
+
 /// For the report when the host device is removed: the library calls
 /// running at that moment, whether this run replaced the mapped file and
 /// let its pages go, and how many pages of the mapping read as zeros now.
@@ -288,21 +334,10 @@ impl Drop for Call {
 /// handed.
 pub(crate) fn removal_note() -> String {
     use std::fmt::Write;
-    let now = crate::host::now_us();
     let mut text = String::from("pipeline library: ");
     {
         let calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
-        if calls.is_empty() {
-            text.push_str("no call running");
-        }
-        for (i, (thread, what, name, since)) in calls.iter().enumerate() {
-            let _ = write!(
-                text,
-                "{}{what} of {name} running for {:.1} ms on thread {thread}",
-                if i == 0 { "" } else { ", " },
-                now.saturating_sub(*since) as f64 / 1000.0
-            );
-        }
+        list_calls(&mut text, &calls, None);
     }
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0 {
@@ -540,6 +575,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _call = call("make", name);
         return create();
     };
     let began = std::time::Instant::now();
@@ -747,6 +783,27 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn a_crash_names_the_pipeline_the_reporting_thread_makes() {
+        label("[compute 0123456789abcdef]".into());
+        let _call = call("make", "crash-note test");
+        let note = crash_note();
+        let listed = "make of crash-note test [compute 0123456789abcdef] running for";
+        assert!(note.contains(listed), "{note}");
+        assert!(note.contains("(the reporting thread)"), "{note}");
+        // Seen from a thread making nothing, the call is listed, not marked.
+        let other = std::thread::spawn(crash_note).join().unwrap();
+        assert!(other.contains(listed), "{other}");
+        assert!(!other.contains("(the reporting thread)"), "{other}");
+        // A reporting thread holding the list is not made to wait for it.
+        let held = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            crash_note(),
+            "pipeline library: its list of calls is in use"
+        );
+        drop(held);
     }
 
     #[test]
