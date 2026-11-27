@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, lane_selector_mask};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -5077,6 +5077,15 @@ impl<'a> Lower<'a> {
         )
     }
 
+    fn guest_lane_selector(&mut self, lane: V) -> V {
+        let mask = lane_selector_mask(self.x.p.wave64);
+        if let Some(index) = self.s.m.int_value(lane) {
+            return self.s.m.i32(index as u32 & mask);
+        }
+        let mask = self.s.m.i32(mask);
+        self.s.m.bin(self.cur, Bin::And, lane, mask)
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -8419,11 +8428,13 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    lane
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.guest_lane_selector(lane)
+                };
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
                     if self.local && self.local_any {
                         // this host wave's lane of that number (lanes 32..63 are 0..31 here)
@@ -8477,6 +8488,7 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
+                let lane = self.guest_lane_selector(lane);
                 let me = self.console_lane();
                 // (the paired form: a wave64 lane select takes the low six bits)
                 let lane = match self.twin {

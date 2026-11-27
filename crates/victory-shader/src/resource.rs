@@ -13,7 +13,7 @@
 //! parameters, by data flow: copies, phis that agree, and additions.
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Fields, NULL, Operand, lane_selector_mask};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
@@ -2264,7 +2264,8 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane, self.p.wave64)?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -2298,7 +2299,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        if lane_of(*at, self.p.wave64).ok_or(())? != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2314,13 +2315,14 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+/// A constant lane selector normalized to the guest wave width.
+fn lane_of(op: Operand, wave64: bool) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
     }
+    .map(|lane| lane & lane_selector_mask(wave64))
 }
 
 /// What dword `k` of a move's result copies.
@@ -2551,6 +2553,40 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn wrapped_lane_selectors_trace_the_last_descriptor_write() {
+        for (write, read) in [(35u32, 3u32), (3, 35)] {
+            let words = [
+                0x7E00_0287u32, // v_mov_b32 v0, 7 (ordinary vector use prevents unspill)
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                (128 + write) << 9 | 10, // v_writelane_b32 v0, s10, write
+                0xD760_0002,
+                (128 + read) << 9 | 0x100, // v_readlane_b32 s2, v0, read
+                0xBE83_0380,               // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ];
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 8).unwrap();
+            assert_eq!(p.blocks[0].insts[3].name(), "v_readlane_b32");
+            let r = track(
+                &p,
+                &[param(Table, 9, 1), param(Table, 10, 1)],
+                HwStage::Cs,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                r.scalar,
+                [((0, 5), at(1, 0x20))],
+                "write {write}, read {read}"
+            );
+        }
     }
 
     #[test]

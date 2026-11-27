@@ -1084,6 +1084,93 @@ mod tests {
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
+    #[test]
+    fn lane_selectors_wrap_at_the_console_wave_width() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+
+        let shader = |wave64, host, selector: u32| {
+            let width = if wave64 { 64 } else { 32 };
+            let lane = (128 + selector) << 9;
+            let words = [
+                0xBE85_0380u32, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                // An ordinary vector move prevents spill replacement and gives both shaders the
+                // same bitcode constant pool before the lane operations.
+                0x7E12_0200 | (128 + width), // v_mov_b32 v9, width
+                // Seed lane 32 in the constant pool even when testing selector 0 on wave64.
+                0xBE86_0380 | if wave64 { 32 } else { 5 }, // s_mov_b32 s6, payload
+                0xD761_0009,
+                lane | 6, // v_writelane_b32 v9, s6, selector
+                0xD760_0007,
+                lane | 0x109, // v_readlane_b32 s7, v9, selector
+                0x7E02_0207,  // v_mov_b32 v1, s7
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 4,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                ],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 5 << 1,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            };
+            let bytes = crate::dxbc::build(&[]);
+            let container = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let was = lower::TEST_HOST_WAVE.replace(Some(host));
+            let result = emit(&container, &native, &p, &st, &io, &res);
+            lower::TEST_HOST_WAVE.set(was);
+            result.unwrap().dxil
+        };
+
+        for (wave64, host, width) in [(false, 32, 32), (true, 64, 64), (true, 32, 64)] {
+            assert!(
+                shader(wave64, host, width) == shader(wave64, host, 0),
+                "guest {width}, host {host}"
+            );
+        }
+        assert!(
+            shader(true, 32, 32) != shader(true, 32, 0),
+            "keep the wave64 upper half on a wave32 host"
+        );
+    }
+
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
     /// output signature has SV_StencilRef, and the feature bit
