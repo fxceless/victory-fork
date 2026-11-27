@@ -1181,8 +1181,12 @@ fn table_stages() -> bool {
 /// it has up to the last entry read by a stage that also reads a constant
 /// view in it (0: no stage does), and up to the last entry any stage reads:
 /// (root parameter, with constants, all).
-fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
-    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+fn stage_spans<'a>(
+    p: &HostPipeline,
+    buf: &'a mut [(u8, u32, u32); 64],
+    overflow: &'a mut Vec<(u8, u32, u32)>,
+) -> &'a [(u8, u32, u32)] {
+    let mut len = 0usize;
     for stage in &p.stages {
         let t = stage.translated();
         let mut constant = [false; 256];
@@ -1192,16 +1196,26 @@ fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
         for u in t.used.iter().filter(|u| u.root == RootType::Table) {
             let n = u.table_offset_dwords / 8 + 1;
             let with = if constant[usize::from(u.slot)] { n } else { 0 };
-            match spans.iter_mut().find(|s| s.0 == u.slot) {
-                Some(s) => {
-                    s.1 = s.1.max(with);
-                    s.2 = s.2.max(n);
-                }
-                None => spans.push((u.slot, with, n)),
+            let slice = if overflow.is_empty() { &mut buf[..len] } else { overflow.as_mut_slice() };
+            if let Some(s) = slice.iter_mut().find(|s| s.0 == u.slot) {
+                s.1 = s.1.max(with);
+                s.2 = s.2.max(n);
+            } else if !overflow.is_empty() {
+                overflow.push((u.slot, with, n));
+            } else if len < 64 {
+                buf[len] = (u.slot, with, n);
+                len += 1;
+            } else {
+                overflow.extend_from_slice(&buf[..len]);
+                overflow.push((u.slot, with, n));
             }
         }
     }
-    spans
+    if overflow.is_empty() {
+        &buf[..len]
+    } else {
+        overflow.as_slice()
+    }
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -1735,12 +1749,18 @@ impl State {
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,
         // slots).
-        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
+        let mut span_buf = [(0u8, 0u32, 0u32); 64];
+        let mut span_overflow = Vec::new();
+        let spans = if table_stages() {
+            stage_spans(p, &mut span_buf, &mut span_overflow)
+        } else {
+            &[][..]
+        };
         let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
