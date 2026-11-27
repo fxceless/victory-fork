@@ -3665,7 +3665,9 @@ impl<'a> Lower<'a> {
 
     /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
     /// with the legacy rule that a zero factor makes the product a +0 rather
-    /// than turning an infinite or NaN factor into a NaN.
+    /// than turning an infinite or NaN factor into a NaN. The fusing is asked
+    /// for, not promised: DXIL `FMad` may run as a multiply and an add, and
+    /// on some hosts does (WARP; an RTX 5060 Laptop on driver 610.62).
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
         let fused = self.fmad(a, b, c);

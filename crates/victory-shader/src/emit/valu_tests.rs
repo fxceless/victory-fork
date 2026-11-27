@@ -1677,12 +1677,19 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
 /// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
 /// flushed subnormal sources and the legacy zero-factor rule.
+///
+/// The fusing is the host's to give: it is lowered to DXIL `FMad`, which a
+/// driver may run fused or as a multiply and an add. NVIDIA's Ada driver
+/// fuses it (fork pull request #961); an RTX 5060 Laptop (Blackwell, driver
+/// 610.62) and WARP round the product first. So the rounding case takes
+/// either answer and names which one it got; the flushing and the
+/// zero-factor cases are exact on every device.
 #[test]
 fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
     let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
     let cases = [
         // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
-        // rounding, lost when the product is rounded before the add.
+        // rounding, lost (+0) when the product is rounded before the add.
         [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
         // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
         [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
@@ -1696,11 +1703,20 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         eprintln!("no SM 6.6 host or WARP device; skipped");
         return;
     }
+    // Case 0 with the product rounded first: 1.0 - 1.0.
+    const ROUNDED_FIRST: u32 = 0x0000_0000;
     run_cases(&mad, &cases, |backend, i, _, got| {
-        if backend == "warp" && i == 0 {
-            // WARP rounds the product before the add; hardware's single
-            // rounding is the reference for the fused form.
-            eprintln!("{backend}: fused rounding differs on WARP; skipped");
+        if i == 0 {
+            match got {
+                g if g == want[0] => eprintln!("{backend}: FMad fused (one rounding)"),
+                ROUNDED_FIRST => {
+                    eprintln!("{backend}: FMad not fused by this host (product rounded first)")
+                }
+                _ => panic!(
+                    "{backend}: case 0 = {got:#010x}, neither fused ({:#010x}) nor rounded first ({ROUNDED_FIRST:#010x})",
+                    want[0]
+                ),
+            }
             return;
         }
         assert_eq!(got, want[i], "{backend}: case {i}");
