@@ -42,9 +42,53 @@ impl<'a> Lower<'a> {
     /// guard on each instruction; else they stay and [`Self::partial_active`]
     /// leaves them out of memory accesses, ballots and reductions.
     pub(super) fn dispatch_threads_prologue(&mut self, order: &[usize]) {
-        let Some(threads) = self.s.threads else {
+        let Some(active) = self.dispatch_threads_active() else {
             return;
         };
+        // The paired form: each thread holds two console lanes, each with its own thread id
+        // and so its own place against the count. They stay, each lane guarded by its own
+        // (`LaneState`), since a thread cannot leave for one of its lanes.
+        let upper = if self.twin.is_some() {
+            self.swap_lanes();
+            let other = self.dispatch_threads_active();
+            self.swap_lanes();
+            other
+        } else {
+            None
+        };
+        let e = self.s.entry;
+        let barrier = self.x.p.blocks.iter().enumerate().any(|(b, blk)| {
+            !self.no_barrier.contains(&b) && blk.insts.iter().any(|i| i.name() == "s_barrier")
+        });
+        // (Not where the translation adds group barriers of its own: two host
+        // waves per console wave, `halves` or `split_lds`. Fork #646 checks the
+        // exchange and `s_barrier` only.)
+        let leave = self.twin.is_none()
+            && self.exchange.is_none()
+            && self.halves.is_none()
+            && !self.split_lds
+            && !barrier
+            && self.x.p.blocks[order[0]].preds.is_empty();
+        if leave {
+            let body = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(e, Term::CondBr(active, body, exit));
+            self.s.m.terminate(exit, Term::Ret);
+            self.body_entry = body;
+            self.block[order[0]] = Some(body);
+            self.cur = body;
+        } else {
+            self.partial_active = Some(active);
+            if let Some(t) = self.twin.as_deref_mut() {
+                t.partial_active = upper;
+            }
+        }
+    }
+
+    /// Whether the lane being lowered lies within the `DispatchX` thread count of each axis
+    /// whose group is wider than one thread (`None`: no such axis).
+    fn dispatch_threads_active(&mut self) -> Option<V> {
+        let threads = self.s.threads?;
         let e = self.s.entry;
         let zero = self.s.m.i32(0);
         let mut active: Option<V> = None;
@@ -70,30 +114,6 @@ impl<'a> Lower<'a> {
                 Some(prev) => self.s.m.bin(e, Bin::And, prev, ok),
             });
         }
-        let Some(active) = active else {
-            return;
-        };
-        let barrier = self.x.p.blocks.iter().enumerate().any(|(b, blk)| {
-            !self.no_barrier.contains(&b) && blk.insts.iter().any(|i| i.name() == "s_barrier")
-        });
-        // (Not where the translation adds group barriers of its own: two host
-        // waves per console wave, `halves` or `split_lds`. Fork #646 checks the
-        // exchange and `s_barrier` only.)
-        let leave = self.exchange.is_none()
-            && self.halves.is_none()
-            && !self.split_lds
-            && !barrier
-            && self.x.p.blocks[order[0]].preds.is_empty();
-        if leave {
-            let body = self.s.m.new_block();
-            let exit = self.s.m.new_block();
-            self.s.m.terminate(e, Term::CondBr(active, body, exit));
-            self.s.m.terminate(exit, Term::Ret);
-            self.body_entry = body;
-            self.block[order[0]] = Some(body);
-            self.cur = body;
-        } else {
-            self.partial_active = Some(active);
-        }
+        active
     }
 }

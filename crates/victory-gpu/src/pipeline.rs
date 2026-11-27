@@ -9,9 +9,11 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: only pipelines from streams of vertex or mesh, pixel and
+//! geometry stages and compute pipelines get host pipelines; tessellation
+//! stages and the plain graphics description keep their containers only.
+//! The title's geometry programs (voxelization) were drawn with in none of
+//! the runs so far: that path has only been run offline. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -67,6 +69,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its range of the loop notes (`crate::loop_notes`), given out on its
+    /// first draw.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) loop_slot: OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +125,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                loop_slot: OnceLock::new(),
             })
         })
         .clone()
@@ -205,7 +213,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let main = programs.into_iter().find(|p| {
         matches!(
             p.stage,
-            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs | HwStage::Gs
         )
     });
     let threads = match main.as_ref().map(|p| &p.io) {

@@ -59,6 +59,8 @@ mod indirect;
 mod inplace;
 mod launch;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod loop_notes;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

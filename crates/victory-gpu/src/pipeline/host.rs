@@ -486,7 +486,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex (or mesh), then pixel stage, then the title's geometry stage;
+    /// or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -522,6 +523,9 @@ struct Recipe {
     root_blob: Vec<u8>,
     ms: Arc<Shader>,
     ps: Option<Arc<Shader>>,
+    /// The mesh and pixel programs linked for this pipeline, where the mesh program's outputs
+    /// pass 32 KiB alone ([`linked`]): made of these, not of `ms` and `ps`.
+    pair: Option<Arc<(victory_shader::emit::HostShader, Option<victory_shader::emit::HostShader>)>>,
     state: MeshState,
     describe: String,
     depth_bounds: bool,
@@ -542,7 +546,22 @@ impl Launch {
                         BytecodeLength: t.host.dxil.len(),
                     })
                 };
-                let (ms, ps) = (code(&r.ms), r.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code));
+                let (ms, ps) = match &r.pair {
+                    Some(pair) => (
+                        D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: pair.0.dxil.as_ptr().cast(),
+                            BytecodeLength: pair.0.dxil.len(),
+                        },
+                        match &pair.1 {
+                            Some(ps) => D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: ps.dxil.as_ptr().cast(),
+                                BytecodeLength: ps.dxil.len(),
+                            },
+                            None => r.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code),
+                        },
+                    ),
+                    None => (code(&r.ms), r.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code)),
+                };
                 let name = super::library::name(
                     "mesh payload",
                     &r.root_blob,
@@ -612,8 +631,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// A host pipeline for vertex (or mesh), pixel and geometry shaders with
+    /// the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
@@ -626,14 +645,18 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry");
+        if mesh.is_some() && geometry.is_some() {
+            return refuse("a mesh pipeline with a geometry stage", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -644,6 +667,11 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            // The title's geometry program, last (the pixel stage stays the second where
+            // there is one). It runs between its vertex program, the container's VS program
+            // (the other compilation of the ES half it was made with), and the pixel program
+            // (`victory_shader::geometry`).
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -706,9 +734,10 @@ impl HostPipeline {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
                     // Ours, not the title's, stay root descriptors: the
                     // table of strides, the directory of title memory by
-                    // address and its fault notes.
+                    // address and its fault notes, the loop notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_LOOPS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -870,7 +899,23 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            // A mesh program whose outputs pass D3D12's 32 KiB is linked with this pixel
+            // program, or made without the outputs no pixel program reads when there is none
+            // ([`linked`]): the pipeline gets the programs made for each other, which bind as
+            // the shared translations do.
+            let pair = linked(ms, stages.get(1).map(|(ps, _)| *ps));
+            let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            };
+            let (ms_code, ps_code) = match &pair {
+                Some(pair) => (
+                    bytecode(&pair.0.dxil),
+                    pair.1.as_ref().map_or(code(1), |ps| bytecode(&ps.dxil)),
+                ),
+                None => (code(0), code(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -884,13 +929,13 @@ impl HostPipeline {
                     super::library::name(
                         "mesh launched",
                         &root_blob,
-                        &[&code_bytes(&code(0)), &code_bytes(&code(1)), crate::launch::bytes()],
+                        &[&code_bytes(&ms_code), &code_bytes(&ps_code), crate::launch::bytes()],
                         &state,
                     )
                 } else {
-                    super::library::name("mesh payload", &root_blob, &[&code_bytes(&code(0)), &code_bytes(&code(1))], &state)
+                    super::library::name("mesh payload", &root_blob, &[&code_bytes(&ms_code), &code_bytes(&ps_code)], &state)
                 };
-                mesh_pipeline(&host.device, &root, amplification, code(0), code(1), &mesh_state, depth_bounds, &name)
+                mesh_pipeline(&host.device, &root, amplification, ms_code, ps_code, &mesh_state, depth_bounds, &name)
             };
             let refused = |e: windows::core::Error| {
                 tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -904,6 +949,7 @@ impl HostPipeline {
                             root_blob: root_blob.clone(),
                             ms: stages[0].0.clone(),
                             ps: stages.get(1).map(|(s, _)| (*s).clone()),
+                            pair: pair.clone(),
                             state: mesh_state,
                             describe: state.clone(),
                             depth_bounds,
@@ -948,13 +994,18 @@ impl HostPipeline {
             });
         }
 
+        // The pixel stage and the title's geometry stage by what they are (without a pixel
+        // stage, the geometry stage is the second).
+        let at = |stage: &str| stages.iter().position(|(s, _)| s.stage == stage);
+        let pixel = at("pixel").map_or(D3D12_SHADER_BYTECODE::default(), &code);
+        let title_gs = at("geometry").map(&code);
         // A pipeline the title makes for rectangles gets a geometry stage
         // that completes each one from the three vertices the vertex
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
+        if g.topology.0 == RECTANGLES && title_gs.is_none() {
+            let ps = at("pixel").and_then(|i| stages[i].0.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
@@ -965,12 +1016,14 @@ impl HostPipeline {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
+            PS: pixel,
+            GS: title_gs.unwrap_or_else(|| {
+                rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: gs.as_ptr().cast(),
+                        BytecodeLength: gs.len(),
+                    }
+                })
             }),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
@@ -993,19 +1046,25 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        // A pipeline with the geometry stage has a name of its own in the
-        // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
-                "graphics rectangles",
+        // A pipeline with the rectangle stage, or the title's geometry stage, has a name of
+        // its own in the library; the others keep theirs.
+        let name = |gs: Option<&Vec<u8>>| match (title_gs, gs) {
+            (Some(title), _) => super::library::name(
+                "graphics geometry",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[&code_bytes(&code(0)), &code_bytes(&pixel), &code_bytes(&title)],
                 &state,
             ),
-            None => super::library::name(
+            (None, Some(gs)) => super::library::name(
+                "graphics rectangles",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&pixel), &gs[..]],
+                &state,
+            ),
+            (None, None) => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&pixel)],
                 &state,
             ),
         };
@@ -1178,6 +1237,69 @@ fn graphics_depth_bounds_pipeline(
         };
         stream_pipeline(device, &mut stream, name)
     }
+}
+
+/// A mesh program and its pixel program (if the pipeline has one) translated for each other.
+type LinkedMesh = (victory_shader::emit::HostShader, Option<victory_shader::emit::HostShader>);
+
+/// The mesh program `ms` and the pixel program `ps` translated for one pipeline
+/// ([`victory_shader::emit::link_mesh`]), when `ms`'s outputs pass D3D12's 32 KiB as it is
+/// translated alone: 71 of the title's mesh programs (pedestrian, vehicle and prop transforms
+/// with fire, spatter, decal and transmission variants) declare 65 to 71 output components
+/// for 128 vertices, which the validator refuses; NVIDIA's driver built them anyway. Linked,
+/// the mesh program writes only the outputs `ps` reads and `ps` declares only the inputs it
+/// reads. Without a pixel program (`ps` `None`: depth only) the mesh program is made with its
+/// system values alone ([`victory_shader::emit::link_mesh_alone`]). Made once per pair (both
+/// programs translated again, not kept on disk: the pipeline library keeps the pipeline);
+/// `None` when `ms` fits, or the pair does not link (then the pipeline is made of the shared
+/// translations, as before). `VICTORY_MESH_LINK=0` turns it off.
+fn linked(ms: &Arc<Shader>, ps: Option<&Arc<Shader>>) -> Option<Arc<LinkedMesh>> {
+    static PAIRS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), Option<Arc<LinkedMesh>>>>> =
+        std::sync::Mutex::new(None);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LINK").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let tm = ms.translated()?;
+    let tp = match ps {
+        Some(ps) => Some(ps.translated()?),
+        None => None,
+    };
+    // (most mesh programs fit: nothing more to do for them)
+    if victory_shader::emit::mesh_fits(&tm.host.dxil).unwrap_or(true) {
+        return None;
+    }
+    let key = (ms.hash.clone(), ps.map_or_else(String::new, |ps| ps.hash.clone()));
+    if let Some(pair) = PAIRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&key) {
+        return pair.clone();
+    }
+    let shaders: Vec<&Arc<Shader>> = std::iter::once(ms).chain(ps).collect();
+    // (translated outside the lock: two workers on one pair translate it twice at worst)
+    let made = match (ps, tp) {
+        (Some(ps), Some(tp)) => victory_shader::emit::link_mesh(&ms.container, &tm.host, &ps.container, &tp.host)
+            .map(|pair| pair.map(|(lm, lp)| (lm, Some(lp)))),
+        _ => victory_shader::emit::link_mesh_alone(&ms.container, &tm.host).map(|lm| lm.map(|lm| (lm, None))),
+    };
+    let pair = match made {
+        Ok(Some(pair)) => {
+            tracing::info!(?shaders, "mesh outputs over 32 KiB: the pair is linked for its pipeline");
+            Some(Arc::new(pair))
+        }
+        Ok(None) => {
+            tracing::warn!(?shaders, "mesh outputs over 32 KiB, and the pair does not link");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(?shaders, error = %e, "mesh outputs over 32 KiB, and the pair does not translate linked");
+            None
+        }
+    };
+    PAIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key, pair.clone());
+    pair
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
