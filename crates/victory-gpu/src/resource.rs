@@ -672,6 +672,16 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Subresource index 0, for a copy location of type 0 (which reads
+    /// only the first four bytes).
+    pub(crate) const ZERO: PlacedFootprint =
+        PlacedFootprint { offset: 0, format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
+
+    /// Rows of one 2D subresource at the start of a buffer.
+    pub(crate) const fn rows(format: u32, width: u32, height: u32, row_pitch: u32) -> Self {
+        PlacedFootprint { offset: 0, format, width, height, depth: 1, row_pitch }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -2326,6 +2336,13 @@ impl OnDemand {
             crate::descriptor::host::levels_changed(memory);
         }
     }
+}
+
+/// A texture's width, height and console format, for code outside this
+/// crate (the AMD upscaler stand-in in `victory-hle`); `None` for buffers
+/// and null.
+pub fn texture_shape(this: *const crate::object::Object) -> Option<(u64, u32, u32)> {
+    texture_memory(this).map(|(_, d)| (d.width, d.height, d.format))
 }
 
 /// A texture's console memory and description; `None` for buffers.

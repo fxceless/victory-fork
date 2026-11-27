@@ -850,7 +850,7 @@ extern "system" fn copy_buffer_region(
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
-    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
+    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src) && !STAND_IN_COPY.get();
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -944,6 +944,354 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// A texture copy recorded into one of our lists for code outside this
+/// crate (the AMD upscaler stand-in in `victory-hle`), as the title's own
+/// `CopyTextureRegion` would record it: the top-left `width` x `height`
+/// texels of subresource 0 of `src` to the top left of subresource 0 of
+/// `dst`. Only if both host copies have one format (a target the host
+/// cannot render to stands in another format; the copy is between host
+/// copies, so that is what must agree); `false` if not recorded.
+pub fn copy_texture_top_left(list: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let (Some(to), Some(from)) = (crate::resource::host_resource(dst), crate::resource::host_resource(src)) else {
+            return false;
+        };
+        // SAFETY: live resources; plain queries.
+        if unsafe { to.GetDesc().Format != from.GetDesc().Format } {
+            return false;
+        }
+    }
+    let at = |resource: This| CopyLocation {
+        resource,
+        kind: 0,
+        footprint: crate::resource::PlacedFootprint::ZERO,
+    };
+    let (to, from) = (at(dst), at(src));
+    let source_box: [u32; 6] = [0, 0, 0, width, height, 1];
+    STAND_IN_COPY.set(true);
+    copy_texture_region(list, &raw const to, 0, 0, 0, &raw const from, &raw const source_box);
+    STAND_IN_COPY.set(false);
+    true
+}
+
+thread_local! {
+    /// [`copy_texture_top_left`] is recording: [`unlike`] lets a stand-in
+    /// target and a title-format texture be copied (their host copies were
+    /// checked to share a format).
+    static STAND_IN_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For code outside this crate (the AMD upscaler stand-in in
+/// `victory-hle`): the top-left `width` x `height` texels of subresource 0
+/// of `src` stretched over all of subresource 0 of `dst`, filtered
+/// (bilinear), recorded into one of our lists. The texels go through two
+/// buffers of ours (the pass reads and writes buffers, bound as root
+/// views, so the title's descriptor heaps stay as they are); the title's
+/// pipeline and root signature are set again by its next draw or
+/// dispatch. Reads RGBA half floats and writes either RGBA half floats or
+/// native RGB9E5, according to the host destination. Returns false when
+/// the pass could not be recorded.
+pub fn stretch_texture(list: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> bool {
+    #[cfg(windows)]
+    {
+        stretch::record(list, dst, src, width, height).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (list, dst, src, width, height);
+        false
+    }
+}
+
+#[cfg(windows)]
+mod stretch {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    use super::{CopyLocation, List, This, ensure_state, host_list};
+    use crate::object::Object;
+
+    /// `R16G16B16A16_FLOAT`.
+    const HALF4: u32 = 10;
+    const RGB9E5: u32 = 67;
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+
+    const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), UAV(u0)"
+cbuffer Sizes : register(b0) { uint sw; uint sh; uint sp; uint dw; uint dh; uint dp; uint packed; };
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+float4 texel(uint x, uint y) {
+    uint2 v = src.Load2((y * sp + x) * 8);
+    return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+}
+// Shared-exponent packing from the PC FidelityFX path (fxceless/victory-fork#86).
+// RGB9E5 stores three unsigned 9-bit mantissas and one shared 5-bit exponent.
+uint pack_rgb9e5(float3 rgb) {
+    rgb = clamp(rgb, 0.0, 65408.0);
+    float largest = max(rgb.r, max(rgb.g, rgb.b));
+    uint exponent = ((asuint(max(largest, exp2(-16.0))) >> 23) & 255u) - 111u;
+    float scale = exp2(24.0 - float(exponent));
+    if (floor(largest * scale + 0.5) >= 512.0) {
+        exponent++;
+        scale *= 0.5;
+    }
+    uint3 mantissa = uint3(floor(rgb * scale + 0.5));
+    return mantissa.r | (mantissa.g << 9) | (mantissa.b << 18) | (exponent << 27);
+}
+
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= dw || id.y >= dh) return;
+    float fx = clamp((id.x + 0.5) * sw / dw - 0.5, 0.0, sw - 1.0);
+    float fy = clamp((id.y + 0.5) * sh / dh - 0.5, 0.0, sh - 1.0);
+    uint x0 = (uint)fx;
+    uint y0 = (uint)fy;
+    uint x1 = min(x0 + 1, sw - 1);
+    uint y1 = min(y0 + 1, sh - 1);
+    float ax = fx - x0;
+    float ay = fy - y0;
+    float4 c = lerp(lerp(texel(x0, y0), texel(x1, y0), ax), lerp(texel(x0, y1), texel(x1, y1), ax), ay);
+    uint pixel = id.y * dp + id.x;
+    if (packed != 0)
+        dst.Store(pixel * 4, pack_rgb9e5(c.rgb));
+    else
+        dst.Store2(pixel * 8, uint2(f32tof16(c.x) | (f32tof16(c.y) << 16), f32tof16(c.z) | (f32tof16(c.w) << 16)));
+}
+"#;
+
+    /// The pass, made once.
+    struct Pass {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Pass {}
+    // SAFETY: as above.
+    unsafe impl Sync for Pass {}
+
+    impl Pass {
+        fn dispatch(&self, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource, sizes: [u32; 7]) {
+            let [_, _, _, width, height, _, _] = sizes;
+            // SAFETY: an open list, our pass, and live buffers in SRV and UAV states respectively.
+            unsafe {
+                list.SetComputeRootSignature(&self.root);
+                list.SetPipelineState(&self.pso);
+                list.SetComputeRoot32BitConstants(0, sizes.len() as u32, sizes.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
+                list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+        }
+    }
+
+    /// The two buffers, kept while the sizes stay the same.
+    struct Buffers {
+        sizes: (u64, u64),
+        from: ID3D12Resource,
+        to: ID3D12Resource,
+    }
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Buffers {}
+
+    fn pass() -> Option<&'static Pass> {
+        static PASS: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
+        PASS.get_or_init(|| match make() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "the upscaler stand-in's stretch could not be made");
+                None
+            }
+        })
+        .as_ref()
+    }
+
+    fn make() -> windows::core::Result<Pass> {
+        let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; the out
+        // pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                windows::core::s!("upscaler stand-in stretch"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )?;
+        }
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: the blob's own bytes; the root signature is inside the
+        // shader.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes)?;
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(Pass { root, pso })
+        }
+    }
+
+    /// The buffers for `sizes` bytes, made again when the sizes change.
+    fn buffers(sizes: (u64, u64)) -> Option<(ID3D12Resource, ID3D12Resource)> {
+        static KEPT: std::sync::Mutex<Option<Buffers>> = std::sync::Mutex::new(None);
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.as_ref().is_none_or(|b| b.sizes != sizes) {
+            let host = crate::host::host()?;
+            *kept = Some(Buffers {
+                sizes,
+                from: host.uav_buffer(sizes.0)?,
+                to: host.uav_buffer(sizes.1)?,
+            });
+        }
+        kept.as_ref().map(|b| (b.from.clone(), b.to.clone()))
+    }
+
+    fn barrier(list: &ID3D12GraphicsCommandList, resource: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+        let b = crate::host::transition(resource, before, after);
+        // SAFETY: an open list and a live resource.
+        unsafe { list.ResourceBarrier(&[b]) };
+    }
+
+    pub(super) fn record(this: *const Object, dst: *const Object, src: *const Object, width: u32, height: u32) -> Option<()> {
+        let list = host_list(this)?;
+        let pass = pass()?;
+        let to = crate::resource::host_resource(dst)?;
+        let from = crate::resource::host_resource(src)?;
+        // SAFETY: live resources; plain queries.
+        let (td, fd) = unsafe { (to.GetDesc(), from.GetDesc()) };
+        let out_format = td.Format.0 as u32;
+        let out_bytes = match out_format {
+            HALF4 => 8,
+            RGB9E5 => 4,
+            _ => return None,
+        };
+        if fd.Format.0 as u32 != HALF4 {
+            return None;
+        }
+        let (sw, sh) = (width.min(fd.Width as u32), height.min(fd.Height));
+        let (dw, dh) = (td.Width as u32, td.Height);
+        if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+            return None;
+        }
+        // Rows pitched as copies to and from buffers need (256 bytes).
+        let pitch = |w: u32, bytes: u32| (w * bytes).div_ceil(256) * 256;
+        let (sp, dp) = (pitch(sw, 8), pitch(dw, out_bytes));
+        let (a, b) = buffers((u64::from(sp) * u64::from(sh), u64::from(dp) * u64::from(dh)))?;
+        list.keep(&a);
+        list.keep(&b);
+        let l = &list.list;
+        let raw = |r: &ID3D12Resource| -> This { r.as_raw().cast_const().cast() };
+
+        // The source: what the title wrote itself, first; then to the
+        // first buffer.
+        list.twin_use(src, false, false);
+        if crate::texture::title_written(from) {
+            crate::texture::upload(list, src, from);
+        }
+        ensure_state(list, src, COPY_SOURCE);
+        barrier(l, &a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        let texels = CopyLocation { resource: raw(from), kind: 0, footprint: crate::resource::PlacedFootprint::ZERO };
+        let rows = CopyLocation {
+            resource: raw(&a),
+            kind: 1,
+            footprint: crate::resource::PlacedFootprint::rows(HALF4, sw, sh, sp),
+        };
+        let source_box = D3D12_BOX { left: 0, top: 0, front: 0, right: sw, bottom: sh, back: 1 };
+        // SAFETY: an open list; both locations in the host's layout, naming
+        // live resources the list keeps.
+        unsafe { list.list.CopyTextureRegion((&raw const rows).cast(), 0, 0, 0, (&raw const texels).cast(), Some(&raw const source_box)) };
+
+        // The stretch, buffer to buffer.
+        barrier(l, &a, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(l, &b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        pass.dispatch(l, &a, &b, [sw, sh, sp / 8, dw, dh, dp / out_bytes, u32::from(out_format == RGB9E5)]);
+        list.keep(&pass.root);
+        list.keep(&pass.pso);
+        // The title's pipeline and root signature again at its next draw
+        // or dispatch.
+        // SAFETY: the title passes one of our lists.
+        unsafe { (*this.cast::<List>()).state.lock().unwrap_or_else(|e| e.into_inner()).forget_host_bindings() };
+
+        // The second buffer to the destination.
+        barrier(l, &a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        barrier(l, &b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list.twin_use(dst, false, true);
+        crate::texture::card_writes(list, dst, to, Some(0));
+        crate::texture::host_written(dst);
+        ensure_state(list, dst, COPY_DEST);
+        let out = CopyLocation { resource: raw(to), kind: 0, footprint: crate::resource::PlacedFootprint::ZERO };
+        let stretched = CopyLocation {
+            resource: raw(&b),
+            kind: 1,
+            footprint: crate::resource::PlacedFootprint::rows(out_format, dw, dh, dp),
+        };
+        // SAFETY: as for the first copy.
+        unsafe { list.list.CopyTextureRegion((&raw const out).cast(), 0, 0, 0, (&raw const stretched).cast(), None) };
+        barrier(l, &b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Some(())
+    }
+    #[test]
+    fn stretch_writes_pitched_half_and_rgb9e5_rows() {
+        let host = crate::host::host().expect("D3D12 test host");
+        let pass = pass().expect("stretch shader and pipeline");
+        let (src, mapped) = host.upload_buffer(512).unwrap();
+        // Two rows of two RGBA16F pixels. Adjacent rows ramp in opposite directions.
+        let black = [0u16, 0, 0, 0x3c00];
+        let color = [0x3c00u16, 0x3800, 0x3400, 0x3c00];
+        let quarter = [0x3400u16, 0x3000, 0x2c00, 0x3c00];
+        let three_quarters = [0x3a00u16, 0x3600, 0x3200, 0x3c00];
+        // SAFETY: the upload is mapped for 512 bytes, with a 256-byte row pitch.
+        unsafe {
+            for (offset, pixel) in [(0, black), (8, color), (256, color), (264, black)] {
+                mapped.add(offset).cast::<[u16; 4]>().write(pixel);
+            }
+        }
+        for packed in [false, true] {
+            let pixel_bytes = if packed { 4 } else { 8 };
+            let row_bytes = 4 * pixel_bytes;
+            let dst = host.uav_buffer(512).unwrap();
+            let back = host.read_back_buffer(512).unwrap();
+            let list = host.new_list().unwrap();
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            pass.dispatch(&list.list, &src, &dst, [2, 2, 32, 4, 2, 256 / pixel_bytes as u32, u32::from(packed)]);
+            barrier(&list.list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            // SAFETY: both buffers are 512 bytes and in copy-compatible states.
+            unsafe { list.list.CopyBufferRegion(&back, 0, &dst, 0, 512) };
+            let mut actual = vec![0xcc; 2 * row_bytes];
+            list.defer_read_back(back, actual.as_mut_ptr(), [row_bytes, 2, row_bytes]);
+            list.close();
+            host.execute(&[&list]);
+            let expected: Vec<u8> = if packed {
+                // Quarter intensity has exponent 14, three quarters has 15 and full intensity has 16.
+                [0, 0x71010100, 0x79818180, 0x81010100, 0x81010100, 0x79818180, 0x71010100, 0u32]
+                    .into_iter().flat_map(u32::to_le_bytes).collect()
+            } else {
+                [black, quarter, three_quarters, color, color, three_quarters, quarter, black].into_iter().flatten().flat_map(u16::to_le_bytes).collect()
+            };
+            assert_eq!(actual, expected, "packed={packed}");
+        }
+    }
+
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
