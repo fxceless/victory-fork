@@ -127,8 +127,39 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
+    /// Microseconds of the `watch::writes` askings whose kernel call failed
+    /// and fell to the guards: the failed call, the look at what the
+    /// memory is, the guards' walk.
+    WatchFailedUs,
+    /// Microseconds of the askings answered by the guards with no kernel
+    /// call (`WatchKnownView`).
+    WatchKnownUs,
+    /// Refreshes of a watched host copy's range (`Shadow::update_free`)
+    /// that copied nothing, and their microseconds (the asking included).
+    RefreshNone,
+    RefreshNoneUs,
+    /// The ones that copied something, and their microseconds.
+    RefreshSome,
+    RefreshSomeUs,
+    /// With `VICTORY_REFRESH_COUNT=1`: of the refreshes that copied
+    /// nothing, those known unchanged before asking
+    /// (`crate::watch::unchanged_known`), and their microseconds: what a
+    /// skip of them would take off at most.
+    RefreshKnown,
+    RefreshKnownUs,
+    /// Refreshes skipped as known unchanged (`VICTORY_REGION_SKIP`).
+    RefreshSkipped,
 }
-const COUNTERS: usize = 80;
+/// One slot per counter: follows the enum (a fixed 80 was outrun by the
+/// refresh counters and ended run 324 with an index past the end).
+const COUNTERS: usize = C::RefreshSkipped as usize + 1;
+const _: () = assert!(COUNTERS <= 256, "the counters' array stays small");
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -401,6 +432,21 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    /// Every counter has a slot: the last one too (run 324 ended with an
+    /// index past the end of a fixed-size array).
+    #[test]
+    fn the_last_counter_has_a_slot() {
+        use super::{C, COUNT, add};
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = COUNT[C::RefreshSkipped as usize].load(Relaxed);
+        add(C::RefreshSkipped, 1);
+        add(C::RefreshKnownUs, 0);
+        assert!(COUNT[C::RefreshSkipped as usize].load(Relaxed) > before);
     }
 }
 
@@ -690,6 +736,11 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
+    // Everything the system says of the two memory groups, beside the
+    // budget and use the lines below print.
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -737,6 +788,33 @@ fn log_memory() {
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+    );
+    // Upstream VIctory #3198: textures the card had no room for are asked
+    // for again instead of staying without a host copy for the run.
+    let no_room = crate::resource::NOT_MADE_FOR_NOW.load(Relaxed);
+    if no_room > 0 {
+        tracing::info!(
+            "host textures the card had no room for when asked: {} times since the start, {} of them \
+             made on a later use",
+            no_room,
+            crate::resource::MADE_AFTER_NO_ROOM.load(Relaxed),
+        );
+    }
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
     );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
@@ -957,6 +1035,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -970,6 +1051,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1116,6 +1203,13 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    crate::draw::tables_line(frames);
+    let [together, written, mapped] =
+        [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
+         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.
@@ -1237,6 +1331,32 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0} ({:.2} ms in all with their guard walks); \
+         not made because the range is known guarded view memory: {:.0} ({:.2} ms in all) (VICTORY_VIEW_ASK=1 asks \
+         the kernel anyway; VICTORY_VIEW_KNOWN=1 keeps written view blocks known); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
+        c[C::WatchFailed as usize],
+        c[C::WatchFailedUs as usize] / 1e3,
+        c[C::WatchKnownView as usize],
+        c[C::WatchKnownUs as usize] / 1e3,
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
+    tracing::info!(
+        "  refreshes of watched host copies per frame: {:.0} copied nothing ({:.2} ms), {:.0} copied something \
+         ({:.2} ms); of those that copied nothing, {:.0} were known unchanged before asking ({:.2} ms; \
+         VICTORY_REFRESH_COUNT=1 looks: every block of the range read-only by our hand and clean, or the range \
+         asked ahead, and no page noted written since the copy took it); skipped as known unchanged \
+         (VICTORY_REGION_SKIP): {:.0}",
+        c[C::RefreshNone as usize],
+        c[C::RefreshNoneUs as usize] / 1e3,
+        c[C::RefreshSome as usize],
+        c[C::RefreshSomeUs as usize] / 1e3,
+        c[C::RefreshKnown as usize],
+        c[C::RefreshKnownUs as usize] / 1e3,
+        c[C::RefreshSkipped as usize],
+    );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
