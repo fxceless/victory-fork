@@ -1,9 +1,10 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -140,14 +141,40 @@ impl Tally {
     }
 }
 
-/// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+struct PairInput {
+    pattern: String,
+    shader: Option<Arc<emit::HostShader>>,
+}
+
+impl PairInput {
+    fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.trim().to_owned(),
+            shader: None,
+        }
+    }
+}
+
+/// Keep the first compatible emission for each requested input. Several pairs
+/// can use the same shader without duplicating its bytecode.
+fn keep_pair_shader(pairs: &mut [(PairInput, PairInput)], label: &str, shader: &emit::HostShader) {
+    let copy = LazyCell::new(|| Arc::new(shader.clone()));
+    for (vertex, pixel) in pairs {
+        let input = match shader.stage {
+            HwStage::Vs | HwStage::Ms => vertex,
+            HwStage::Ps => pixel,
+            _ => return,
+        };
+        if input.shader.is_none() && label.contains(&input.pattern) {
+            input.shader = Some(Arc::clone(&copy));
+        }
+    }
+}
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
-    /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
-    /// kept to build those pipelines after the walk.
-    keep: Option<Kept>,
+struct Checks<'a> {
+    /// Requested `VICTORY_PAIRS` inputs (`vs+ps,ms+ps,...` label substrings).
+    pairs: Option<&'a Mutex<Vec<(PairInput, PairInput)>>>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
 }
@@ -258,13 +285,13 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
+    let pairs: Vec<_> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .map(|(v, p)| (PairInput::new(v), PairInput::new(p)))
         .collect();
-    let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let pairs = (!pairs.is_empty()).then(|| Mutex::new(pairs));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -290,7 +317,7 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            pairs: pairs.as_ref(),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
@@ -356,13 +383,11 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
-    if !pairs.is_empty() {
+    if let Some(pairs) = pairs {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+        for (v, p) in lock(&pairs).iter() {
+            let made = match (&v.shader, &p.shader) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -371,7 +396,7 @@ pub fn run(
                 .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
-            println!("pair {v} + {p}: {made}");
+            println!("pair {} + {}: {made}", v.pattern, p.pattern);
         }
     }
     let mut lines = t.lines;
@@ -392,7 +417,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -494,7 +519,13 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks<'_>,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -632,11 +663,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
+    if let Some(pairs) = checks.pairs {
+        let label = label();
+        keep_pair_shader(&mut lock(pairs), &label, &shader);
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
@@ -883,4 +915,50 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_label_selects_compatible_pipeline_stages() {
+        for stage in [HwStage::Vs, HwStage::Ms] {
+            let mut pairs = [(PairInput::new("lighting"), PairInput::new("lighting"))];
+            let mut shader = host::stub_ps();
+            shader.stage = HwStage::Cs;
+            keep_pair_shader(&mut pairs, "lighting Cs", &shader);
+            assert!(pairs[0].0.shader.is_none() && pairs[0].1.shader.is_none());
+
+            shader.stage = HwStage::Ps;
+            keep_pair_shader(&mut pairs, "lighting Ps", &shader);
+            assert!(pairs[0].0.shader.is_none());
+            shader.stage = stage;
+            keep_pair_shader(&mut pairs, "unrelated", &shader);
+            assert!(pairs[0].0.shader.is_none());
+            keep_pair_shader(&mut pairs, "lighting", &shader);
+
+            let (vertex, pixel) = &pairs[0];
+            assert_eq!(vertex.shader.as_ref().unwrap().stage, stage);
+            assert_eq!(pixel.shader.as_ref().unwrap().stage, HwStage::Ps);
+        }
+    }
+
+    #[test]
+    fn overlapping_pairs_share_the_first_matching_shader() {
+        let mut pairs = [
+            (PairInput::new("sky"), PairInput::new("lighting")),
+            (PairInput::new("fog"), PairInput::new("Ps")),
+        ];
+        let mut shader = host::stub_ps();
+        keep_pair_shader(&mut pairs, "lighting Ps", &shader);
+        let first = pairs[0].1.shader.clone().unwrap();
+        shader.dxil.clear();
+        keep_pair_shader(&mut pairs, "lighting Ps", &shader);
+
+        for (vertex, pixel) in &pairs {
+            assert!(vertex.shader.is_none());
+            assert!(Arc::ptr_eq(pixel.shader.as_ref().unwrap(), &first));
+        }
+    }
 }
