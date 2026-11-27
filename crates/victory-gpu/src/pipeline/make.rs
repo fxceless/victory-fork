@@ -466,6 +466,12 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // The translator lowers large shaders with recursion, and the
+                // world's mesh programs overflow the default 2 MiB. A dead
+                // worker means the pipeline the title waits for never
+                // appears. 512 MiB covers it on the host that measured this;
+                // the few programs with unbounded recursion still overflow.
+                .stack_size(512 << 20)
                 .spawn(|| {
                     loop {
                         next().make();
