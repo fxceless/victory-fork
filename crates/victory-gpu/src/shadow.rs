@@ -4717,18 +4717,20 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
+        let mut skip = Vec::new();
+        {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(patch.ranges.iter().copied())
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
-        };
+            skip.extend(
+                dirty
+                    .iter()
+                    .copied()
+                    .chain(patch.ranges.iter().copied())
+                    .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+                    .filter(|&(a, b)| a < at + n && b > at),
+            );
+        }
         title.clear();
         title.resize(n, 0);
         // Who touched the page since its last store is looked at before our
@@ -4741,13 +4743,18 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
+        let changed = if skip.is_empty() {
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
+            merge_piece(gpu, held, &mut title[..])
+        } else {
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, skip) {
+                let (a, b) = (a - at, b - at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            changed
+        };
         if !mapped || !changed {
             return 0;
         }
