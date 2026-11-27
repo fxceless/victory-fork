@@ -972,6 +972,37 @@ pub(crate) enum Into<'a> {
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// CPU time summed across ordinary indexed-texture passes and worker threads.
+static TEXTURE_CPU_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn texture_cpu_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CPU_PROFILE").is_some_and(|v| v == "1"))
+}
+
+struct TextureCpuTimer {
+    phase: usize,
+    since: std::time::Instant,
+}
+impl TextureCpuTimer {
+    fn next(&mut self) {
+        let now = std::time::Instant::now();
+        TEXTURE_CPU_US[self.phase].fetch_add(now.duration_since(self.since).as_micros() as u64, Ordering::Relaxed);
+        self.phase += 1;
+        self.since = now;
+    }
+}
+impl Drop for TextureCpuTimer {
+    fn drop(&mut self) {
+        TEXTURE_CPU_US[self.phase].fetch_add(self.since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+pub(crate) fn texture_cpu_line(frames: f64) {
+    if !texture_cpu_profile() { return; }
+    let [upkeep, selection, slots] = TEXTURE_CPU_US.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    tracing::info!("indexed texture CPU phases per frame, all threads: {upkeep:.2} ms queue upkeep, {selection:.2} ms due selection and accounting, {slots:.2} ms slot processing");
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -2858,6 +2889,9 @@ impl State {
         // did or will do.
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
+        let mut cpu_profile = (!only && texture_cpu_profile()).then(|| TextureCpuTimer {
+            phase: 0, since: std::time::Instant::now(),
+        });
         // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
         // as if the card had room, within its own bytes.
         let forced = only && bake_sources_mode().0 == BakeMode::Full;
@@ -2895,6 +2929,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             host.texture_slots_blank(frame);
         }
+        if let Some(timer) = &mut cpu_profile { timer.next(); }
         let due = match &sources {
             // The bake draw's own, due or not, held or not.
             Some(slots) => host.texture_slots_queued(slots),
@@ -2914,6 +2949,7 @@ impl State {
                 due
             }
         };
+        if let Some(timer) = &mut cpu_profile { timer.next(); }
         // What a run for a bake draw's own may upload.
         let sourced_at_most = bake_sources_mode().1;
         let mut sourced_bytes = 0u64;

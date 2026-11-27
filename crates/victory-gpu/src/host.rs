@@ -10830,6 +10830,7 @@ impl Meter {
                 slots as f64 / frames
             );
         }
+        crate::draw::texture_cpu_line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
