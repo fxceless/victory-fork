@@ -5435,6 +5435,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn water_readback_preserves_the_final_texture_state() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+        use windows::core::IUnknown;
+
+        const CHILD: &str = "VICTORY_TEST_TEXTURE_BACK_STATE";
+        if std::env::var_os(CHILD).is_none() {
+            // The kind selector is fixed on first use in each process.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .env("VICTORY_TEXTURE_BACK", "8x8f41")
+                .env("VICTORY_D3D12_WARP", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut image = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::from_ref(&ID3D12Resource::IID).cast(),
+                &mut image,
+            ),
+            crate::object::S_OK
+        );
+        // SAFETY: create_committed returned an owned title COM reference.
+        let _owner = unsafe { IUnknown::from_raw(image.cast_mut().cast()) };
+        let copy = crate::resource::host_copy(image).unwrap();
+        let (_, first, _) = crate::resource::title_texture(image).unwrap();
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        for (last, value) in [(srv, 1.0f32), (uav, 2.0), (srv | source, 3.0), (source, 4.0)] {
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, image, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let rtv = host.rtv(Some(&copy.texture), None);
+            // SAFETY: the list is open and the view names this render target.
+            unsafe { list.list.ClearRenderTargetView(rtv, &[value; 4], None) };
+            readable(
+                &list,
+                ResourceType::Uav,
+                &View::Unordered(image as usize, 0, None),
+            );
+            crate::list::ensure_state(&list, image, last.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the owned linear allocation starts with this texel and the readback has completed.
+            assert_eq!(unsafe { (first as *const f32).read_unaligned() }, value);
+            assert_eq!(copy.state.load(Ordering::Relaxed), last.0 as u32);
+        }
+    }
+
+    #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {
         // (a mesh dispatch is kind 10, a draw kind 0)
         let remembered = Some((7u64, 10u32, 12u32, 32u32));

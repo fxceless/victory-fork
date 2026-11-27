@@ -8338,7 +8338,20 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
-            self.settle(&target.copy, COPY_SOURCE);
+            let copy = target.copy.clone();
+            // The state this recording leaves, including any title barriers
+            // after the UAV write. Other lists can be recorded out of order.
+            let last = self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(std::sync::Arc::as_ptr(&copy) as usize))
+                .map(|(_, last, _)| *last);
+            // On first use the submission prelude establishes COPY_SOURCE.
+            let needs_barrier = last.is_none_or(|state| state & COPY_SOURCE == 0);
+            if needs_barrier {
+                self.settle(&copy, COPY_SOURCE);
+            }
             // With device-removed data in its full form: the copies that
             // follow are named in the breadcrumbs (a stop in them read "op
             // 8, no marker"). Not otherwise: a note is also a line of a
@@ -8349,7 +8362,11 @@ impl HostList {
                     self.note_op(|| format!("texture read-back of title texture {:#x} (texback)", target.owner()));
                 }
             }
-            if let Some(back) = crate::texback::record(&self.list, target) {
+            let back = crate::texback::record(&self.list, target);
+            if needs_barrier && let Some(last) = last {
+                self.settle(&copy, last);
+            }
+            if let Some(back) = back {
                 self.deferred().texture_backs.push(back);
             }
         }
