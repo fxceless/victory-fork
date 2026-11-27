@@ -10244,7 +10244,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // A long copy is read by several threads at once (`read_wide`): it has
+    // nothing to do with any other, and one thread's kernel read runs at
+    // some 3 GB/s, which is what the frame line's "copies" are.
+    let wide = !title_dst && len >= WIDE_READ_MIN && crate::shadow::wide_available() && !crate::shadow::in_wide_job();
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len))
+        || if wide { read_wide(src, dst, len) } else { read(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -10329,6 +10334,42 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// A copy this many bytes or longer is read by several threads at once
+/// ([`read`], [`read_wide`]). Below it the hand-over costs what it saves: at
+/// 2 MiB the copy is one piece and no thread but this one has it (measured on
+/// six cores: 0.17 ms one thread against 0.19 ms through the pool).
+const WIDE_READ_MIN: usize = 4 << 20;
+
+/// One piece of a [`read_wide`] copy.
+const WIDE_READ_CHUNK: usize = 2 << 20;
+
+/// [`read`] of a long range, its bytes read by several threads at once
+/// (`crate::shadow::wide`). False if any piece was not readable: the caller
+/// reads the whole range again the slow way, over the bytes it already has.
+///
+/// The pieces are disjoint parts of one destination, and the kernel's read
+/// of them shares nothing: on a machine with cores to spare this is the one
+/// copy that ran on one thread, at the speed of that thread's memory.
+fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let (src, dst) = (src as usize, dst as usize);
+    let whole = std::sync::Arc::new(AtomicBool::new(true));
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(WIDE_READ_CHUNK));
+    for at in (0..len).step_by(WIDE_READ_CHUNK) {
+        let n = WIDE_READ_CHUNK.min(len - at);
+        let whole = whole.clone();
+        jobs.push(Box::new(move || {
+            // SAFETY: a piece of the caller's range, which it vouches for.
+            let (src, dst) = unsafe { ((src as *const u8).add(at), (dst as *mut u8).add(at)) };
+            if !read(src, dst, n) {
+                whole.store(false, Relaxed);
+            }
+        }));
+    }
+    crate::shadow::wide_run(jobs);
+    whole.load(Relaxed)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
