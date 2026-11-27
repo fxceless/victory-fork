@@ -183,13 +183,35 @@ mod tests {
     /// query (a query it cannot read is refused at once).
     #[test]
     fn the_system_takes_the_subscription() {
+        use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, GetLastError, SetLastError};
+
+        const UNCHANGED: u32 = u32::MAX;
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let (channel, query) = (wide("System"), wide(QUERY));
         // SAFETY: as in `start`.
-        let subscription = unsafe {
-            EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(on_event), EvtSubscribeToFutureEvents)
+        let (subscription, error) = unsafe {
+            SetLastError(UNCHANGED);
+            let subscription = EvtSubscribe(
+                0,
+                std::ptr::null_mut(),
+                channel.as_ptr(),
+                query.as_ptr(),
+                0,
+                std::ptr::null(),
+                Some(on_event),
+                EvtSubscribeToFutureEvents,
+            );
+            (subscription, GetLastError())
         };
-        assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
+        // Wine's stub can return zero without setting LastError.
+        if subscription == 0
+            && matches!(error, UNCHANGED | ERROR_CALL_NOT_IMPLEMENTED)
+            && crate::running_under_wine()
+        {
+            eprintln!("EvtSubscribe is unavailable on this Wine runtime");
+            return;
+        }
+        assert_ne!(subscription, 0, "{}", std::io::Error::from_raw_os_error(error as i32));
         // SAFETY: our own subscription.
         unsafe { windows_sys::Win32::System::EventLog::EvtClose(subscription) };
     }

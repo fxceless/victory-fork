@@ -1113,6 +1113,11 @@ unsafe extern "system" {
 /// by anybody, and free memory taken by anybody, with no word to us:
 /// `VirtualQuery` does not tell the three apart, this question does.
 fn placeholder(block: usize) -> bool {
+    placeholder_result(block).unwrap_or(false)
+}
+
+/// The placeholder query, retaining the kernel's status if it cannot answer.
+fn placeholder_result(block: usize) -> Result<bool, i32> {
     /// `MEMORY_REGION_INFORMATION` (ntddk); only the kinds are read.
     #[repr(C)]
     #[derive(Default)]
@@ -1142,7 +1147,10 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status < 0 {
+        return Err(status);
+    }
+    Ok(region.region_type & PLACEHOLDER_RESERVATION != 0)
 }
 
 /// The note that `block` is uncommitted is gone, or is true no longer: the
@@ -2825,13 +2833,15 @@ mod tests {
     /// lies in a placeholder is; then nothing is asked until the runtime
     /// tells of the block, or the look at the holes finds it filled. A
     /// hole in an ordinary reservation is never known by a bit, and its
-    /// note grows old.
+    /// note grows old. The note also expires if Wine cannot query the
+    /// placeholder flag.
     #[test]
     fn holes_are_known_by_their_bits_only_when_noted_for_good() {
+        use windows_sys::Win32::Foundation::STATUS_INVALID_INFO_CLASS;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
-            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
-            VirtualAlloc2,
+            CreateFileMappingW, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER,
+            MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS,
+            UnmapViewOfFile2, VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let _turn = light_turn();
@@ -2883,10 +2893,27 @@ mod tests {
             assert_eq!(view.Value as usize, p + block * BLOCK);
             view
         };
+        let release = |views: &[MEMORY_MAPPED_VIEW_ADDRESS]| {
+            // SAFETY: our views, placeholder and section.
+            unsafe {
+                for &view in views {
+                    UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+                }
+                for block in 0..4 {
+                    VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+                }
+                windows_sys::Win32::Foundation::CloseHandle(section);
+            }
+            title_memory_remapped(p, 4 * BLOCK);
+        };
         let pages = |block: usize| (p + block * BLOCK) / PAGE;
         let (from, to) = (p, p + 4 * BLOCK);
         let first = map(0);
-        assert!(placeholder(p / BLOCK + 1) && placeholder(p / BLOCK + 3), "what is left of the placeholder");
+        let can_query_placeholders = match (placeholder_result(p / BLOCK + 1), placeholder_result(p / BLOCK + 3)) {
+            (Ok(true), Ok(true)) => true,
+            (Err(STATUS_INVALID_INFO_CLASS), Err(STATUS_INVALID_INFO_CLASS)) if crate::running_under_wine() => false,
+            results => panic!("what is left of the placeholder: {results:?}"),
+        };
         assert!(!placeholder(p / BLOCK), "a view is none");
         // The first asking takes every block; blocks 1 to 3 are unmapped.
         let (one, all) = writes_as(from, to, true, 2).expect("a view");
@@ -2901,8 +2928,30 @@ mod tests {
         assert!(!known(from, to), "a hole not noted for good has no bit");
         // Noted for good, as with `VICTORY_ABSENT_MS=told`, and looked at
         // as the asking after the notes does.
-        assert_eq!(guard_at(from, to, 1, u64::MAX), Some(Vec::new()));
+        let noted_at = 1;
+        assert_eq!(guard_at(from, to, noted_at, u64::MAX), Some(Vec::new()));
         publish(&JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), &[], from, to, true);
+        if !can_query_placeholders {
+            // Without the query, a hole's bit stays clear and its note expires.
+            assert!(known(p, p + BLOCK));
+            for block in 1..4 {
+                assert!(!known(p + block * BLOCK, p + (block + 1) * BLOCK));
+            }
+            let second = map(1);
+            let expires_at = noted_at + UNSURE_MS;
+            assert_eq!(
+                guard_at(from, to, expires_at - 1, u64::MAX),
+                Some(Vec::new()),
+                "the note is still current",
+            );
+            assert_eq!(
+                guard_at(from, to, expires_at, u64::MAX),
+                Some(vec![pages(1)]),
+                "the expired note reveals the mapping",
+            );
+            release(&[first, second]);
+            return;
+        }
         assert!(known(from, to), "holes in a placeholder, noted for good");
         let before = light_counts();
         let (three, written) = writes_as(from, to, true, 2).expect("a view");
@@ -2950,18 +2999,9 @@ mod tests {
         assert_eq!(guard_at(plain, plain + BLOCK, 50, u64::MAX), Some(Vec::new()), "the note is 48 ms old");
         assert_eq!(guard_at(plain, plain + BLOCK, 2 + UNSURE_MS, u64::MAX), Some(vec![plain / PAGE]), "the note is old");
         title_memory_remapped(plain, BLOCK);
-        // SAFETY: our views, placeholder and reservation.
-        unsafe {
-            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
-            for view in [first, second, third] {
-                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
-            }
-            for block in 0..4 {
-                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
-            }
-            windows_sys::Win32::Foundation::CloseHandle(section);
-        }
-        title_memory_remapped(p, 4 * BLOCK);
+        // SAFETY: our ordinary reservation.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
+        release(&[first, second, third]);
     }
 
     /// A copy has nothing new to take of a range known by its bits when it

@@ -15,6 +15,17 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(windows, test))]
+fn running_under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    // SAFETY: Query a loaded module and check for Wine's named export.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]

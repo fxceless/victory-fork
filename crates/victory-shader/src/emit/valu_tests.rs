@@ -598,23 +598,28 @@ fn every_f32_comparison_answers_nans_as_ieee() {
         }
     }
     let ieee = |op: u16, a: f32, b: f32| -> bool {
-        let un = a.is_nan() || b.is_nan();
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let order = a.partial_cmp(&b);
+        let less = order == Some(Less);
+        let equal = order == Some(Equal);
+        let greater = order == Some(Greater);
         match op {
             0x0 => false,
-            0x1 => a < b,
-            0x2 => a == b,
-            0x3 => a <= b,
-            0x4 => a > b,
-            0x5 => a < b || a > b,
-            0x6 => a >= b,
-            0x7 => !un,
-            0x8 => un,
-            0x9 => !(a >= b),
-            0xA => !(a < b || a > b),
-            0xB => !(a > b),
-            0xC => !(a <= b),
-            0xD => !(a == b),
-            0xE => !(a < b),
+            0x1 => less,
+            0x2 => equal,
+            0x3 => less || equal,
+            0x4 => greater,
+            0x5 => less || greater,
+            0x6 => greater || equal,
+            0x7 => order.is_some(),
+            0x8 => order.is_none(),
+            0x9 => !(greater || equal),
+            0xA => !(less || greater),
+            0xB => !greater,
+            0xC => !(less || equal),
+            0xD => !equal,
+            0xE => !less,
             _ => true,
         }
     };
