@@ -296,6 +296,18 @@ struct SocketAddress {
     len: i32,
 }
 
+/// A title supplies this count; a list longer than this is refused rather
+/// than used as a slice length.
+const MAX_SOCKET_ADDRESSES: usize = 64;
+
+fn address_list_count(list: *const u8) -> Option<usize> {
+    // SAFETY: the caller checked the list pointer; the count is its first dword.
+    let count = unsafe { list.cast::<i32>().read_unaligned() };
+    usize::try_from(count)
+        .ok()
+        .filter(|&count| count <= MAX_SOCKET_ADDRESSES)
+}
+
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
@@ -308,11 +320,13 @@ pub extern "system" fn WSAConnectByList(
     reserved: *mut c_void,
 ) -> i32 {
     if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
+        let Some(count) = address_list_count(list) else {
+            wsa_error(WSAEINVAL);
+            return 0;
         };
+        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`; the count is bounded.
+        let entries =
+            unsafe { std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count) };
         if !entries
             .iter()
             .all(|e| reachable("network connect blocked", e.addr, e.len))
@@ -894,6 +908,18 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    #[test]
+    fn a_socket_address_list_count_is_bounded() {
+        let count = |value: i32| {
+            let mut bytes = value.to_ne_bytes();
+            address_list_count(bytes.as_mut_ptr())
+        };
+        assert_eq!(count(2), Some(2));
+        assert_eq!(count(0), Some(0));
+        assert_eq!(count(-1), None);
+        assert_eq!(count(i32::MAX), None);
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
