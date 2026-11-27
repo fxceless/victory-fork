@@ -32,6 +32,16 @@ struct Clock {
     first: u64,
 }
 
+impl Clock {
+    fn next_tick(&self, elapsed: Duration, last: u64) -> (u64, Duration) {
+        let elapsed = elapsed.as_nanos();
+        let interval = self.interval.as_nanos().max(1);
+        let tick = (self.first + (elapsed / interval + 1) as u64).max(last + 1);
+        let at = u128::from(tick - self.first) * interval;
+        (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
+    }
+}
+
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
@@ -102,15 +112,7 @@ fn next_tick(kind: u32) -> (u64, Duration) {
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
-    let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    (
-        tick,
-        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-    )
+    c.next_tick(c.start.elapsed(), last(kind).load(Ordering::Relaxed))
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -205,16 +207,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_clock_preserves_its_phase_across_early_wakes_and_missed_ticks() {
+        let clock = Clock { start: Instant::now(), interval: Duration::from_millis(2), first: 99 };
+        let at = Duration::from_micros;
+        assert_eq!(clock.next_tick(at(500), 99), (100, at(1500)));
+        assert_eq!(clock.next_tick(at(500), 100), (101, at(3500)));
+        assert_eq!(clock.next_tick(at(9000), 101), (104, at(1000)));
+    }
+
+    #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        assert_eq!(second, first + 1);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -244,7 +253,8 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // A delayed waiter can miss ticks. It must still end on a later one.
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
