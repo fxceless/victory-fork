@@ -49,6 +49,18 @@ extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESU
     xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
 }
 
+/// GDK `XGameUiShowTextEntryAsync` treats `maxTextLength == 0` as 1024 characters.
+const DEFAULT_MAX_TEXT_LENGTH: u32 = 1024;
+
+/// Normalize `maxTextLength`: `0` maps to the 1024-character GDK default.
+fn effective_max_length(max: u32) -> u32 {
+    if max == 0 {
+        DEFAULT_MAX_TEXT_LENGTH
+    } else {
+        max
+    }
+}
+
 /// The title treats `E_ABORT` as cancelled and goes on; any
 /// other failure as an error.
 extern "system" fn text_entry_async(
@@ -61,6 +73,7 @@ extern "system" fn text_entry_async(
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let max_length = effective_max_length(max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -102,12 +115,12 @@ extern "system" fn text_entry_result(
     put(used, written as u32)
 }
 
-/// At most `max` characters (0: no limit).
+/// At most `effective_max_length(max)` characters (0: 1024-character default).
 fn limit(typed: &str, max: u32) -> String {
-    match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
-    }
+    typed
+        .chars()
+        .take(effective_max_length(max) as usize)
+        .collect()
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
@@ -116,11 +129,11 @@ fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String
     dialog::ask(title, description, default, max)
 }
 
-/// Tests answer for the user: "typed" for a title starting with "Type",
-/// cancelled otherwise.
+/// Tests answer for the user: `default` + "typed" for a title starting with
+/// "Type" when `max` has been normalized (non-zero), cancelled otherwise.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
-    title.starts_with("Type").then(|| format!("{default}typed"))
+fn ask(title: &str, _: &str, default: &str, max: u32) -> Option<String> {
+    (max != 0 && title.starts_with("Type")).then(|| format!("{default}typed"))
 }
 
 mod dialog {
@@ -138,6 +151,11 @@ mod dialog {
     struct Entry {
         max: u32,
         typed: Option<String>,
+    }
+
+    /// `EM_LIMITTEXT` parameter for `max` (normalizing `0` to the 1024 default).
+    pub(super) fn limit_text_wparam(max: u32) -> WPARAM {
+        super::effective_max_length(max) as WPARAM
     }
 
     /// The description, an edit box with the default text, OK and Cancel,
@@ -184,7 +202,10 @@ mod dialog {
             .chunks(2)
             .map(|c| u32::from(c[0]) | u32::from(c.get(1).copied().unwrap_or(0)) << 16)
             .collect();
-        let mut entry = Entry { max, typed: None };
+        let mut entry = Entry {
+            max: super::effective_max_length(max),
+            typed: None,
+        };
         // SAFETY: a complete template and our dialog procedure; `entry`
         // outlives the modal dialog.
         unsafe {
@@ -208,7 +229,7 @@ mod dialog {
                 wm::WM_INITDIALOG => {
                     wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
                     let entry = &*(lparam as *const Entry);
-                    wm::SendMessageW(edit, EM_LIMITTEXT, entry.max as WPARAM, 0);
+                    wm::SendMessageW(edit, EM_LIMITTEXT, limit_text_wparam(entry.max), 0);
                     wm::SendMessageW(edit, EM_SETSEL, 0, -1);
                     SetFocus(edit);
                     0 // focus set here
@@ -260,8 +281,22 @@ static VTABLE: Methods<20> = Methods([
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    type Entry = extern "system" fn(
+        This,
+        *mut AsyncBlock,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        u32,
+        u32,
+    ) -> HRESULT;
+    type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+    type Result_ = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
 
     fn block() -> AsyncBlock {
         AsyncBlock {
@@ -270,6 +305,36 @@ mod tests {
             callback: None,
             internal: [0; 4],
         }
+    }
+
+    fn run_text_entry(default: &str, max_length: u32) -> (u32, String, u32) {
+        let this: This = &OBJECT;
+        let mut b = block();
+        let default = CString::new(default).unwrap();
+        let entry = method::<Entry>(&OBJECT, 0x88);
+        assert_eq!(
+            entry(
+                this,
+                &mut b,
+                c"Type".as_ptr(),
+                std::ptr::null(),
+                default.as_ptr(),
+                0,
+                max_length,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
+        let mut out = vec![0 as c_char; size as usize];
+        let mut used = 0;
+        assert_eq!(
+            method::<Result_>(&OBJECT, 0x98)(this, &mut b, size, out.as_mut_ptr(), &mut used),
+            S_OK
+        );
+        let returned = text(out.as_ptr()).expect("result should be valid UTF-8 with NUL");
+        (size, returned, used)
     }
 
     #[test]
@@ -285,17 +350,6 @@ mod tests {
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(method::<Done>(&OBJECT, 0x40)(this, &mut b), S_OK);
 
-        type Entry = extern "system" fn(
-            This,
-            *mut AsyncBlock,
-            *const c_char,
-            *const c_char,
-            *const c_char,
-            u32,
-            u32,
-        ) -> HRESULT;
-        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
-        type Result_ = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
         let null = std::ptr::null();
         let entry = method::<Entry>(&OBJECT, 0x88);
         // Dismissed: cancelled.
@@ -317,5 +371,50 @@ mod tests {
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+    }
+
+    #[test]
+    fn max_length_zero_applies_1024_default() {
+        assert_eq!(effective_max_length(0), 1024);
+        assert_eq!(dialog::limit_text_wparam(0), 1024);
+
+        let over_limit = "a".repeat(1025);
+        let expected = "a".repeat(1024);
+        assert_eq!(limit(&over_limit, 0), expected);
+        assert_eq!(limit(&expected, 0), expected);
+
+        let (size, returned, used) = run_text_entry(&over_limit, 0);
+        assert_eq!((size, used), (1025, 1025));
+        assert_eq!(returned, expected);
+
+        let (short_size, short_returned, short_used) = run_text_entry("hi", 0);
+        assert_eq!((short_size, short_used), (8, 8));
+        assert_eq!(short_returned, "hityped");
+    }
+
+    #[test]
+    fn explicit_positive_limit_and_utf8_boundaries() {
+        assert_eq!(effective_max_length(16), 16);
+        assert_eq!(dialog::limit_text_wparam(16), 16);
+
+        assert_eq!(limit(&"b".repeat(20), 16), "b".repeat(16));
+        assert_eq!(limit("short", 16), "short");
+
+        let (size, returned, used) = run_text_entry(&"b".repeat(20), 16);
+        assert_eq!((size, used), (17, 17));
+        assert_eq!(returned, "b".repeat(16));
+
+        let (short_size, short_returned, short_used) = run_text_entry("hi", 16);
+        assert_eq!((short_size, short_used), (8, 8));
+        assert_eq!(short_returned, "hityped");
+
+        // Multi-byte UTF-8 characters are bounded by scalar count, not byte count,
+        // and the result buffer still includes the trailing NUL byte.
+        let utf8_over = "\u{e9}".repeat(1025);
+        let utf8_expected = "\u{e9}".repeat(1024);
+        assert_eq!(limit(&utf8_over, 0), utf8_expected);
+        let (utf8_size, utf8_returned, utf8_used) = run_text_entry(&utf8_over, 0);
+        assert_eq!((utf8_size, utf8_used), (1024 * 2 + 1, 1024 * 2 + 1));
+        assert_eq!(utf8_returned, utf8_expected);
     }
 }
