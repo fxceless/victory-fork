@@ -31,3 +31,10 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Launcher and frame-report regression tests
+        shell: pwsh
+        run: |
+          ./tests/low-memory-launcher.ps1
+          ./tests/performance-tools.ps1
+      - name: Release build
+        run: cargo build --release --locked -p victory

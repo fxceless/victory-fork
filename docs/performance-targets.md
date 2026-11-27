@@ -146,8 +146,10 @@ and the report analyzer. Synthetic reports test known percentiles and 1% lows,
 hitches hidden by averages, higher unmet targets, warm-up boundaries, missing
 tail samples, sequence gaps, generated frames and incomplete captures.
 
-Rust regressions cover a full nonblocking report queue and partial timing-patch
-rejection. They have not run on this host. `scripts\check-local-fixes.ps1
+Rust regressions cover a full nonblocking report queue, fractional-microsecond
+timestamp consistency and partial timing-patch rejection. They have not run on
+this host. CI also runs the launcher/analyzer regressions and a release build;
+an unrun or pending CI job is not a passing result. `scripts\check-local-fixes.ps1
 -RequireRust` runs the required workspace Clippy, tests and release build once
 the pinned Rust toolchain and MSVC developer environment are available. No
 hardware/Ultra FPS result is claimed by these changes.

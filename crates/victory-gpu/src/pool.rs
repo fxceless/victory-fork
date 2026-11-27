@@ -66,7 +66,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool, small: bool) -> usize {
-    crate::budget::texture_spares(memory, keep, small)
+    crate::budget::texture_spares(memory, keep, small).min(SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
