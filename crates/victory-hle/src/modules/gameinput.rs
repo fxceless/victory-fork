@@ -1067,6 +1067,9 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+#[cfg(windows)]
+mod playstation;
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1133,19 +1136,12 @@ mod host {
     }
 
     impl Source for Host {
+        /// XInput; a PlayStation controller fills slot 0 while XInput has none there.
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
-            }
-            self.empty_until[slot] = None;
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = self
+                .xinput(slot)
+                .or_else(|| (slot == 0).then(super::playstation::pad).flatten())?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1195,6 +1191,22 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
+            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                return None;
+            }
+            let mut state = XINPUT_STATE::default();
+            // SAFETY: room for the state.
+            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                return None;
+            }
+            self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
         }
     }
 
