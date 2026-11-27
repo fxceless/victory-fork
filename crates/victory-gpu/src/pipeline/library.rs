@@ -650,7 +650,7 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_history(dir, saved_pipeline_history(), &used));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -701,6 +701,27 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
+/// VICTORY_PIPELINE_HISTORY=0 ignores the saved scheduling history without
+/// disabling the driver library or overwriting the existing early list.
+fn saved_pipeline_history() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HISTORY").is_none_or(|v| v != "0"))
+}
+
+fn read_history(dir: Option<&std::path::Path>, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    dir.and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok()).unwrap_or_default()
+}
+
+fn write_history(dir: &std::path::Path, enabled: bool, used: &[String]) -> std::io::Result<()> {
+    if enabled {
+        write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -708,10 +729,7 @@ static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
+        let listed = read_history(DIR.get().map(|d| d.as_path()), saved_pipeline_history());
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
@@ -736,6 +754,31 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_pipeline_history_preserves_the_saved_early_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EARLY_FILE);
+        let old = b"old-pipeline-a\nold-pipeline-b";
+        std::fs::write(&path, old).unwrap();
+        assert_eq!(read_history(Some(dir.path()), true).as_bytes(), old);
+        assert!(read_history(Some(dir.path()), false).is_empty());
+        let used = vec!["new-pipeline".to_owned()];
+        write_history(dir.path(), false, &used).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), old);
+        write_history(dir.path(), true, &used).unwrap();
+        assert_eq!(read_history(Some(dir.path()), true), "new-pipeline");
+    }
+
+    #[test]
+    fn disabled_pipeline_history_does_not_create_an_early_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = vec!["new-pipeline".to_owned()];
+        write_history(dir.path(), false, &used).unwrap();
+        assert!(!dir.path().join(EARLY_FILE).exists());
+        assert!(read_history(Some(dir.path()), false).is_empty());
+        assert!(read_history(None, true).is_empty());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
