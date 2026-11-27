@@ -25,7 +25,70 @@
 // Each table is sorted by opcode. VOP3 holds only VOP3-only opcodes; VOP3
 // encodings of VOPC/VOP2/VOP1 ops (0x000-0x13f, 0x180-0x1ff) use those tables.
 
-pub(super) const SOP2: &[(u16, &str)] = &[
+pub(super) struct Table {
+    entries: &'static [(u16, &'static str)],
+    rows: &'static [u8],
+}
+
+impl Table {
+    pub(super) fn lookup(&self, opcode: u16) -> Option<&'static str> {
+        let row = *self.rows.get(usize::from(opcode))?;
+        self.entries.get(usize::from(row)).map(|&(_, name)| name)
+    }
+}
+
+// One byte per possible opcode avoids repeated searches while keeping
+// Instruction compact. An absent opcode has a row outside the entries slice.
+const fn index<const N: usize>(entries: &[(u16, &str)]) -> [u8; N] {
+    assert!(entries.len() <= u8::MAX as usize);
+    let mut rows = [u8::MAX; N];
+    let mut row = 0;
+    while row < entries.len() {
+        let opcode = entries[row].0 as usize;
+        assert!(row == 0 || entries[row - 1].0 < entries[row].0);
+        rows[opcode] = row as u8;
+        row += 1;
+    }
+    rows
+}
+
+macro_rules! opcode_tables {
+    ($($name:ident: $entries:ident),+ $(,)?) => {
+        $(
+            pub(super) const $name: Table = {
+                const LEN: usize = $entries[$entries.len() - 1].0 as usize + 1;
+                Table {
+                    entries: $entries,
+                    rows: &index::<LEN>($entries),
+                }
+            };
+        )+
+    };
+}
+
+opcode_tables! {
+    SOP2: SOP2_ENTRIES,
+    SOPK: SOPK_ENTRIES,
+    SOP1: SOP1_ENTRIES,
+    SOPC: SOPC_ENTRIES,
+    SOPP: SOPP_ENTRIES,
+    SMEM: SMEM_ENTRIES,
+    VOP2: VOP2_ENTRIES,
+    VOP1: VOP1_ENTRIES,
+    VOPC: VOPC_ENTRIES,
+    VOP3: VOP3_ENTRIES,
+    VOP3P: VOP3P_ENTRIES,
+    VINTRP: VINTRP_ENTRIES,
+    DS: DS_ENTRIES,
+    MUBUF: MUBUF_ENTRIES,
+    MTBUF: MTBUF_ENTRIES,
+    MIMG: MIMG_ENTRIES,
+    FLAT: FLAT_ENTRIES,
+    GLOBAL: GLOBAL_ENTRIES,
+    SCRATCH: SCRATCH_ENTRIES,
+}
+
+const SOP2_ENTRIES: &[(u16, &str)] = &[
     (0x000, "s_add_u32"),
     (0x001, "s_sub_u32"),
     (0x002, "s_add_i32"),
@@ -79,7 +142,7 @@ pub(super) const SOP2: &[(u16, &str)] = &[
     (0x036, "s_mul_hi_i32"),
 ];
 
-pub(super) const SOPK: &[(u16, &str)] = &[
+const SOPK_ENTRIES: &[(u16, &str)] = &[
     (0x000, "s_movk_i32"),
     (0x001, "s_version"),
     (0x002, "s_cmovk_i32"),
@@ -109,7 +172,7 @@ pub(super) const SOPK: &[(u16, &str)] = &[
     (0x01c, "s_subvector_loop_end"),
 ];
 
-pub(super) const SOP1: &[(u16, &str)] = &[
+const SOP1_ENTRIES: &[(u16, &str)] = &[
     (0x003, "s_mov_b32"),
     (0x004, "s_mov_b64"),
     (0x005, "s_cmov_b32"),
@@ -178,7 +241,7 @@ pub(super) const SOP1: &[(u16, &str)] = &[
     (0x049, "s_movrelsd_2_b32"),
 ];
 
-pub(super) const SOPC: &[(u16, &str)] = &[
+const SOPC_ENTRIES: &[(u16, &str)] = &[
     (0x000, "s_cmp_eq_i32"),
     (0x001, "s_cmp_lg_i32"),
     (0x002, "s_cmp_gt_i32"),
@@ -199,7 +262,7 @@ pub(super) const SOPC: &[(u16, &str)] = &[
     (0x013, "s_cmp_lg_u64"),
 ];
 
-pub(super) const SOPP: &[(u16, &str)] = &[
+const SOPP_ENTRIES: &[(u16, &str)] = &[
     (0x000, "s_nop"),
     (0x001, "s_endpgm"),
     (0x002, "s_branch"),
@@ -239,7 +302,7 @@ pub(super) const SOPP: &[(u16, &str)] = &[
     (0x028, "s_ttracedata_imm"),
 ];
 
-pub(super) const SMEM: &[(u16, &str)] = &[
+const SMEM_ENTRIES: &[(u16, &str)] = &[
     (0x000, "s_load_dword"),
     (0x001, "s_load_dwordx2"),
     (0x002, "s_load_dwordx4"),
@@ -326,7 +389,7 @@ pub(super) const SMEM: &[(u16, &str)] = &[
     (0x0ac, "s_atomic_dec_x2"),
 ];
 
-pub(super) const VOP2: &[(u16, &str)] = &[
+const VOP2_ENTRIES: &[(u16, &str)] = &[
     (0x001, "v_cndmask_b32"),
     (0x002, "v_dot2c_f32_f16"),
     (0x003, "v_add_f32"),
@@ -379,7 +442,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x03c, "v_pk_fmac_f16"),
 ];
 
-pub(super) const VOP1: &[(u16, &str)] = &[
+const VOP1_ENTRIES: &[(u16, &str)] = &[
     (0x000, "v_nop"),
     (0x001, "v_mov_b32"),
     (0x002, "v_readfirstlane_b32"),
@@ -463,7 +526,7 @@ pub(super) const VOP1: &[(u16, &str)] = &[
     (0x068, "v_swaprel_b32"),
 ];
 
-pub(super) const VOPC: &[(u16, &str)] = &[
+const VOPC_ENTRIES: &[(u16, &str)] = &[
     (0x000, "v_cmp_f_f32"),
     (0x001, "v_cmp_lt_f32"),
     (0x002, "v_cmp_eq_f32"),
@@ -656,7 +719,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
     (0x0ff, "v_cmpx_tru_f16"),
 ];
 
-pub(super) const VOP3: &[(u16, &str)] = &[
+const VOP3_ENTRIES: &[(u16, &str)] = &[
     (0x140, "v_mad_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
@@ -775,7 +838,7 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x37f, "v_add_nc_i32"),
 ];
 
-pub(super) const VOP3P: &[(u16, &str)] = &[
+const VOP3P_ENTRIES: &[(u16, &str)] = &[
     (0x000, "v_pk_mad_i16"),
     (0x001, "v_pk_mul_lo_u16"),
     (0x002, "v_pk_add_i16"),
@@ -806,13 +869,13 @@ pub(super) const VOP3P: &[(u16, &str)] = &[
     (0x022, "v_fma_mixhi_f16"),
 ];
 
-pub(super) const VINTRP: &[(u16, &str)] = &[
+const VINTRP_ENTRIES: &[(u16, &str)] = &[
     (0x000, "v_interp_p1_f32"),
     (0x001, "v_interp_p2_f32"),
     (0x002, "v_interp_mov_f32"),
 ];
 
-pub(super) const DS: &[(u16, &str)] = &[
+const DS_ENTRIES: &[(u16, &str)] = &[
     (0x000, "ds_add_u32"),
     (0x001, "ds_sub_u32"),
     (0x002, "ds_rsub_u32"),
@@ -969,7 +1032,7 @@ pub(super) const DS: &[(u16, &str)] = &[
     (0x0ff, "ds_read_b128"),
 ];
 
-pub(super) const MUBUF: &[(u16, &str)] = &[
+const MUBUF_ENTRIES: &[(u16, &str)] = &[
     (0x000, "buffer_load_format_x"),
     (0x001, "buffer_load_format_xy"),
     (0x002, "buffer_load_format_xyz"),
@@ -1047,7 +1110,7 @@ pub(super) const MUBUF: &[(u16, &str)] = &[
     (0x087, "buffer_store_format_d16_xyzw"),
 ];
 
-pub(super) const MTBUF: &[(u16, &str)] = &[
+const MTBUF_ENTRIES: &[(u16, &str)] = &[
     (0x000, "tbuffer_load_format_x"),
     (0x001, "tbuffer_load_format_xy"),
     (0x002, "tbuffer_load_format_xyz"),
@@ -1066,7 +1129,7 @@ pub(super) const MTBUF: &[(u16, &str)] = &[
     (0x00f, "tbuffer_store_format_d16_xyzw"),
 ];
 
-pub(super) const MIMG: &[(u16, &str)] = &[
+const MIMG_ENTRIES: &[(u16, &str)] = &[
     (0x000, "image_load"),
     (0x001, "image_load_mip"),
     (0x002, "image_load_pck"),
@@ -1172,7 +1235,7 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0e7, "image_bvh64_intersect_ray"),
 ];
 
-pub(super) const FLAT: &[(u16, &str)] = &[
+const FLAT_ENTRIES: &[(u16, &str)] = &[
     (0x008, "flat_load_ubyte"),
     (0x009, "flat_load_sbyte"),
     (0x00a, "flat_load_ushort"),
@@ -1229,7 +1292,7 @@ pub(super) const FLAT: &[(u16, &str)] = &[
     (0x060, "flat_atomic_fmax_x2"),
 ];
 
-pub(super) const GLOBAL: &[(u16, &str)] = &[
+const GLOBAL_ENTRIES: &[(u16, &str)] = &[
     (0x008, "global_load_ubyte"),
     (0x009, "global_load_sbyte"),
     (0x00a, "global_load_ushort"),
@@ -1289,7 +1352,7 @@ pub(super) const GLOBAL: &[(u16, &str)] = &[
     (0x060, "global_atomic_fmax_x2"),
 ];
 
-pub(super) const SCRATCH: &[(u16, &str)] = &[
+const SCRATCH_ENTRIES: &[(u16, &str)] = &[
     (0x008, "scratch_load_ubyte"),
     (0x009, "scratch_load_sbyte"),
     (0x00a, "scratch_load_ushort"),
@@ -1316,6 +1379,25 @@ pub(super) const SCRATCH: &[(u16, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn indices_match_opcode_tables() {
+        for table in [
+            SOP2, SOPK, SOP1, SOPC, SOPP, SMEM, VOP2, VOP1, VOPC, VOP3, VOP3P, VINTRP, DS, MUBUF,
+            MTBUF, MIMG, FLAT, GLOBAL, SCRATCH,
+        ] {
+            for opcode in 0..=u16::MAX {
+                let expected = table
+                    .entries
+                    .binary_search_by_key(&opcode, |&(key, _)| key)
+                    .ok()
+                    .map(|row| table.entries[row].1);
+                assert_eq!(table.lookup(opcode), expected, "opcode {opcode:#x}");
+            }
+        }
+    }
+
     fn bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }

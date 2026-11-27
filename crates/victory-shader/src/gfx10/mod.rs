@@ -54,14 +54,40 @@ pub struct Instruction {
     pub offset: usize,
     pub encoding: Encoding,
     pub opcode: u16,
-    /// Every dword of the instruction, including literals and extra dwords.
-    pub words: Vec<u32>,
+    /// Every dword of the instruction, including literals and extra dwords;
+    /// `len` of them. The longest instruction here is an MIMG with its three
+    /// extra address dwords, five in all, so they live inline: a heap vector
+    /// per instruction was one allocation and one cache miss for a word or
+    /// two of data.
+    words: [u32; Instruction::MAX_WORDS],
+    len: u8,
 }
 
 impl Instruction {
+    /// The most dwords an instruction here has: an MIMG with its three extra
+    /// address dwords.
+    const MAX_WORDS: usize = 5;
+
+    pub(crate) fn single_word(offset: usize, encoding: Encoding, opcode: u16, word: u32) -> Self {
+        let mut words = [0; Self::MAX_WORDS];
+        words[0] = word;
+        Self {
+            offset,
+            encoding,
+            opcode,
+            words,
+            len: 1,
+        }
+    }
+
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
         name(self.encoding, self.opcode)
+    }
+
+    /// Every dword of the instruction, including literals and extra dwords.
+    pub fn words(&self) -> &[u32] {
+        &self.words[..usize::from(self.len)]
     }
 }
 
@@ -75,7 +101,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     while let Some(mut offset) = pending.pop() {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
-            let next = offset + 4 * inst.words.len();
+            let next = offset + 4 * inst.words().len();
             let flow = control(&inst, code.len(), |at| {
                 found.range(..at).next_back().map(|(_, i)| i)
             })?;
@@ -94,7 +120,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let list: Vec<Instruction> = found.into_values().collect();
     if let Some(w) = list
         .windows(2)
-        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        .find(|w| w[0].offset + 4 * w[0].words().len() > w[1].offset)
     {
         return Err(isa(w[1].offset, "a branch lands inside an instruction"));
     }
@@ -119,7 +145,8 @@ pub(crate) fn control<'a>(
     len: usize,
     before: impl Fn(usize) -> Option<&'a Instruction>,
 ) -> Result<Flow, ShaderError> {
-    Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
+    let next = inst.offset + 4 * inst.words().len();
+    Ok(match flow(inst, next, len)? {
         Flow::Stop if inst.name() == Some("s_setpc_b64") => {
             far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
         }
@@ -129,7 +156,7 @@ pub(crate) fn control<'a>(
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {
     let target = || {
-        let delta = 4 * i64::from(inst.words[0] as u16 as i16);
+        let delta = 4 * i64::from(inst.words()[0] as u16 as i16);
         usize::try_from(next as i64 + delta)
             .ok()
             .filter(|&t| t < len)
@@ -159,17 +186,17 @@ fn far_jump<'a>(
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
-    let n = setpc.words[0] & 0xFF;
+    let n = setpc.words()[0] & 0xFF;
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
         let Some(prev) = before(at) else {
             break;
         };
-        if prev.offset + 4 * prev.words.len() != at {
+        if prev.offset + 4 * prev.words().len() != at {
             break;
         }
-        let w = prev.words[0];
+        let w = prev.words()[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
         match (prev.encoding, prev.name()) {
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
@@ -177,7 +204,7 @@ fn far_jump<'a>(
             {
                 // The low dword of a signed 64-bit offset: a backward jump
                 // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
+                let literal = i64::from(prev.words()[1] as i32);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
@@ -282,11 +309,20 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    if len > Instruction::MAX_WORDS {
+        return Err(isa(offset, "instruction longer than the decoder's budget"));
+    }
+    let mut words = [0u32; Instruction::MAX_WORDS];
+    words[0] = w;
+    for (i, w) in words.iter_mut().enumerate().take(len).skip(1) {
+        *w = word(i)?;
+    }
     Ok(Instruction {
         offset,
         encoding,
         opcode: opcode as u16,
-        words: (0..len).map(word).collect::<Result<_, _>>()?,
+        words,
+        len: len as u8,
     })
 }
 
@@ -320,10 +356,7 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         Encoding::Global => (t::GLOBAL, opcode),
         Encoding::Scratch => (t::SCRATCH, opcode),
     };
-    table
-        .binary_search_by_key(&op, |&(o, _)| o)
-        .ok()
-        .map(|i| table[i].1)
+    table.lookup(op)
 }
 
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
@@ -369,35 +402,23 @@ mod tests {
         decode(&bytes(code))
             .unwrap()
             .iter()
-            .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
+            .map(|i| (i.offset, i.words().len(), i.name().unwrap_or("?")))
             .collect()
     }
 
     #[test]
-    fn tables_are_sorted() {
-        for t in [
-            opcodes::SOP2,
-            opcodes::SOPK,
-            opcodes::SOP1,
-            opcodes::SOPC,
-            opcodes::SOPP,
-            opcodes::SMEM,
-            opcodes::VOP2,
-            opcodes::VOP1,
-            opcodes::VOPC,
-            opcodes::VOP3,
-            opcodes::VOP3P,
-            opcodes::VINTRP,
-            opcodes::DS,
-            opcodes::MUBUF,
-            opcodes::MTBUF,
-            opcodes::MIMG,
-            opcodes::FLAT,
-            opcodes::GLOBAL,
-            opcodes::SCRATCH,
+    fn vop3_names_match_aliased_encodings() {
+        for (encoding, start, count) in [
+            (Encoding::Vopc, 0x000, 0x100),
+            (Encoding::Vop2, 0x100, 0x40),
+            (Encoding::Vop1, 0x180, 0x80),
         ] {
-            assert!(t.windows(2).all(|w| w[0].0 < w[1].0));
+            for opcode in 0..count {
+                assert_eq!(name(Encoding::Vop3, start + opcode), name(encoding, opcode));
+            }
         }
+        assert_eq!(name(Encoding::Vop3, 0x14b), Some("v_fma_f32"));
+        assert_eq!(name(Encoding::Vop3, 0x17f), None);
     }
 
     #[test]
@@ -427,6 +448,21 @@ mod tests {
                 (44, 1, "s_endpgm"),
             ]
         );
+    }
+
+    #[test]
+    fn preserves_all_five_image_words() {
+        let image = [0xF080_0F0E, 0, 1, 2, 3];
+        let mut code = bytes(&image);
+        code.extend(S_ENDPGM.to_le_bytes());
+        let decoded = decode(&code).unwrap();
+
+        assert_eq!(decoded[0].words(), image);
+        assert_eq!(decoded[1].offset, 20);
+        assert!(matches!(
+            decode(&code[..16]),
+            Err(ShaderError::Isa { offset: 0, .. })
+        ));
     }
 
     #[test]
