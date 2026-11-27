@@ -127,8 +127,15 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
+    let exp = raw_exp as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if raw_exp == 0xff {
+        if man != 0 {
+            return sign | 0x7e00 | ((man >> 13) & 0x03ff) as u16;
+        }
+        return sign | 0x7c00;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +154,12 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Round to nearest, ties to even: a carry out of the mantissa is added
+    // into the exponent (`2 - 2^-12` is 2.0); at most it reaches infinity,
+    // 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let rounded = (man + 0x0fff + ((man >> 13) & 1)) >> 13;
+    sign | (half + rounded) as u16
 }
 
 #[cfg(test)]
@@ -233,5 +242,96 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// Issue #245: expanding `R16_FLOAT` rectangles with an exact halfway
+    /// normal tie must round to even instead of always rounding up.
+    #[test]
+    fn r16_float_rect_normal_ties_round_to_even() {
+        // 1.0, 0.0, 2^-11 -> fourth corner is 1.0 + 2^-11, halfway between
+        // 0x3c00 (even) and 0x3c01 (odd).
+        let src: Vec<u8> = [0x3c00_u16, 0x0000, 0x1000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = vec![0u8; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        assert_eq!(u16::from_le_bytes([dst[10], dst[11]]), 0x3c00);
+    }
+
+    /// Issue #245: expanding `R16_FLOAT` rectangles with a NaN corner must
+    /// preserve a quiet NaN instead of turning it into infinity (`0x7c00`).
+    #[test]
+    fn r16_float_rect_preserves_nan() {
+        let src: Vec<u8> = [0x7e00_u16, 0x0000, 0x0000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = vec![0u8; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        let h = u16::from_le_bytes([dst[10], dst[11]]);
+        assert!((h & 0x7fff) > 0x7c00, "expected quiet NaN, got {h:#06x}");
+        assert_ne!(h & 0x0200, 0, "expected quiet NaN bit, got {h:#06x}");
+
+        let neg_src: Vec<u8> = [0xfe00_u16, 0x0000, 0x0000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        expand_rects(&neg_src, &mut dst, 2, &[(0, 54)]);
+        let neg_h = u16::from_le_bytes([dst[10], dst[11]]);
+        assert_ne!(
+            neg_h & 0x8000,
+            0,
+            "expected sign preserved, got {neg_h:#06x}"
+        );
+        assert!(
+            (neg_h & 0x7fff) > 0x7c00,
+            "expected negative quiet NaN, got {neg_h:#06x}"
+        );
+    }
+
+    #[test]
+    fn f32_to_half_ieee754_edge_cases() {
+        // Normal ties-to-even (even stays, odd rounds up, non-ties follow nearest).
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-10) + 2f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-23)), 0x3c01);
+        assert_eq!(
+            f32_to_half(1.0 + 2f32.powi(-10) + 2f32.powi(-11) - 2f32.powi(-23)),
+            0x3c01
+        );
+
+        // Signed zeros.
+        assert_eq!(f32_to_half(0.0), 0x0000);
+        assert_eq!(f32_to_half(-0.0), 0x8000);
+
+        // Signed infinities and finite overflow.
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+        assert_eq!(f32_to_half(65520.0), 0x7c00);
+        assert_eq!(f32_to_half(-65520.0), 0xfc00);
+        assert_eq!(f32_to_half(1e10), 0x7c00);
+        assert_eq!(f32_to_half(-1e10), 0xfc00);
+
+        // Quiet and low-payload NaNs keep sign and produce nonzero quiet NaN mantissa.
+        for (bits, expect_sign) in [
+            (0x7fc0_0000_u32, 0x0000_u16),
+            (0xffc0_0000_u32, 0x8000_u16),
+            (0x7f80_0001_u32, 0x0000_u16),
+            (0xff80_0001_u32, 0x8000_u16),
+        ] {
+            let h = f32_to_half(f32::from_bits(bits));
+            assert_eq!(h & 0x8000, expect_sign);
+            assert!((h & 0x7fff) > 0x7c00, "got {h:#06x} for {bits:#010x}");
+            assert_ne!(h & 0x0200, 0, "got {h:#06x} for {bits:#010x}");
+        }
+        assert_eq!(f32_to_half(f32::from_bits(0x7fc0_2000)), 0x7e01);
+
+        // Subnormal round-to-even ties (positive, negative, and carry to smallest normal).
+        assert_eq!(f32_to_half(2f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_half(-2f32.powi(-25)), 0x8000);
+        assert_eq!(f32_to_half(3.0 * 2f32.powi(-25)), 0x0002);
+        assert_eq!(f32_to_half(-3.0 * 2f32.powi(-25)), 0x8002);
+        assert_eq!(f32_to_half(2f32.powi(-14) - 2f32.powi(-25)), 0x0400);
     }
 }
