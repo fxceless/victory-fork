@@ -12,6 +12,26 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads: 4 unless `VICTORY_MESH_LAUNCH=0` (none then, as before). With
+/// it the host puts an amplification shader of its own in front of the
+/// mesh shader (the launch of an indirect mesh record, `victory-gpu`'s
+/// `launch`), whose payload must have the size the mesh shader declares: a
+/// mesh shader that declares none is refused with one (the RTX 5080's
+/// driver returns `E_INVALIDARG`), and one that declares a payload is still
+/// taken without an amplification shader. Read here too so that the switch
+/// is part of the shader cache's key.
+pub fn mesh_payload_bytes() -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "0")) {
+        4
+    } else {
+        0
+    }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -43,7 +63,11 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+///   host reads afterwards to make those copies for the frames to come;
+///   after them, [`MEMORY_PAGES`] dwords, one per page: a store or atomic
+///   through an address sets its page's dword to 1 (the host reads and
+///   clears them, and copies back only pages shaders wrote). The buffer is
+///   [`MEMORY_NOTES`] dwords in all.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
@@ -51,6 +75,9 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of the [`SLOT_FAULTS`] buffer in all: the fault notes, then one
+/// written flag per directory page (dword [`MEMORY_FAULTS`] + page).
+pub const MEMORY_NOTES: u32 = MEMORY_FAULTS + MEMORY_PAGES;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -176,6 +203,12 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Wide raw loads given a bounds check (`lower.rs`, `raw_dwords`).
+    #[cfg(test)]
+    pub guarded_wide_loads: u32,
+    /// Quad-local reads written through quad operations (`lower.rs`, `quad_read`).
+    #[cfg(test)]
+    pub quad_reads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -232,6 +265,10 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            guarded_wide_loads: 0,
+            #[cfg(test)]
+            quad_reads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -738,7 +775,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
