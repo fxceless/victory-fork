@@ -296,6 +296,11 @@ struct SocketAddress {
     len: i32,
 }
 
+/// More candidates than any title offers. A `SOCKET_ADDRESS_LIST`
+/// carries no size, so a count past this is the title's word alone and
+/// is refused rather than walked.
+const MAX_CONNECT_LIST: usize = 64;
+
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
@@ -311,6 +316,10 @@ pub extern "system" fn WSAConnectByList(
         // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
         let entries = unsafe {
             let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
+            if count > MAX_CONNECT_LIST {
+                wsa_error(WSAEINVAL);
+                return 0;
+            }
             std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
         };
         if !entries
@@ -894,6 +903,39 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    #[test]
+    fn a_count_the_list_cannot_hold_is_refused() {
+        // One real loopback entry; the count claims 0x7FFFFFFF follow it.
+        #[repr(C)]
+        struct List {
+            count: i32,
+            pad: i32,
+            entries: [SocketAddress; 1],
+        }
+        let sockaddr = v4(HOME, 80);
+        let list = List {
+            count: i32::MAX,
+            pad: 0,
+            entries: [SocketAddress {
+                addr: sockaddr.as_ptr(),
+                len: sockaddr.len() as i32,
+            }],
+        };
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let connected = WSAConnectByList(
+            0,
+            (&list as *const List).cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(connected, 0);
+        assert_eq!(last_error(), WSAEINVAL);
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
