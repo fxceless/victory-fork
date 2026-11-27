@@ -422,6 +422,7 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    pub(crate) quad_inputs: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -510,6 +511,7 @@ struct Lanes<'a> {
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
+    quad_inputs: HashMap<Value, Bool>,
     /// Other values read as masks: constants, uniform selects, opaque ones.
     other: Map<Key, Bool>,
     /// Pairs read as masks that `mask` does not see: carry-ins, and pairs
@@ -605,6 +607,7 @@ impl<'a> Lanes<'a> {
             derived_phis: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
+            quad_inputs: HashMap::new(),
             other: Map::default(),
             seen: Vec::new(),
             scc_lane: Map::default(),
@@ -623,6 +626,7 @@ impl<'a> Lanes<'a> {
     fn reset(&mut self) {
         self.b = Bools::new();
         self.masks.clear();
+        self.quad_inputs.clear();
         self.other.clear();
         self.seen.clear();
         self.scc_lane.clear();
@@ -839,6 +843,7 @@ impl<'a> Lanes<'a> {
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
+            quad_inputs: self.quad_inputs,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
@@ -1153,6 +1158,7 @@ impl<'a> Lanes<'a> {
                 let a = arg(0, self)?;
                 let lo = dst.or(exec_out)?.0;
                 let born = self.born(lo);
+                self.quad_inputs.insert(lo, a);
                 let q = self.b.atom(Atom::Quad(lo), born);
                 let r = self.b.or(a, q);
                 (r, Some(r))

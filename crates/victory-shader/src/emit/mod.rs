@@ -2074,6 +2074,9 @@ mod atomic_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod helper_lane_tests;
+
 #[cfg(test)]
 mod barycentric_tests {
     use super::container::SigElement;
@@ -2094,7 +2097,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -2112,6 +2115,14 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    pub(super) fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2137,7 +2148,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();

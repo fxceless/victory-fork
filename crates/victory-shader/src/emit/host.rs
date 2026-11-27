@@ -678,6 +678,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_repeated(root, pso, d, 1).map(|(out, _)| out)
+    }
+
+    pub(super) fn draw_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        repeats: u32,
+    ) -> Result<(Vec<[f32; 4]>, f64), String> {
+        assert!(repeats > 0 && (repeats == 1 || d.mesh_groups == 0));
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -914,11 +925,36 @@ impl Host {
                     }]),
                 );
             }
+            let stamps = if repeats > 1 {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                }, &mut heap).map_err(err)?;
+                let heap = heap.ok_or("timestamp query heap")?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc(16),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((heap, back))
+            } else {
+                None
+            };
             if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                list.DrawInstanced(3, 1, 0, 0);
+                for _ in 0..repeats {
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+            }
+            if let Some((heap, back)) = &stamps {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -984,7 +1020,20 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            let us = if let Some((_, back)) = stamps {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let [start, end] = *p.cast::<[u64; 2]>();
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+                if end <= start {
+                    return Err("draw timestamps did not advance".into());
+                }
+                (end - start) as f64 * 1e6 / queue.GetTimestampFrequency().map_err(err)? as f64
+                    / f64::from(repeats)
+            } else {
+                0.0
+            };
+            Ok((out, us))
         }
     }
 }
