@@ -88,6 +88,7 @@ impl<'a> Lower<'a> {
         std::mem::swap(&mut self.handles, &mut t.handles);
         std::mem::swap(&mut self.strides, &mut t.strides);
         std::mem::swap(&mut self.clane, &mut t.clane);
+        std::mem::swap(&mut self.partial_active, &mut t.partial_active);
         self.upper = !self.upper;
     }
 
@@ -518,8 +519,15 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let c = self.cur;
+        let entry = self.x.st.active.contains(&mask);
         let [lo, hi] = self.both(|l| {
-            let on = l.boolean(m, c)?;
+            let mut on = l.boolean(m, c)?;
+            // (EXEC on entry leaves out the threads past a DispatchX count, each lane's own)
+            if let Some(active) = l.partial_active
+                && entry
+            {
+                on = l.s.m.bin(c, Bin::And, on, active);
+            }
             let x = l.i32_of(src)?;
             let id = l.s.m.i32(ident);
             Ok(l.s.m.select(c, on, x, id))
