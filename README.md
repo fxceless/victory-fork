@@ -597,7 +597,7 @@ What did it, on top of the list below:
   the in-flight fetch (#648) on as well; do not combine the two. The
   in-flight fetch itself measured slower here in two runs and stays off.
 - Frame rate, second night (an RTX 4070; the first room went from about
-  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  3.5-4 to 6-7 frames a second with the switches below combined; the
   defaults are unchanged and give about 4.5-5):
   - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
     thread of the layer, not by the title's render thread, which a
@@ -620,6 +620,15 @@ What did it, on top of the list below:
     reused instead of made and freed every frame.
   - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
     the layer; it is how the above was found.
+  - On an RTX 5060 with 8 GB,
+    [issue #912](https://github.com/fxceless/victory-fork/issues/912) reports
+    4.2-4.7 frames a second in the same room with
+    `VICTORY_RELAY=2 VICTORY_INDIRECT_WINDOW=1` and 1.2-1.7 with the
+    combined async submit, copy queue, texture no-wait and merge switches
+    added. To isolate a switch, compare one change at a time in the same
+    scene with the same cache, after the
+    pipeline compile queue has drained. Keep the inexact merge settings
+    out of the baseline.
 - Frame rate, third session: measuring first (same RTX 4070, first room).
   - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
     frame's length, and for the usual frame and each long one what it was
