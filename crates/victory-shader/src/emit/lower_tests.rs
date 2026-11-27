@@ -849,3 +849,36 @@ fn the_builders_prefix_sum_lowers_and_validates_as_a_spilled_dispatch_x_program(
         v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
     }
 }
+
+#[test]
+fn scalar_bit_searches_lower() {
+    // The searches and zero counts (TuxBox 1a50eb9): each result is
+    // compared and branched on, so the value has to be built.
+    let tail = [
+        0xBF07_8010, // s_cmp_lg_u32 s16, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE84_0380, // s_mov_b32 s4, 0
+        S_ENDPGM,
+    ];
+    let heads: [(&[u32], &str); 3] = [
+        (&[0xBE90_1600], "s_flbit_i32_b64"), // s16, s[0:1]
+        (&[0xBE90_1200], "s_ff0_i32_b64"),   // s16, s[0:1]
+        (&[0xBE90_1100], "s_ff0_i32_b32"),   // s16, s0
+    ];
+    for (head, name) in heads {
+        let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+        lowers(&words, 0).unwrap();
+        // The encodings above name s16 as the destination and s0 as the
+        // source; a two-dword source starts at the even register 0.
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let inst = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == name)
+            .unwrap_or_else(|| panic!("{name} decoded"));
+        assert!(inst.write(crate::ir::Reg::S(16)).is_some(), "{name}");
+        assert!(inst.read(crate::ir::Reg::S(0)).is_some(), "{name}");
+    }
+}

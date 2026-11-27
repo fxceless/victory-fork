@@ -5446,6 +5446,51 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                // Ported from TuxBox (brcly, Apache-2.0) 1a50eb9, which restores
+                // the same families (see NOTICE). None of them writes SCC.
+                "s_flbit_i32_b64" => {
+                    // From the top: the first set bit of the high word, else
+                    // 32 past the low word's own, -1 for a zero pair.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let flbit = |l: &mut Self, x: V| {
+                        l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[x])
+                    };
+                    let (fl, fh) = (flbit(self, a), flbit(self, b));
+                    let k32 = self.s.m.i32(32);
+                    let fl = self.s.m.bin(c, Bin::Add, fl, k32);
+                    let (z, ones) = (self.s.m.i32(0), self.s.m.i32(u32::MAX));
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, low, fl, ones);
+                    let r = self.s.m.select(c, high, fh, r);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The first zero bit from the bottom: the lowest set bit of
+                    // the complement, -1 when both words are all ones.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ones = self.s.m.i32(u32::MAX);
+                    let (na, nb) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let ff1 = |l: &mut Self, x: V| {
+                        l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[x])
+                    };
+                    let (fa, fb) = (ff1(self, na), ff1(self, nb));
+                    let k32 = self.s.m.i32(32);
+                    let fb = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let (z, none) = (self.s.m.i32(0), self.s.m.i32(u32::MAX));
+                    let low = self.s.m.cmp(c, pred::NE, na, z);
+                    let high = self.s.m.cmp(c, pred::NE, nb, z);
+                    let r = self.s.m.select(c, high, fb, none);
+                    let r = self.s.m.select(c, low, fa, r);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -5610,6 +5655,17 @@ impl<'a> Lower<'a> {
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_ff0_i32_b32" => {
+                // Ported from TuxBox (brcly, Apache-2.0) 1a50eb9: the first
+                // zero bit is the lowest set bit of the complement.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let n = self.s.m.bin(c, Bin::Xor, a, ones);
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[n]);
                 (r, None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
