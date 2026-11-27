@@ -234,32 +234,49 @@ pub fn here(h: H, n: u64) {
 /// one of a lower efficiency class than the best. Always false where all
 /// cores are alike.
 pub fn on_slow_core() -> bool {
-    use windows_sys::Win32::System::Threading::GetCurrentProcessorNumber;
-    /// By logical processor (of group 0): whether it is slow.
-    static SLOW: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessorNumberEx;
+    /// A bit mask of slow processors for each processor group.
+    static SLOW: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let slow = SLOW.get_or_init(|| {
-        let sets = cpu_sets();
-        let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-        let mut slow = vec![false; sets.iter().map(|c| c.1 as usize + 1).max().unwrap_or(0)];
-        for (_, processor, class) in &sets {
-            slow[*processor as usize] = *class < best;
-        }
+        let sets = cpu_sets(None);
+        let slow = slow_core_masks(&sets);
         tracing::info!(
             "processors: {} logical, {} of them slow ones (a lower efficiency class than the best); the frame log counts how \
              often the render, submit and recording threads are found on a slow one",
-            slow.len(),
-            slow.iter().filter(|&&s| s).count()
+            sets.len(),
+            slow.iter().map(|mask| mask.count_ones()).sum::<u32>()
         );
         slow
     });
-    // SAFETY: a plain query.
-    let processor = unsafe { GetCurrentProcessorNumber() } as usize;
-    slow.get(processor).copied().unwrap_or(false)
+    let mut processor = PROCESSOR_NUMBER::default();
+    // SAFETY: a plain query into a valid out parameter.
+    unsafe { GetCurrentProcessorNumberEx(&mut processor) };
+    slow.get(usize::from(processor.Group))
+        .is_some_and(|mask| mask & (1u64 << processor.Number) != 0)
 }
 
-/// The system's processor sets of group 0: each one's id, its logical
-/// processor and its efficiency class (higher is faster).
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+struct CpuSet {
+    id: u32,
+    group: u16,
+    number: u8,
+    class: u8,
+}
+
+fn slow_core_masks(sets: &[CpuSet]) -> Vec<u64> {
+    let Some(best) = sets.iter().map(|set| set.class).max() else {
+        return Vec::new();
+    };
+    let groups = sets.iter().map(|set| usize::from(set.group) + 1).max().unwrap_or(0);
+    let mut masks = vec![0; groups];
+    for set in sets.iter().filter(|set| set.class < best) {
+        masks[usize::from(set.group)] |= 1u64 << set.number;
+    }
+    masks
+}
+
+/// The system's processor sets, optionally limited to one processor group.
+fn cpu_sets(group: Option<u16>) -> Vec<CpuSet> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -278,8 +295,13 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
         }
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
-        if set.Group == 0 {
-            sets.push((set.Id, set.LogicalProcessorIndex, set.EfficiencyClass));
+        if group.is_none_or(|group| set.Group == group) {
+            sets.push(CpuSet {
+                id: set.Id,
+                group: set.Group,
+                number: set.LogicalProcessorIndex,
+                class: set.EfficiencyClass,
+            });
         }
         at += info.Size as usize;
     }
@@ -309,9 +331,9 @@ pub fn keep_on_fast_cores(what: &str) {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_FAST_CORES").is_none_or(|v| v != "0")) {
         return;
     }
-    let sets = cpu_sets();
-    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-    let fast: Vec<u32> = sets.iter().filter(|c| c.2 == best).map(|c| c.0).collect();
+    let sets = cpu_sets(Some(0));
+    let best = sets.iter().map(|set| set.class).max().unwrap_or(0);
+    let fast: Vec<u32> = sets.iter().filter(|set| set.class == best).map(|set| set.id).collect();
     // All alike (or nothing known): nothing to ask for.
     if fast.is_empty() || fast.len() == sets.len() {
         return;
@@ -338,9 +360,9 @@ pub fn keep_on_fast_cores(what: &str) {
 /// were busy while the title's recording calls took three times as long.
 pub fn keep_on_slow_cores(what: &str) -> bool {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
-    let sets = cpu_sets();
-    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
-    let slow: Vec<u32> = sets.iter().filter(|c| c.2 < best).map(|c| c.0).collect();
+    let sets = cpu_sets(Some(0));
+    let best = sets.iter().map(|set| set.class).max().unwrap_or(0);
+    let slow: Vec<u32> = sets.iter().filter(|set| set.class < best).map(|set| set.id).collect();
     if slow.len() < 8 {
         return false;
     }
@@ -784,6 +806,19 @@ fn kinds(frames: &[Frame]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_core_samples_keep_processor_groups_separate() {
+        let sets = [
+            CpuSet { id: 10, group: 0, number: 0, class: 0 },
+            CpuSet { id: 11, group: 0, number: 1, class: 1 },
+            CpuSet { id: 20, group: 2, number: 0, class: 1 },
+            CpuSet { id: 21, group: 2, number: 63, class: 0 },
+        ];
+        assert_eq!(slow_core_masks(&sets), [1, 0, 1 << 63]);
+        assert!(slow_core_masks(&[]).is_empty());
+        assert_eq!(slow_core_masks(&sets[1..3]), [0, 0, 0]);
+    }
 
     fn frame(number: u64, ms: f64) -> Frame {
         let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
