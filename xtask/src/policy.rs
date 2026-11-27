@@ -60,9 +60,20 @@ fn run_log(path: &str) -> Option<bool> {
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
+    (b"\x7FELF", "ELF binary"),
     (b"DXBC", "shader container"),
+    (b"FSSM", "Xbox FSSM shader binary"),
+    (b"SGD5", "SGD5 shader archive"),
+    (b"\x03\x02\x23\x07", "SPIR-V shader binary"),
+    (b"RPF7", "RAGE packfile (RPF7)"),
+    (b"RPF8", "RAGE packfile (RPF8)"),
+    (b"RPF9", "RAGE packfile (RPF9)"),
+    (b"RSC7", "RAGE resource (RSC7)"),
+    (b"RSC8", "RAGE resource (RSC8)"),
     (b"DDS ", "DDS texture"),
     (b"RIFF", "RIFF (audio/video)"),
+    (b"BKHD", "Wwise soundbank"),
+    (b"OggS", "Ogg audio"),
     (b"BC\xC0\xDE", "LLVM bitcode"),
     (b"Microsoft C/C++ MSF", "PDB"),
     (b"!<arch>", "library archive"),
@@ -89,9 +100,25 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
             }
             out.stdout
         } else {
-            match std::fs::read(root.join(path)) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let full = root.join(path);
+            match std::fs::symlink_metadata(&full) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    violations.push(format!("{path}: symbolic link not allowed in repository"));
+                    continue;
+                }
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => match std::fs::read(&full) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        violations.push(format!("{path}: cannot read file: {err}"));
+                        continue;
+                    }
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    violations.push(format!("{path}: cannot inspect file: {err}"));
+                    continue;
+                }
             }
         };
         for problem in check(path, &content) {
@@ -156,7 +183,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         .into_iter()
         .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_file() || e.file_type().is_symlink())
         .filter_map(|e| {
             e.path()
                 .strip_prefix(root)
@@ -215,6 +242,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
+    } else if std::str::from_utf8(content).is_err() {
+        problems.push("binary or non-UTF-8 content".to_owned());
     } else if let Some(run) = longest_encoded_run(content)
         && run > MAX_ENCODED_RUN
     {
@@ -285,5 +314,42 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_game_archive_magics_and_non_utf8_binary_without_nuls() {
+        for magic in [
+            b"RPF9header".as_slice(),
+            b"SGD5header".as_slice(),
+            b"RSC7header".as_slice(),
+            b"FSSMheader".as_slice(),
+            b"BKHDheader".as_slice(),
+            b"\x03\x02\x23\x07spirv".as_slice(),
+        ] {
+            assert!(
+                !check("notes.txt", magic).is_empty(),
+                "expected magic {magic:?} to be rejected even in .txt"
+            );
+        }
+        // Raw binary bytes without any NUL byte must still be rejected as non-UTF-8.
+        assert!(!check("notes.txt", &[0xFF, 0xFE, 0x80, 0x90]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_in_tree() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "victory-xtask-policy-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("dangling.txt");
+        symlink(dir.join("missing-target"), &link).unwrap();
+        let res = super::run(&dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_err(), "dangling symlink in tree must fail policy");
     }
 }
