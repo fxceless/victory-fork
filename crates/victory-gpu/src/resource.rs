@@ -1121,6 +1121,8 @@ struct Resource {
     /// access, the colour texture shaders write instead ([`Twin`]).
     #[cfg(windows)]
     host: Hosted,
+    #[cfg(windows)]
+    fsr_output: std::sync::OnceLock<Option<Box<crate::ffx::rgb9e5::Output>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1389,7 +1391,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, r.data() as usize, true).ok()
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1403,7 +1409,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => host_texture(&r.desc, r.host.state, clear, r.data() as usize),
         };
         let texture = match texture {
             Ok(texture) => texture,
@@ -2097,6 +2103,33 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+#[cfg(windows)]
+pub(crate) fn rgb9e5_fsr_output(this: This) -> Option<&'static crate::ffx::rgb9e5::Output> {
+    let resource = resource(this);
+    if !resource.desc.rgb9e5_fsr_candidate() {
+        return None;
+    }
+    let texture = host_copy(this)?;
+    resource
+        .fsr_output
+        .get_or_init(|| crate::ffx::rgb9e5::Output::new(&texture.texture).map(Box::new))
+        .as_deref()
+}
+
+#[cfg(windows)]
+impl ResourceDesc {
+    fn rgb9e5_fsr_candidate(&self) -> bool {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        self.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
+            && self.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32
+            && self.depth_or_array_size == 1
+            && self.mip_levels == 1
+            && self.sample_count == 1
+            && self.flags & 0xf == 0x5
+    }
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2143,8 +2176,9 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    title_address: usize,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
-    host_texture_as(desc, state, clear, false)
+    host_texture_as(desc, state, clear, title_address, false)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2154,9 +2188,11 @@ fn host_texture_as(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    title_address: usize,
     reserved: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return Err(NoTexture::Refused);
@@ -2209,56 +2245,91 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
-        // The card's own layout of 64 KiB tiles, which a reserved texture
-        // must have.
+    if reserved {
+        // Reserved textures use the card's own layout of 64 KiB tiles.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
-        // SAFETY: as below; a texture the title fills has no clear value.
-        unsafe {
-            host.device.CreateReservedResource(
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                None,
-                &mut texture,
-            )
-        }
-    } else {
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
-        }
-    };
-    if let Err(e) = made {
-        let why = no_texture(e.code().0);
-        // Out of room may come back each second for many textures: its
-        // first and then every power-of-two-th line only.
-        static NO_ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = (why == NoTexture::ForNow)
-            .then(|| NO_ROOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
-        if n.is_none_or(u64::is_power_of_two) {
-            tracing::warn!(error = %e, desc = ?d, reserved, ?why, times = n, "no host texture");
-        }
-        return Err(why);
     }
-    let texture = texture.ok_or(NoTexture::Refused)?;
-    crate::host::name(&texture, || {
-        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-    });
-    Ok(texture)
+    let allocate = |d: &ResourceDesc, clear: Option<&[u32; 5]>| {
+        let mut texture: Option<ID3D12Resource> = None;
+        let state = D3D12_RESOURCE_STATES(
+            crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+        );
+        // SAFETY: the description and clear value have the host layout.
+        let made = unsafe {
+            if reserved {
+                host.device.CreateReservedResource(
+                    std::ptr::from_ref(d).cast(),
+                    state,
+                    None,
+                    &mut texture,
+                )
+            } else {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(d).cast(),
+                    state,
+                    clear.map(|v| std::ptr::from_ref(v).cast()),
+                    &mut texture,
+                )
+            }
+        };
+        if let Err(error) = made {
+            let why = no_texture(error.code().0);
+            // Out of room is retryable and may be reported for many textures.
+            static NO_ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = (why == NoTexture::ForNow)
+                .then(|| NO_ROOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+            if n.is_none_or(u64::is_power_of_two) {
+                tracing::warn!(%error, desc = ?d, title_address, reserved, ?why, times = n, "no host texture");
+            }
+            return Err(why);
+        }
+        let texture = texture.ok_or(NoTexture::Refused)?;
+        crate::host::name(&texture, || {
+            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+        });
+        Ok(texture)
+    };
+
+    if !reserved && d.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
+        && desc.rgb9e5_fsr_candidate() && crate::ffx::enabled()
+    {
+        static WRITABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let writable = *WRITABLE.get_or_init(|| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+                ..Default::default()
+            };
+            // SAFETY: the feature selector matches the initialized structure.
+            let query = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            let rtv = support.Support1.contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+            let typed_uav = support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+            let typed_store = support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            tracing::info!(result = ?query.map_err(|e| e.code()), rtv, typed_uav, typed_store, "RGB9E5 host format support");
+            rtv && typed_uav && typed_store
+        });
+        if !writable {
+            use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+            static WRITABLE_REJECTED: AtomicBool = AtomicBool::new(false);
+            if !WRITABLE_REJECTED.load(Relaxed) {
+                match allocate(&d, clear_value.as_ref()) {
+                    Ok(texture) => return Ok(texture),
+                    Err(NoTexture::ForNow) => return Err(NoTexture::ForNow),
+                    Err(NoTexture::Refused) => WRITABLE_REJECTED.store(true, Relaxed),
+                }
+            }
+            d.flags = 0;
+            return allocate(&d, None);
+        }
+    }
+    allocate(&d, clear_value.as_ref())
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2401,6 +2472,8 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
         },
+        #[cfg(windows)]
+        fsr_output: std::sync::OnceLock::new(),
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
