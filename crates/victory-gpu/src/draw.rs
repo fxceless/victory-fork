@@ -1082,6 +1082,16 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// `VICTORY_BVH_DRY=1` (diagnostics): the structure builder's dispatches
+/// are bound as usual (host copies made ready, shader writes declared) and
+/// then not run, to tell what the builder's own writes do from what the
+/// rest of its machinery does.
+#[cfg(feature = "diagnostics")]
+fn builder_dry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_DRY").is_some_and(|v| v == "1"))
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -1528,7 +1538,10 @@ impl State {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
-        // The title address of the buffer view at that dword of the table.
+        // The title address of the buffer or ray-tracing structure view at
+        // that dword of the table, as for a view the shader picks from the
+        // heap (`SLOT_VIEW_ADDRESSES`): the programs that walk structures
+        // take the structure's address out of its view.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
                 .and_then(|view| crate::descriptor::host::view_address(&view))
@@ -1548,20 +1561,26 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool, srvs: &[u8]) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
+        let (mut addresses, mut constants, mut records) = (Vec::new(), Vec::new(), Vec::new());
+        for (slot, root) in self.roots_ref(compute).iter().enumerate() {
             match root {
-                Root::View(address) => addresses.push(*address),
+                Root::View(address) => {
+                    addresses.push(*address);
+                    // (the title's root SRVs the shader reads: records it may take addresses from)
+                    if u8::try_from(slot).is_ok_and(|s| srvs.contains(&s)) {
+                        records.push(*address);
+                    }
+                }
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::ready(list, heap, &addresses, &constants, &records, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -1753,9 +1772,10 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by; its
+            // copies declared written only for a shader that can store there.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, writes && t.stores_by_address, &t.host.root_srvs) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1809,6 +1829,37 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
                             }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the view heap's table of view addresses.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.addresses());
+                        match table {
+                            Some((gpu, buffer)) => {
+                                // The list may outlive the title's heap
+                                // object, which owns the table.
+                                const ONCE: usize = usize::MAX - 0x5f;
+                                if list.first_use(ONCE) {
+                                    list.keep(buffer);
+                                }
+                                // SAFETY: an open list; the list holds the table.
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, gpu);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                                    }
+                                }
+                            }
+                            None => once!("a shader takes view addresses from a view heap that is not set"),
                         }
                         continue;
                     }
@@ -1875,6 +1926,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                #[cfg(feature = "diagnostics")]
+                if slot == victory_shader::emit::SLOT_LOOPS {
+                    // Ours: where the program counts lanes that reached a
+                    // loop's limit (`crate::loop_notes`).
+                    let Some(gpu) = crate::loop_notes::address(&stage.shader) else {
+                        once!("loop notes without their buffer: the draw is dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the
+                    // process.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3355,6 +3425,91 @@ impl State {
         list.segments_dispatched();
     }
 
+    /// With the builder's trace (`crate::bvhtrace`): a dispatch of the
+    /// structure builder or of another program that reaches title memory by
+    /// address, with its root arguments and the first bytes of title memory
+    /// at each root view.
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline, what: impl FnOnce() -> String) {
+        use std::fmt::Write;
+        if !crate::bvhtrace::on() {
+            return;
+        }
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let by_address = p
+            .stages
+            .iter()
+            .any(|s| s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY));
+        if !builder && !by_address {
+            return;
+        }
+        if builder {
+            crate::bvhtrace::arm();
+            // What a stage reads from list upload memory (`crate::list::upload`,
+            // or the heap past it), as it stands when the list is submitted:
+            // the builder fills it after recording.
+            let hash = p.stages.first().map_or(String::new(), |s| s.shader.hash.clone());
+            let headers = crate::bvhtrace::header_stage() == Some(hash.as_str());
+            let count = self.compute.iter().find_map(|r| match r {
+                Root::Constants(v) => v.first().copied(),
+                _ => None,
+            });
+            let upload = crate::list::upload::span();
+            let in_upload = |a: u64| a >= 1 << 40 || upload.is_some_and(|(start, len)| (start..start + len).contains(&a));
+            for root in &self.compute {
+                if let Root::View(a) = *root
+                    && in_upload(a)
+                {
+                    let hash = hash.clone();
+                    list.defer_host(move || {
+                        crate::bvhtrace::line(|| format!("R {hash} {a:#x} [{}]", crate::bvhtrace::peek(a, 160)));
+                        if headers && let Some(count) = count {
+                            crate::bvhtrace::headers_named(a, count);
+                        }
+                    });
+                }
+            }
+            // A pre-built structure rebuilt in place from its header, at the
+            // stage's root view 1 (`crate::bvhtrace::rebuild_stage`).
+            if crate::bvhtrace::rebuild_stage() == Some(hash.as_str())
+                && let Some(&Root::View(header)) = self.compute.get(1)
+            {
+                crate::bvhtrace::rebuilt_named(header);
+            }
+        }
+        crate::bvhtrace::line(|| {
+            let hash = p.stages.first().map_or("?", |s| s.shader.hash.as_str());
+            let mut text = format!(
+                "D {:#x} {} {hash} {}",
+                std::ptr::from_ref(list) as usize,
+                if builder { "B" } else { "M" },
+                what()
+            );
+            for (slot, root) in self.compute.iter().enumerate() {
+                match root {
+                    Root::None => {}
+                    Root::Table(a) => {
+                        let _ = write!(text, " | {slot}=table {a:#x}");
+                    }
+                    Root::Constants(v) => {
+                        let _ = write!(text, " | {slot}=constants {}", crate::bvhtrace::hex(&v.iter().flat_map(|d| d.to_le_bytes()).collect::<Vec<u8>>()));
+                    }
+                    Root::View(a) => {
+                        let _ = write!(text, " | {slot}=view {a:#x}");
+                        match crate::shadow::extent(*a) {
+                            Some((start, len)) => {
+                                let _ = write!(text, " in {start:#x}+{len:#x}");
+                            }
+                            None => text.push_str(" in no buffer"),
+                        }
+                        let _ = write!(text, " [{}]", crate::bvhtrace::peek(*a, 64));
+                    }
+                }
+            }
+            text
+        });
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.dispatch_x(list, x, y, z, 0);
@@ -3455,6 +3610,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.trace_dispatch(list, p, || format!("{x}x{y}x{z}"));
+        #[cfg(feature = "diagnostics")]
+        if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -4870,6 +5031,22 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.trace_dispatch(list, p, || {
+                format!(
+                    "indirect max {max} at {arguments:#x} [{}] count {:?}",
+                    crate::bvhtrace::peek(arguments, 12),
+                    count.map(|c| crate::bvhtrace::peek(c, 4))
+                )
+            });
+        }
+        #[cfg(feature = "diagnostics")]
+        if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
+            // (The list knows where the clamp left the records: nothing to
+            // give back when they are not read.)
+            return true;
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -5510,5 +5687,30 @@ mod tests {
         assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
         // No thread along an axis: nothing runs.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+
+    /// A program that walks a ray-tracing structure takes the structure's
+    /// address out of its view at a fixed place of a table: the host gives
+    /// it the address the view's description holds (the view has no
+    /// resource, so a buffer's range gave 0, and every walk ended at an
+    /// empty root before its first node test).
+    #[test]
+    fn a_structure_view_in_a_table_gives_the_structure_address() {
+        use victory_shader::emit::USER_VIEW_ADDRESS;
+        let null = std::ptr::null();
+        let mut table = vec![0u64; 4 * 2]; // two 32-byte slots
+        let base = table.as_mut_ptr() as u64;
+        let mut desc = [0u32; 10];
+        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        // (the union begins on 8 bytes: the location is words 4 and 5)
+        desc[4] = 0x2345_6700;
+        desc[5] = 0x12;
+        crate::descriptor::create_srv(null, null, &desc, base + 32);
+        let mut state = State::default();
+        state.compute = vec![Root::None, Root::Table(base)];
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 8, None), 0x2345_6700);
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS + 1, 1, 8, None), 0x12);
+        // An empty slot, as before: 0.
+        assert_eq!(state.host_word(true, USER_VIEW_ADDRESS, 1, 0, None), 0);
     }
 }

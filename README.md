@@ -794,6 +794,11 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, on by default and slow: the game's own structure-builder programs translate and run, title memory can be read and written by raw address from shaders (with written-page notes), the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and ray-traced shadows and light show in game since 2026-11-27, at 0.2 to 3 frames a second. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Mesh programs whose outputs pass D3D12's 32 KiB as translated alone (71: pedestrian, vehicle and prop transforms) are linked with the pixel program of each pipeline, so that the mesh program writes only what that program reads (`VICTORY_MESH_LINK=0` turns it off). Offline, 710 such pairs link, validate and get a pipeline.
+- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 → 2.4 ms a frame).
+- Geometry programs (the 195 voxelization stages) run as host geometry shaders between the container's vertex program and the pixel program: the console keeps their input and output vertices in LDS rings, which the translator follows to the vertices and dwords they hold. All 195 validate offline and get a pipeline on WARP; no run has drawn with one yet. A mesh program over 32 KiB drawn without a pixel program (the title draws depth with mesh programs alone) keeps its system values only. Offline (CPU census, `victory translate --validate`), 25,948 of 25,953 programs translate and validate; the rest are five ray-trace programs.
+- Loops as the console runs them: a loop whose code fixes its count runs to its end whatever the limit (the environment BRDF tables integrated a half or a quarter of their samples), and a loop closed by a jump is left at its exit at the limit. Limits per stage, and `VICTORY_LOOP_NOTES=1` counts the lanes that reach them.
+- Wave64 compute programs on 32-lane GPUs: those that use their wave values only to allocate run as two host waves of their own (`VICTORY_WAVE_SPLIT=0` turns it off; the costliest, 2.8 ms a frame of card time in the exchange form), and the paired form reads a guarded write without its select where only lanes inside the guard read it (`VICTORY_WAVE_RAW=0` turns it off; 30 % fewer host instructions in the paired programs).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -865,7 +870,7 @@ What each part does today and what it still needs:
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, the ray-tracing builder's shaders; geometry stages translate but no run has drawn with one; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
@@ -950,7 +955,18 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops whose end the data decides stop after `n` iterations per lane instead of their stage's limit (own shader cache entries); `pixel:<n>,vertex:<n>,compute:<n>,trace:<n>` (any of them) for those stages alone; if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it (or, without a pixel program, of the mesh program with its system values only) |
+| `VICTORY_WAVE_PAIRS=0` | no paired form for console wave64 compute programs (on by default where the host's widest wave is under 64 lanes; `=1` on everywhere) |
+| `VICTORY_WAVE_SPLIT=0` | wave64 compute programs that use their wave values only to allocate take the forms they took before (two host waves meeting at group barriers, or the paired form), not two host waves of their own (own shader cache entries) |
+| `VICTORY_WAVE_RAW=0` | the paired form selects every guarded write, as before, also where only lanes inside the guard read it (own shader cache entries) |
+| `VICTORY_CARD_TITLE_COPIES=0` | a title copy whose source the list's shaders wrote by address is done at submission, as before, not on the card behind them (the structure builder's sizes) |
+| `VICTORY_REMAP_LAND=0` | a remap of title memory does not wait for the flights whose declared writes touch its range |
+| `VICTORY_BVH_TRACE=<file>` | a line per event of the ray-tracing structure builder: its dispatches and those of programs that reach title memory by address, the upload memory they read, every range put back into title memory, page mappings and copies (unbuffered; diagnostics builds) |
+| `VICTORY_BVH_CHECK=<hash>[,<hash>]` | with the trace, walks the structures the header stage (and the in-place rebuild's header stage) start, once their headers are put back, and reports bad nodes (`V` lines) |
+| `VICTORY_BVH_DRY=1` | the builder's dispatches are bound (copies made ready, writes declared) and not run (diagnostics builds) |
+| `VICTORY_CRASH_MEMORY=1` | a crash report adds the title memory around each register that holds a title address, and one pointer further |
+| `VICTORY_LOOP_NOTES=1` | translated loops count the lanes that reach their limit (own shader cache entries); every five seconds the log names the programs and loops whose counts grew (`loop notes:` lines; helper lanes of pixel shaders are never counted) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

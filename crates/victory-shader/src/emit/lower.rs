@@ -17,13 +17,32 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, DRIVER, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+
+/// Descriptors whose dwords the code reads as numbers (`descriptor_data`), a child module so it
+/// shares the emitter's state.
+#[path = "descriptor_data.rs"]
+mod descriptor_data;
+
+/// The iteration limit of translated loops and the loop notes, a child module so it shares the
+/// emitter's state.
+#[path = "loops.rs"]
+mod loops;
+#[cfg(test)]
+pub(super) use loops::TEST_NOTES;
+pub(super) use loops::{COMPUTE_LOOP_LIMIT, PIXEL_LOOP_LIMIT, TRACE_LOOP_LIMIT, VERTEX_LOOP_LIMIT};
+use loops::notes_on;
+
+/// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
+/// module so it shares the emitter's state.
+#[path = "float64.rs"]
+mod float64;
 
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
@@ -39,6 +58,15 @@ pub(super) use paired::{accesses_lds, supports_paired_lds};
 /// child module so it shares the emitter's state (fork pull request #646).
 #[path = "dispatch_threads.rs"]
 mod dispatch_threads;
+
+/// The paired form's guarded writes read without their guard where only lanes inside it read
+/// them, a child module so it shares the emitter's state.
+#[path = "guarded.rs"]
+mod guarded;
+/// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
+/// emitter's state.
+#[path = "rings.rs"]
+mod rings;
 
 type Why = &'static str;
 
@@ -76,6 +104,9 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// How a console wave64 compute program was run on a host of 32-lane waves
+    /// ([`super::forms`]), empty otherwise.
+    pub form: &'static str,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -328,15 +359,39 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
+    /// Loop headers' iteration counters (see [`PIXEL_LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    /// Loops whose code fixes how often they go round again
+    /// (`trip::constant_passes`), by header IR block.
+    passes: HashMap<usize, u32>,
+    /// Counted loops that go round by jumps back alone, innermost first: the
+    /// header and the blocks of the loop ([`Self::jump_loop_exit`]).
+    jump_loops: Vec<(usize, Vec<bool>)>,
+    /// The program tests rays against tree nodes (`image_bvh*`): its loops
+    /// are cut at [`TRACE_LOOP_LIMIT`].
+    traces: bool,
     twin: Option<Box<LaneState>>,
     upper: bool,
     lds_last: Option<bool>,
     lane_scalars: HashSet<Value>,
+    /// The paired form: what guarded writes computed before their guard, for readers under a
+    /// guard that implies it ([`guarded`]); the guard of the instruction being lowered when
+    /// its sources may be read so; the searches of those implications.
+    raw: guarded::Raws,
+    raw_use: Option<(Bool, V)>,
+    raw_meets: crate::structure::Meets,
+    /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
+    /// With loop notes ([`super::loop_notes`]): each counted loop's number in
+    /// its program's notes (`shader::SLOT_LOOPS`), by header IR block.
+    notes: Option<HashMap<usize, u32>>,
+    /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
+    /// is left out (empty when not linking).
+    drop_in: Vec<bool>,
+    drop_out: Vec<bool>,
+    /// A geometry program's vertices so far ([`rings`]).
+    emitted: rings::Emitted,
 }
 
 #[derive(Default)]
@@ -352,16 +407,10 @@ struct LaneState {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
+    /// The lane's own guard against a `DispatchX` thread count ([`Lower::partial_active`]).
+    partial_active: Option<V>,
+    raw: guarded::Raws,
 }
-
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -389,6 +438,9 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+/// A descriptor joined from the ways into a block, where one of them brings what a heap index
+/// cannot stand for (an immediate sampler, say), or comes from later in the program.
+pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -604,23 +656,6 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     same
 }
 
-/// What a register value holds, for [`wave_local`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wave {
-    /// Nothing that depends on how the threads are divided into waves.
-    Plain,
-    /// The number of the wave's first lane in a mask (`s_ff1`).
-    First,
-    /// A reduction over the wave's lanes: a count, a sum, a minimum...
-    Total(super::wave::Op),
-    /// A count or sum over the lanes below this one.
-    Prefix,
-    /// Derived from what a first-lane atomic returned: the slots the wave reserved.
-    Base,
-    /// A mix the idiom does not make.
-    Mixed,
-}
-
 pub(super) fn crosses_halves(p: &Program, st: &Structured) -> bool {
     p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
         let n = i.name();
@@ -630,303 +665,6 @@ pub(super) fn crosses_halves(p: &Program, st: &Structured) -> bool {
             // `ds_bpermute` reads within its own 32-lane half (Belobug #363).
             || reads_mask_as_data(st, i)
     }) || lane_constant_masks(st) || !st.wide.is_empty()
-}
-
-/// Whether a console wave64 program may run with each host wave as a wave of its own
-/// ([`with_local_waves`]): its wave-wide values are used only as the allocation idiom uses
-/// them, which does not care how the threads are divided into waves. A first-lane number only
-/// picks the first lane; a count or sum only goes into that lane's atomic on a shared counter;
-/// a prefix only goes onto the base that atomic returned; the first lane does nothing else.
-/// Anything else done with them takes one wave to be the whole thread group (a tile's result,
-/// say) and is refused, with the offset and what was found.
-/// Lane masks read as numbers by other instructions and lane reads outside whole-wave sections
-/// are stopped by the lowering itself.
-// shortcut: `v_readfirstlane` of a value that differs between lanes is taken as it is (this
-// host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
-// the only mix of old and new lanes that is looked at.
-pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
-    use super::wave::{Op, Shape};
-    const FIRST: Why = "a wave's first-lane number used as data";
-    const TOTAL: Why = "a count or sum over the wave used as data";
-    const PREFIX: Why = "a count or sum over the lanes below used without a reserved base";
-    const MIXED: Why = "a value that depends on the wave on some paths only";
-    const EFFECT: Why = "a write by the wave's first lane other than its reservation";
-    fn of(kind: &HashMap<Value, Wave>, v: Option<Value>) -> Wave {
-        v.and_then(|v| kind.get(&v).copied()).unwrap_or(Wave::Plain)
-    }
-    fn put(kind: &mut HashMap<Value, Wave>, v: Value, k: Wave) {
-        if k == Wave::Plain {
-            kind.remove(&v);
-        } else {
-            kind.insert(v, k);
-        }
-    }
-    let wild = |k: Wave| !matches!(k, Wave::Plain | Wave::Base);
-    let why = |k: Wave| match k {
-        Wave::First => FIRST,
-        Wave::Total(_) => TOTAL,
-        Wave::Prefix => PREFIX,
-        _ => MIXED,
-    };
-    // a mask (by its low dword) under which only a wave's first lane runs
-    let first_mask = |firsts: &HashSet<Value>, m: Option<Value>| {
-        m.and_then(|m| st.masks.get(&m)).is_some_and(|&b| {
-            st.bools
-                .support(b)
-                .iter()
-                .any(|a| matches!(a, Atom::Lane(v) if firsts.contains(v)))
-        })
-    };
-    // One instruction outside a section: the kind of what it writes, and whether it is a
-    // first lane's reservation.
-    let step = |inst: &Inst, kind: &HashMap<Value, Wave>, firsts: &mut HashSet<Value>| -> Result<(Wave, bool), Why> {
-        let name = inst.name();
-        let val = |op: &Operand| match *op {
-            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
-            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
-            _ => None,
-        };
-        let ops: Vec<Operand> = match &inst.fields {
-            Fields::Valu(v) => v.src.clone(),
-            Fields::Sop { dst, src, .. } => {
-                let mut o = src.clone();
-                if matches!(name, "s_addk_i32" | "s_mulk_i32") {
-                    o.extend(dst.iter().copied());
-                }
-                o
-            }
-            Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
-                data.iter().copied().collect()
-            }
-            _ => Vec::new(),
-        };
-        let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
-        // Everything else it reads (addresses, descriptors, SCC, the high dwords of wide
-        // operands) must not depend on the wave. Not EXEC, and not the old value of a VGPR it
-        // writes, which only the lanes outside EXEC keep.
-        let named: Vec<Value> = ops.iter().filter_map(&val).collect();
-        for &(r, v) in &inst.reads {
-            let kept = matches!(r, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == r);
-            if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) || kept || named.contains(&v) {
-                continue;
-            }
-            let k = of(kind, Some(v));
-            if wild(k) {
-                return Err(why(k));
-            }
-        }
-        let w = kinds.iter().copied().find(|&k| wild(k)).unwrap_or(Wave::Mixed);
-        let sum = |k: Wave| k == Wave::Total(Op::AddU);
-        let is_mask = |o: &Operand| {
-            val(o).is_some_and(|v| st.masks.contains_key(&v) || st.highs.contains_key(&v))
-        };
-        let mut reserved = false;
-        let out = match (name, &kinds[..]) {
-            ("s_ff1_i32_b64" | "s_ff1_i32_b32", _) if ops.first().is_some_and(is_mask) => Wave::First,
-            ("s_bcnt1_i32_b64" | "s_bcnt1_i32_b32", _) if ops.first().is_some_and(is_mask) => {
-                Wave::Total(Op::AddU)
-            }
-            // bits of a mask below the lane; with -1 for the mask, the lane's number
-            ("v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32", [_, b]) => {
-                match (matches!(ops[0], Operand::Scalar { .. }), *b) {
-                    (_, Wave::Prefix) | (true, Wave::Plain | Wave::Base) => Wave::Prefix,
-                    (false, Wave::Plain | Wave::Base) => Wave::Plain,
-                    (_, k) => return Err(why(k)),
-                }
-            }
-            // nothing wave-dependent goes in; what derives from a reserved base stays marked
-            _ if !kinds.iter().any(|&k| wild(k)) => {
-                let derives = matches!(inst.fields, Fields::Valu(_) | Fields::Sop { .. });
-                if derives && kinds.contains(&Wave::Base) { Wave::Base } else { Wave::Plain }
-            }
-            ("v_mov_b32" | "s_mov_b32", [k]) => *k,
-            ("v_cmp_eq_i32" | "v_cmp_eq_u32" | "v_cmpx_eq_i32" | "v_cmpx_eq_u32", [a, b]) => {
-                // the lane whose own number is the first lane's
-                let lane = match (*a, *b) {
-                    (Wave::First, k) if !wild(k) => &ops[1],
-                    (k, Wave::First) if !wild(k) => &ops[0],
-                    _ => return Err(why(w)),
-                };
-                if !matches!(lane, Operand::Vector { .. }) {
-                    return Err(FIRST);
-                }
-                let mask = match &inst.fields {
-                    _ if name.starts_with("v_cmpx") => inst.write(Reg::S(EXEC)),
-                    Fields::Valu(v) => match v.dst {
-                        Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                firsts.extend(mask);
-                Wave::Plain
-            }
-            ("v_add_nc_u32" | "s_add_i32", [a, b]) => match (*a, *b) {
-                (Wave::Prefix, Wave::Base) | (Wave::Base, Wave::Prefix) => Wave::Base,
-                (Wave::Prefix, Wave::Plain | Wave::Prefix) | (Wave::Plain, Wave::Prefix) => Wave::Prefix,
-                (x, y) if sum(x) && sum(y) => x,
-                _ => return Err(why(w)),
-            },
-            ("v_sub_nc_u32" | "s_sub_i32", [a, b]) => match (*a, *b) {
-                (Wave::Base, Wave::Prefix) => Wave::Base,
-                (Wave::Prefix, Wave::Plain) => Wave::Prefix,
-                (Wave::Plain, y) if sum(y) && matches!(ops[0], Operand::Const(128)) => y,
-                _ => return Err(why(w)),
-            },
-            ("s_mul_i32" | "v_mul_lo_u32" | "v_mul_u32_u24", [a, b]) => match (*a, *b) {
-                (x, Wave::Plain) | (Wave::Plain, x) if sum(x) || x == Wave::Prefix => x,
-                _ => return Err(why(w)),
-            },
-            ("s_lshl_b32", [x, Wave::Plain]) | ("v_lshlrev_b32", [Wave::Plain, x])
-                if sum(*x) || *x == Wave::Prefix =>
-            {
-                *x
-            }
-            ("v_lshl_add_u32", [Wave::Prefix, Wave::Plain, c]) if !wild(*c) => {
-                if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
-            }
-            // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
-                let want = match op {
-                    Op::AddU => "buffer_atomic_add",
-                    Op::MinU => "buffer_atomic_umin",
-                    Op::MaxU => "buffer_atomic_umax",
-                    Op::MinI => "buffer_atomic_smin",
-                    Op::MaxI => "buffer_atomic_smax",
-                    Op::Or => "buffer_atomic_or",
-                    Op::And => "buffer_atomic_and",
-                    Op::Xor => "buffer_atomic_xor",
-                    _ => "",
-                };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
-                    return Err(TOTAL);
-                }
-                reserved = true;
-                Wave::Base
-            }
-            _ => return Err(why(w)),
-        };
-        Ok((out, reserved))
-    };
-    let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
-        for &b in &order {
-            let block = &p.blocks[b];
-            for phi in &block.phis {
-                let mut k = Wave::Plain;
-                for (n, &a) in phi.args.iter().enumerate() {
-                    let x = of(kind, Some(a));
-                    k = match (k, x) {
-                        _ if n == 0 => x,
-                        (k, x) if k == x => k,
-                        (Wave::Plain, m @ (Wave::Base | Wave::Prefix))
-                        | (m @ (Wave::Base | Wave::Prefix), Wave::Plain) => m,
-                        _ => Wave::Mixed,
-                    };
-                }
-                put(kind, phi.value, k);
-            }
-            for (i, inst) in block.insts.iter().enumerate() {
-                // inside a whole-wave section: what the simulation found each value to be
-                if let Some((_, sec)) = sections[b].iter().find(|(s, sec)| i > **s && i < sec.end) {
-                    for &(_, w) in &inst.writes {
-                        let k = match sec.shapes.get(&w) {
-                            None => Wave::Mixed,
-                            Some(&Shape::K(_)) => Wave::Plain,
-                            Some(&Shape::Value(v)) => of(kind, Some(v)),
-                            Some(&Shape::Masked(src, _, _)) => of(kind, Some(src)),
-                            Some(&Shape::Active(op, src, mask, _)) => match of(kind, Some(src)) {
-                                Wave::Plain | Wave::Base => Wave::Total(op),
-                                // the first lane's own sum of a total is that total
-                                Wave::Total(o) if o == op && first_mask(firsts, Some(mask)) => Wave::Total(op),
-                                _ => Wave::Mixed,
-                            },
-                            Some(&Shape::Prefix(Op::AddU, src, mask, _, _)) => match of(kind, Some(src)) {
-                                Wave::Plain | Wave::Base => Wave::Prefix,
-                                Wave::Total(Op::AddU) if first_mask(firsts, Some(mask)) => Wave::Prefix,
-                                _ => Wave::Mixed,
-                            },
-                            Some(_) => Wave::Mixed,
-                        };
-                        put(kind, w, k);
-                    }
-                    continue;
-                }
-                let name = inst.name();
-                if name.starts_with("s_cbranch") {
-                    continue; // with the block's exit, below
-                }
-                let (k, reserved) = match step(inst, kind, firsts) {
-                    Ok(r) => r,
-                    Err(why) if check => return Err((inst.machine.offset, why)),
-                    Err(_) => (Wave::Mixed, false),
-                };
-                // the same test as `Lower::inst`'s `effect`
-                let effect = matches!(inst.fields, Fields::Exp { .. })
-                    || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-                    || name.contains("store")
-                    || name.contains("atomic")
-                    || matches!(inst.fields, Fields::Ds { .. })
-                        && !(name.starts_with("ds_read")
-                            || name.starts_with("ds_swizzle")
-                            || name.contains("permute"));
-                if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
-                    return Err((inst.machine.offset, EFFECT));
-                }
-                let guarded = st.guards[b][i].is_some();
-                for &(r, w) in &inst.writes {
-                    let mut kw = match r {
-                        // "some lane is counted" keeps the count's kind; any other SCC is one bit of data
-                        Reg::Scc if !name.starts_with("s_bcnt1") => {
-                            if wild(k) { Wave::Mixed } else { Wave::Plain }
-                        }
-                        _ => k,
-                    };
-                    // a guarded write leaves the old value in the lanes outside EXEC
-                    if guarded
-                        && matches!(r, Reg::V(_))
-                        && kw == Wave::Plain
-                        && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
-                    {
-                        kw = Wave::Mixed;
-                    }
-                    put(kind, w, kw);
-                }
-            }
-            // a branch on "some lane is counted": fine where the structure made it the lane's
-            // own bit (the mask is EXEC under a scalar condition)
-            if check
-                && let Some(last) = block.insts.last()
-                && last.name().starts_with("s_cbranch_scc")
-                && let Some(scc) = last.read(Reg::Scc)
-                && wild(of(kind, Some(scc)))
-            {
-                let own = matches!(st.exits[b], LaneExit::Branch { when, .. }
-                    if !st.bools.support(when).iter().any(|a| matches!(a, Atom::Uniform(v) if *v == scc)));
-                if !own {
-                    return Err((last.machine.offset, TOTAL));
-                }
-            }
-        }
-        Ok(())
-    };
-    let mut kind: HashMap<Value, Wave> = HashMap::new();
-    let mut firsts: HashSet<Value> = HashSet::new();
-    // to a fixpoint (values carried around loops), then once more to say what is wrong
-    let mut settled = false;
-    for _ in 0..16 {
-        let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
-        if (&before.0, before.1) == (&kind, firsts.len()) {
-            settled = true;
-            break;
-        }
-    }
-    if !settled {
-        return Err((0, MIXED));
-    }
-    pass(&mut kind, &mut firsts, true)
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):
@@ -1156,6 +894,13 @@ use signature_packing::{half_outputs, input_packs, packed_half};
 #[cfg(test)]
 use signature_packing::half_input_partners;
 
+/// `s_setreg*` of `HW_REG_POPS_PACKER` (hardware register 25): how a pixel program takes part
+/// in POPS, the console's ordering of the view accesses of overlapping pixels by primitive.
+fn sets_pops_packer(i: &Inst) -> bool {
+    matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
+        && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1170,8 +915,15 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.geometry = x.io.geometry.as_ref().map(|g| super::shader::Geometry {
+            max_vertices: g.max_vertices,
+        });
+        s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // (the signatures stay whole while the program is lowered: rows of 16-bit values and
+        // the like are found by the elements around them; what is left out goes at the end)
+        let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1514,12 +1266,29 @@ impl<'a> Lower<'a> {
             paired_fp32: false,
             code_table: None,
             counters: HashMap::new(),
+            passes: HashMap::new(),
+            jump_loops: Vec::new(),
+            traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            notes: None,
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+            raw: HashMap::new(),
+            raw_use: None,
+            raw_meets: Default::default(),
+            drop_in,
+            drop_out,
+            emitted: Default::default(),
         }
+    }
+
+    /// Element `id` of the inputs (`input`) or the vertex outputs as the finished signature
+    /// numbers it, without those left out ([`super::link`]).
+    fn sig_id(&self, input: bool, id: usize) -> u32 {
+        let drop = if input { &self.drop_in } else { &self.drop_out };
+        (id - drop.iter().take(id).filter(|&&d| d).count()) as u32
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -1754,10 +1523,10 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
-            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::ActiveF64(lo, hi, mask, high) => {
                 return self.active_f64_sum(lo, hi, mask, high);
             }
+            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -2156,7 +1925,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`PIXEL_LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -2166,9 +1935,35 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                if let Some(n) = super::trip::constant_passes(p, &self.rpo, b) {
+                    self.passes.insert(b, n);
+                }
             }
         }
+        self.find_jump_loops();
+        if notes_on() {
+            // Numbered by their first code byte, which the host logs too.
+            let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+            headers.sort_by_key(|&h| (p.blocks[h].offset, h));
+            let last = super::shader::LOOP_NOTES / super::shader::LOOP_NOTE_DWORDS - 1;
+            let numbered = headers.into_iter().enumerate().map(|(n, h)| (h, (n as u32).min(last)));
+            self.notes = Some(numbered.collect());
+        }
         self.cur = self.s.entry;
+        // Title memory written by address has no rasterizer-ordered form.
+        let by_address = |&&(site, a): &&(Site, Address)| {
+            let name = self.x.p.blocks[site.0].insts[site.1].name();
+            a.param == MEMORY && (name.contains("store") || name.contains("atomic"))
+        };
+        if self.s.ordered
+            && let Some(&(site, _)) = self.x.res.scalar.iter().find(by_address)
+        {
+            let offset = self.x.p.blocks[site.0].insts[site.1].machine.offset;
+            return Err(unsupported(
+                offset,
+                "a write by address in a pixel program ordered by primitive",
+            ));
+        }
         self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
@@ -2264,6 +2059,22 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        // A linked stage's signatures without what it leaves out; an input left out must not
+        // have been read.
+        if !self.drop_in.is_empty() || !self.drop_out.is_empty() {
+            if self.s.inputs.iter().zip(&self.drop_in).any(|(e, &d)| d && e.usage != 0) {
+                return Err(unsupported(0, "an input left out of a linked pipeline read"));
+            }
+            let keep = |els: &mut Vec<SigElement>, drop: &[bool]| {
+                let mut d = drop.iter();
+                els.retain(|_| !d.next().copied().unwrap_or(false));
+            };
+            keep(&mut self.s.inputs, &self.drop_in);
+            keep(&mut self.s.outputs, &self.drop_out);
+        }
+        // (the reads have given the pixel inputs their modes)
+        super::container::one_mode_per_register(&mut self.s.inputs, self.s.pixel);
+        super::container::one_mode_per_register(&mut self.s.outputs, false);
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2272,8 +2083,18 @@ impl<'a> Lower<'a> {
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let form = match () {
+            _ if self.twin.is_some() => super::forms::PAIRED,
+            _ if self.local && self.local_any => super::forms::LOCAL_ANY,
+            _ if self.local => super::forms::LOCAL,
+            _ if self.exchange.is_some() => super::forms::EXCHANGE,
+            _ if self.halves.is_some() => super::forms::HALVES,
+            _ if self.x.native.wave64 && wave_size == Some(64) => super::forms::WAVE64,
+            _ => "",
+        };
         Ok(Lowered {
             wave_size,
+            form,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2377,6 +2198,10 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let (entry, i32t) = (self.s.entry, self.s.t.i32);
+                return Val::I32(self.s.op(entry, "primitiveID.i32", Attr::ReadNone, i32t, 108, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2539,8 +2364,9 @@ impl<'a> Lower<'a> {
             ".f32"
         };
         let entry = self.s.entry;
+        let sig = self.sig_id(true, id);
         let args = [
-            self.s.m.i32(id as u32),
+            self.s.m.i32(sig),
             self.s.m.i32(0),
             self.s.m.i8(col),
             self.s.m.undef(self.s.t.i32),
@@ -2811,6 +2637,11 @@ impl<'a> Lower<'a> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
+        // Picked from the view heap at an index the code computes: from
+        // the host's table of view addresses by heap slot.
+        if rp.root == RootType::ResourceHeap {
+            return self.heap_view_address(site);
+        }
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
             return None;
         }
@@ -2832,6 +2663,27 @@ impl<'a> Lower<'a> {
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
         Some((lo, hi))
+    }
+
+    /// The title address (low dword, bits from 32 up) of the view at the
+    /// heap slot the descriptor load at `site` reads, from the host's table
+    /// ([`super::shader::SLOT_VIEW_ADDRESSES`]), in the current block.
+    fn heap_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        // Inside the table whatever the index (lanes that do not run
+        // compute one too).
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let k3 = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEW_ADDRESSES);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, both, align]);
+        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        Some((self.as_int(lo), self.as_int(hi)))
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -2971,7 +2823,7 @@ impl<'a> Lower<'a> {
         };
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
@@ -3227,19 +3079,24 @@ impl<'a> Lower<'a> {
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                // (the paired form: the upper lanes' bits too, lanes 32-63)
+                // (the paired form: the upper lanes' bits too, lanes 32-63; EXEC on entry leaves
+                // out the threads past a DispatchX count, in the paired form each lane by its own)
+                let entry = self.x.st.active.contains(&lo);
+                let own = |l: &mut Self, bit: V| match l.partial_active {
+                    Some(active) if entry => l.s.m.bin(at, Bin::And, bit, active),
+                    _ => bit,
+                };
                 let bits = if self.twin.is_some() {
-                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
+                    self.both(|l| {
+                        let bit = l.boolean(m, at)?;
+                        Ok(own(l, bit))
+                    })
+                    .map(|[a, b]| (a, Some(b)))
                 } else {
-                    self.boolean(m, at).map(|a| (a, None))
+                    self.boolean(m, at).map(|a| (own(self, a), None))
                 };
                 self.balloting.remove(&lo);
-                let (mut bit, upper) = bits?;
-                if let Some(active) = self.partial_active
-                    && self.x.st.active.contains(&lo)
-                {
-                    bit = self.s.m.bin(at, Bin::And, bit, active);
-                }
+                let (bit, upper) = bits?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -3282,7 +3139,7 @@ impl<'a> Lower<'a> {
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -3367,10 +3224,13 @@ impl<'a> Lower<'a> {
                 let val = inst.read(r).ok_or("an unread operand")?;
                 match self.floats.get(&val) {
                     Some(&f) => f,
-                    None => {
-                        let x = self.i32_of(val)?;
-                        self.as_float(x)
-                    }
+                    None => match self.raw_float(val) {
+                        Some(f) => f,
+                        None => {
+                            let x = self.i32_of(val)?;
+                            self.as_float(x)
+                        }
+                    },
                 }
             }
             _ => {
@@ -3966,7 +3826,14 @@ impl<'a> Lower<'a> {
         };
         if self.twin.is_some() {
             let at = at(self)?;
-            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
+            // (each lane without the threads past its DispatchX count)
+            let [lo, hi] = self.both(|l| {
+                let bit = l.boolean(m, at)?;
+                Ok(match l.partial_active {
+                    Some(active) => l.s.m.bin(at, Bin::And, bit, active),
+                    None => bit,
+                })
+            })?;
             let either = self.s.m.bin(at, Bin::Or, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             return Ok(self.s.op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[either]));
@@ -4006,7 +3873,19 @@ impl<'a> Lower<'a> {
             // says what it says on the console (no set bit for "some lane", no objection to
             // "every lane").
             let c = self.cur;
-            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
+            let [lo, hi] = self.both(|l| {
+                let mine = l.boolean(when, c)?;
+                // (threads past a DispatchX count speak neither for nor against)
+                Ok(match l.partial_active {
+                    Some(active) if any => l.s.m.bin(c, Bin::And, mine, active),
+                    Some(active) => {
+                        let t = l.s.m.bool(true);
+                        let off = l.s.m.bin(c, Bin::Xor, active, t);
+                        l.s.m.bin(c, Bin::Or, mine, off)
+                    }
+                    None => mine,
+                })
+            })?;
             let pair = self.s.m.bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
@@ -4165,6 +4044,7 @@ impl<'a> Lower<'a> {
                 };
                 let v = self.s.m.select(self.cur, g, x, old);
                 self.s.m.tag(v, Tag::Guard);
+                self.note_raw(new, x, g);
                 v
             }
             _ => x,
@@ -4231,11 +4111,14 @@ impl<'a> Lower<'a> {
         };
         let x = self.as_int(f);
         self.write(inst, Reg::V(reg), x, guard);
-        if guard.is_none()
-            && Self::sdwa_dst(inst).is_none()
+        if Self::sdwa_dst(inst).is_none()
             && let Some(new) = inst.write(Reg::V(reg))
         {
-            self.floats.insert(new, f);
+            if guard.is_none() {
+                self.floats.insert(new, f);
+            } else {
+                self.note_raw_float(new, f);
+            }
         }
         Ok(())
     }
@@ -4387,7 +4270,15 @@ impl<'a> Lower<'a> {
         // never reached: they come down to the lane count when the outputs
         // do not fit.
         use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
+        // (linked: the outputs the pixel program reads, which are all that is declared)
+        let kept: Vec<SigElement>;
+        let outputs = if self.drop_out.is_empty() {
+            &self.s.outputs
+        } else {
+            kept = self.s.outputs.iter().zip(&self.drop_out).filter(|(_, d)| !**d).map(|(e, _)| e.clone()).collect();
+            &kept
+        };
+        let prims = &self.s.prims;
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
@@ -4590,7 +4481,7 @@ impl<'a> Lower<'a> {
     /// wave operations leave helper lanes out (DXIL without
     /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
     /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
-    /// loop runs to [`LOOP_LIMIT`] in every such lane (upstream measured
+    /// loop runs to its limit in every such lane (upstream measured
     /// draws of 0.3 to 1.3 s each, then DEVICE_HUNG). With its own value a
     /// helper lane matches in the first pass and leaves; what a helper lane
     /// computes only feeds derivatives, and its stores are dropped.
@@ -4633,7 +4524,7 @@ impl<'a> Lower<'a> {
         (0..n)
             .map(|k| {
                 let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             })
             .collect()
     }
@@ -4653,6 +4544,9 @@ impl<'a> Lower<'a> {
         };
         if *gds {
             return Err("GDS");
+        }
+        if self.x.io.geometry.is_some() {
+            return self.ring(inst, b, i);
         }
         let name = inst.name();
         // Lanes past a DispatchX count neither read nor write LDS; a
@@ -4965,7 +4859,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let at = self.begin_guarded(guard);
+        // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
+        // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's
+        // compiler refuses `atomicrmw add` of `0 - x` and `atomicrmw sub` on group-shared
+        // memory, the whole pipeline failing with E_OUTOFMEMORY (RTX 5090, driver of
+        // 2026-11; DXC's own `InterlockedAdd(g, -x)` fails the same way, `InterlockedAdd(g,
+        // x)`, `(g, 5 - x)` and `(g, -5)` do not). The title's `weatherParticle:
+        // CS_BeginUpdate` hands its particles out so (`v_sub_nc_u32 v1, 0, v1;
+        // ds_add_rtn_u32`) and got no pipeline.
+        let take = match rmw {
+            Some(Rmw::Add) => self.s.m.negation_of(v0),
+            Some(Rmw::Sub) if !matches!(v0, V::Const(_)) => Some(v0),
+            _ => None,
+        };
         let r = match rmw {
+            _ if let Some(x) = take => self.lds_rmw_loop(p, |l, old| l.s.m.bin(l.cur, Bin::Sub, old, x)),
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
             None => self
@@ -4992,6 +4900,12 @@ impl<'a> Lower<'a> {
     // shortcut: f32 denormals compare as kept; with the console's MODE
     // flushing them they would order as ±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
+        self.lds_rmw_loop(p, |l, old| l.lds_float_pick(old, data, max))
+    }
+
+    /// A read-modify-write of the LDS dword at `p` as a compare-exchange loop: `new` gives,
+    /// in the loop's one block, what is written over the old value; the old value returns.
+    fn lds_rmw_loop(&mut self, p: V, new: impl FnOnce(&mut Self, V) -> V) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
         let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
@@ -4999,7 +4913,7 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let old = self.s.m.phi(lp, i32t);
         self.cur = lp;
-        let new = self.lds_float_pick(old, data, max);
+        let new = new(self, old);
         let prev = self.s.m.cmpxchg(lp, p, old, new);
         let done = self.s.m.cmp(lp, pred::EQ, prev, old);
         self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
@@ -5107,6 +5021,8 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // (a guard with no host value: the instruction's own lowering says so where it needs it)
+        self.raw_use = self.raw_use_for(b, i, inst).unwrap_or(None);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5132,6 +5048,10 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
+            // A geometry program's emit or cut: a refusal at once, as for the node test.
+            Fields::Sopp { .. } if self.x.io.geometry.is_some() && name.starts_with("s_sendmsg") => {
+                return self.ring_message(b, i).map_err(|why| unsupported(offset, why));
+            }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
@@ -5153,12 +5073,14 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        self.raw_use = None;
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
+                    self.raw.remove(&v);
                 }
                 Ok(())
             }
@@ -5887,6 +5809,10 @@ impl<'a> Lower<'a> {
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
         }
+        if self.scalar.get(&site).is_some_and(|a| a.param == DRIVER) {
+            // (where a geometry program's ring lies in LDS: no ring on the host)
+            return Err("the console driver's table");
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -6060,358 +5986,6 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
-    }
-
-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
-    /// from descriptor bits (an image's width, height, depth, levels; a
-    /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
-    // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
-    fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
-        let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err("a scalar memory read as data");
-        };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
-        // How the program uses the descriptor tells the view's kind: an image or buffer
-        // instruction before a scalar buffer load, which reads any buffer.
-        let x = self.x;
-        let uses = |of: Site| {
-            x.res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .filter_map(move |d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
-        let by_scalar_load = |u: &(Site, u8)| {
-            matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
-        };
-        let use_of = |of: Site| uses(of).find(|u| !by_scalar_load(u)).or_else(|| uses(of).next());
-        // The console compiler loads a descriptor again wherever it needs it, and for a
-        // size it reads the dwords of a load that nothing uses as a descriptor (a texture
-        // picked from the heap by an index held per lane: one load for its width, one for
-        // its base level, one for each read of the image). Another load of as many dwords
-        // from the same address reads the same descriptor, so what uses that one tells
-        // this one's kind. The handle is still made from this load's own operands, which
-        // hold here.
-        let address = self.scalar.get(&site).copied();
-        let twin = || {
-            let a = address?;
-            let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
-            x.res
-                .scalar
-                .iter()
-                .filter(|(s, b)| *s != site && *b == a && same(*s))
-                .find_map(|(s, _)| use_of(*s))
-        };
-        let use_at = use_of(site).or_else(twin);
-        // A descriptor nothing uses as one, whose size the code reads all the same (a
-        // texture picked from the heap by an index in a constant buffer, its width and
-        // height turned into a texel size; a buffer tested for being empty by its record
-        // count): the kind from its dwords and its used-resource entry.
-        let unused = if use_at.is_none() {
-            self.unused_descriptor_kind(inst, site, code, count)
-        } else {
-            None
-        };
-        let (first, props, image, uav, used) = if let Some(kind) = unused {
-            kind
-        } else {
-        let Some((at, first)) = use_at else {
-            // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
-            // copies its dwords and compares them, lane against first lane, and every load
-            // that reaches those lanes reads one address. Each dword stands in as its place
-            // in the table, so the lanes compare equal as they do on the console.
-            if self.x.res.lane_copied.contains(&site)
-                && let Some(a) = self.scalar.get(&site).copied()
-            {
-                for k in 0..count {
-                    let x = self.s.m.i32(a.offset / 4 + k);
-                    self.write(inst, Reg::S(code + k as u8), x, None);
-                }
-                return Ok(());
-            }
-            // A sampler's descriptor: no program reads its dwords as numbers, so where one
-            // meets numbers at a join the register is dead on that path (`dead`), as a
-            // descriptor's address or format is.
-            let sampler = x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            });
-            if sampler {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a sampler's descriptor read as data");
-            }
-            // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
-                            }
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
-                eprintln!(
-                    "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
-                    inst.machine.offset,
-                    inst.name(),
-                    address,
-                    self.x.res.lane_copied.contains(&site)
-                );
-            }
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    // (Unsigned integers where the access moves halves.)
-                    let halves = self
-                        .table_place(&Source::Loaded { load: site, first })
-                        .is_some_and(|p| {
-                            self.halves_only.contains(&p)
-                                && (un.contains("_format_d16_")
-                                    || self.format_load_read_as_halves(ui))
-                        });
-                    (10 | u, if halves { 0x405 } else { 0x409 })
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
-        (first, props, image, uav, used)
-        };
-        let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => {
-                // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
-                let stride = used.map_or(0, |u| u.stride);
-                let n = if props.0 & 0xFF == 11 && stride > 1 {
-                    let k = self.s.m.i32(stride);
-                    self.s.m.bin(c, Bin::UDiv, n, k)
-                } else {
-                    n
-                };
-                let mut words = vec![(2, n)];
-                // Its address too, where the code computes with it and the
-                // host can tell it.
-                let computed = (0..2u8).any(|k| {
-                    inst.write(Reg::S(code + first + k))
-                        .is_some_and(|v| self.computed_with(v, 6))
-                });
-                // (A descriptor nothing uses as one gets it whenever the host can tell it, as
-                // a buffer whose address alone is read does.)
-                if first == 0
-                    && (computed || unused.is_some())
-                    && let Some((lo, hi)) = self.view_address(site)
-                {
-                    words.extend([(0, lo), (1, hi)]);
-                }
-                words
-            }
-        };
-        for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
-                        self.stale.insert(v);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
-    /// descriptor but whose dwords the code reads: the first dword, the handle properties,
-    /// the image kind (none for a buffer), whether it is an unordered view, and its
-    /// used-resource entry. An image's eight dwords read as a 2D texture's, a buffer's four
-    /// as a raw view's where the code reads its record count (dword 2); none for anything
-    /// else (a constant buffer, a sampler, a buffer whose address alone is read).
-    // shortcut: an image whose kind nothing tells is taken for a 2D texture (the title's
-    // reads are texel sizes of 2D textures: puddle masks, shadow masks); a host view of
-    // another kind would answer its own sizes.
-    #[allow(clippy::type_complexity)]
-    fn unused_descriptor_kind(
-        &self,
-        inst: &Inst,
-        site: Site,
-        code: u8,
-        count: u32,
-    ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
-        // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
-        // `descriptor_data` handles on their own.
-        if self.x.res.lane_copied.contains(&site)
-            || self.x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            })
-        {
-            return None;
-        }
-        let used = self.used_kind(&Source::Loaded {
-            load: site,
-            first: 0,
-        });
-        if used.is_some_and(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
-            return None;
-        }
-        let read = |k: u32| {
-            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
-                self.x
-                    .p
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.insts)
-                    .any(|i| i.reads.iter().any(|r| r.1 == v))
-            })
-        };
-        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        match count {
-            // width (dwords 1-2), height (2), levels (3), depth (4)
-            8 if (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
-                Some((0, (2 | u, 0x409), Some(2), uav, used))
-            }
-            // the record count
-            4 if read(2) && used.is_none_or(|u| u.dwords == 4) => {
-                Some((0, (11 | u, 0), None, uav, used))
-            }
-            _ => None,
-        }
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -6777,6 +6351,10 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
+                    // (no rasterizer-ordered form: only heap views are ordered)
+                    (RootType::Descriptor, Some(ResourceType::Uav), _) if self.s.ordered => {
+                        Err("a root UAV of a pixel program ordered by primitive")
+                    }
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
@@ -6831,7 +6409,7 @@ impl<'a> Lower<'a> {
         sampler: bool,
         depth: u32,
     ) -> Result<V, Why> {
-        const WHY: Why = "a descriptor chosen by control flow";
+        const WHY: Why = CHOSEN;
         let p = self.x.p;
         let mut incoming = Vec::new();
         for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
@@ -7242,6 +6820,9 @@ impl<'a> Lower<'a> {
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
+        if let Some(r) = self.valu_f64(inst, name, guard) {
+            return r;
+        }
         match name {
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
@@ -7608,12 +7189,15 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
-                    Some(&x) => x,
-                    None => {
-                        let x = self.i32_of(acc)?;
-                        self.as_float(x)
-                    }
+                let acc = match self.floats.get(&acc).copied() {
+                    Some(x) => x,
+                    None => match self.raw_float(acc) {
+                        Some(x) => x,
+                        None => {
+                            let x = self.i32_of(acc)?;
+                            self.as_float(x)
+                        }
+                    },
                 };
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
@@ -7763,12 +7347,6 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
-            "v_cvt_f32_f64" => {
-                let (lo, hi) = self.f64_pair(inst, 0)?;
-                let bits = self.f64_to_f32_bits(lo, hi);
-                let r = self.as_float(bits);
-                float(self, r)
-            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -7809,9 +7387,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // (a first interpolation half held there before keeps nothing anyone reads:
+                // its pair is evaluated by the second half, and code reads the f16 result's
+                // half of the register)
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
+                    Some(Err(why)) => return Err(why),
                 };
                 let h = self
                     .s
@@ -8155,159 +7737,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
-    /// `abs` and `neg` input modifiers on operand `k`.
-    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        if v.sdwa.is_some() || v.dpp.is_some() {
-            return Err("64-bit operand modifiers");
-        }
-        let op = *v.src.get(k).ok_or("a missing operand")?;
-        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
-            Ok((lo, hi))
-        };
-        let (lo, mut hi) = match op {
-            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
-            Operand::Scalar { code, .. } if code != NULL => {
-                pair(self, Reg::S(code), Reg::S(code + 1))?
-            }
-            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
-            Operand::Const(c @ 240..=248) => {
-                const INLINE_F64: [f64; 9] = [
-                    0.5,
-                    -0.5,
-                    1.0,
-                    -1.0,
-                    2.0,
-                    -2.0,
-                    4.0,
-                    -4.0,
-                    1.0 / std::f64::consts::TAU,
-                ];
-                let bits = INLINE_F64[(c - 240) as usize].to_bits();
-                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
-            }
-            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
-            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
-            _ => return Err("a 64-bit float operand"),
-        };
-        let c = self.cur;
-        if v.abs >> k & 1 != 0 {
-            let mask = self.s.m.i32(0x7FFF_FFFF);
-            hi = self.s.m.bin(c, Bin::And, hi, mask);
-        }
-        if v.neg >> k & 1 != 0 {
-            let sign = self.s.m.i32(0x8000_0000);
-            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
-        }
-        Ok((lo, hi))
-    }
-
-    /// Converts IEEE-754 binary64 `(lo, hi)` to binary32 bits with round-to-nearest-even,
-    /// without requiring host `DOUBLES` (`f64`) support.
-    fn f64_to_f32_bits(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let k0 = self.s.m.i32(0);
-        let k1 = self.s.m.i32(1);
-        let sign_mask = self.s.m.i32(0x8000_0000);
-        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
-
-        let k20 = self.s.m.i32(20);
-        let k7ff = self.s.m.i32(0x7FF);
-        let exp64 = self.s.m.bin(c, Bin::LShr, hi, k20);
-        let exp64 = self.s.m.bin(c, Bin::And, exp64, k7ff);
-
-        let frac_mask = self.s.m.i32(0x000F_FFFF);
-        let frac_hi = self.s.m.bin(c, Bin::And, hi, frac_mask);
-        let frac_any = self.s.m.bin(c, Bin::Or, frac_hi, lo);
-        let frac_nz = self.s.m.cmp(c, pred::NE, frac_any, k0);
-
-        let k3 = self.s.m.i32(3);
-        let k29 = self.s.m.i32(29);
-        let m23_hi = self.s.m.bin(c, Bin::Shl, frac_hi, k3);
-        let m23_lo = self.s.m.bin(c, Bin::LShr, lo, k29);
-        let m23 = self.s.m.bin(c, Bin::Or, m23_hi, m23_lo);
-
-        let rem_mask = self.s.m.i32(0x1FFF_FFFF);
-        let rem = self.s.m.bin(c, Bin::And, lo, rem_mask);
-        let half_rem = self.s.m.i32(0x1000_0000);
-        let gt_half = self.s.m.cmp(c, pred::IUGT, rem, half_rem);
-        let eq_half = self.s.m.cmp(c, pred::EQ, rem, half_rem);
-        let m23_odd_bit = self.s.m.bin(c, Bin::And, m23, k1);
-        let m23_odd = self.s.m.cmp(c, pred::NE, m23_odd_bit, k0);
-        let tie_up = self.s.m.bin(c, Bin::And, eq_half, m23_odd);
-        let norm_round = self.s.m.bin(c, Bin::Or, gt_half, tie_up);
-        let norm_inc = self.s.m.select(c, norm_round, k1, k0);
-
-        // Normal range: exp64 in [897, 1150] -> exp32 in [1, 254].
-        let k896 = self.s.m.i32(896);
-        let k23 = self.s.m.i32(23);
-        let exp32 = self.s.m.bin(c, Bin::Sub, exp64, k896);
-        let exp32_sh = self.s.m.bin(c, Bin::Shl, exp32, k23);
-        let norm_body = self.s.m.bin(c, Bin::Add, exp32_sh, m23);
-        let norm_body = self.s.m.bin(c, Bin::Add, norm_body, norm_inc);
-        let norm_res = self.s.m.bin(c, Bin::Or, sign, norm_body);
-
-        // Subnormal range: exp64 in [874, 896] -> shift in [1, 23].
-        let k897 = self.s.m.i32(897);
-        let k32 = self.s.m.i32(32);
-        let k31 = self.s.m.i32(31);
-        let imp = self.s.m.i32(0x0080_0000);
-        let sig24 = self.s.m.bin(c, Bin::Or, imp, m23);
-        let raw_shift = self.s.m.bin(c, Bin::Sub, k897, exp64);
-        // Clamp shift to [1, 23] so shifts never produce poison outside the subnormal branch.
-        let lt1 = self.s.m.cmp(c, pred::IULT, raw_shift, k1);
-        let shift = self.s.m.select(c, lt1, k1, raw_shift);
-        let gt23 = self.s.m.cmp(c, pred::IUGT, shift, k23);
-        let shift = self.s.m.select(c, gt23, k23, shift);
-        let sub_m = self.s.m.bin(c, Bin::LShr, sig24, shift);
-        let inv_shift = self.s.m.bin(c, Bin::Sub, k32, shift);
-        let lost = self.s.m.bin(c, Bin::Shl, sig24, inv_shift);
-        let round_bit = self.s.m.bin(c, Bin::LShr, lost, k31);
-        let round_on = self.s.m.cmp(c, pred::NE, round_bit, k0);
-        let low31 = self.s.m.i32(0x7FFF_FFFF);
-        let lost_lo = self.s.m.bin(c, Bin::And, lost, low31);
-        let sticky = self.s.m.bin(c, Bin::Or, lost_lo, rem);
-        let sticky_on = self.s.m.cmp(c, pred::NE, sticky, k0);
-        let sub_odd_bit = self.s.m.bin(c, Bin::And, sub_m, k1);
-        let sub_odd = self.s.m.cmp(c, pred::NE, sub_odd_bit, k0);
-        let sub_tie = self.s.m.bin(c, Bin::Or, sticky_on, sub_odd);
-        let sub_round = self.s.m.bin(c, Bin::And, round_on, sub_tie);
-        let sub_inc = self.s.m.select(c, sub_round, k1, k0);
-        let sub_body = self.s.m.bin(c, Bin::Add, sub_m, sub_inc);
-        let sub_res = self.s.m.bin(c, Bin::Or, sign, sub_body);
-
-        // Underflow range: exp64 < 874. Only exp64 == 873 with non-zero fraction rounds up to min subnormal (1).
-        let k873 = self.s.m.i32(873);
-        let eq873 = self.s.m.cmp(c, pred::EQ, exp64, k873);
-        let round_min = self.s.m.bin(c, Bin::And, eq873, frac_nz);
-        let min_bit = self.s.m.select(c, round_min, k1, k0);
-        let under_res = self.s.m.bin(c, Bin::Or, sign, min_bit);
-
-        // Overflow / Inf / NaN: exp64 >= 1151.
-        let is_exp_all = self.s.m.cmp(c, pred::EQ, exp64, k7ff);
-        let is_nan = self.s.m.bin(c, Bin::And, is_exp_all, frac_nz);
-        let inf_bits = self.s.m.i32(0x7F80_0000);
-        let qnan_bits = self.s.m.i32(0x7FC0_0000);
-        let nan_body = self.s.m.bin(c, Bin::Or, qnan_bits, m23);
-        let over_body = self.s.m.select(c, is_nan, nan_body, inf_bits);
-        let over_res = self.s.m.bin(c, Bin::Or, sign, over_body);
-
-        // Select final result by exponent range.
-        let k874 = self.s.m.i32(874);
-        let k1151 = self.s.m.i32(1151);
-        let is_under = self.s.m.cmp(c, pred::IULT, exp64, k874);
-        let is_sub = self.s.m.cmp(c, pred::IULT, exp64, k897);
-        let is_over = self.s.m.cmp(c, pred::IUGE, exp64, k1151);
-        let r = self.s.m.select(c, is_over, over_res, norm_res);
-        let r = self.s.m.select(c, is_sub, sub_res, r);
-        self.s.m.select(c, is_under, under_res, r)
-    }
-
     fn join64(&mut self, lo: V, hi: V) -> V {
         let c = self.cur;
         let ty = self.s.m.int(64);
@@ -8316,69 +7745,6 @@ impl<'a> Lower<'a> {
         let shift = self.s.m.int_const(ty, 32);
         let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
         self.s.m.bin(c, Bin::Or, lo, hi)
-    }
-
-    /// The bits of the float nearest the double whose dwords are `lo` and
-    /// `hi`, on 32-bit integers: round to nearest even, infinities and NaN
-    /// kept (a NaN stays quiet), a result below the smallest normal float
-    /// signed zero (flushed, as the console's default float mode does).
-    // The flush-to-zero form of v_cvt_f32_f64: kept beside the IEEE form in use until the console's
-    // float mode for this instruction is checked.
-    #[allow(dead_code)]
-    fn f64_bits_to_f32_bits(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k20, k29, k3, k23) = (k(self, 20), k(self, 29), k(self, 3), k(self, 23));
-        let sign_mask = k(self, 0x8000_0000);
-        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
-        let e = self.s.m.bin(c, Bin::LShr, hi, k20);
-        let e_mask = k(self, 0x7ff);
-        let e = self.s.m.bin(c, Bin::And, e, e_mask);
-        // The top 23 bits of the 52-bit mantissa, and the 29 below them.
-        let m_mask = k(self, 0x000f_ffff);
-        let mh = self.s.m.bin(c, Bin::And, hi, m_mask);
-        let mh = self.s.m.bin(c, Bin::Shl, mh, k3);
-        let ml = self.s.m.bin(c, Bin::LShr, lo, k29);
-        let m = self.s.m.bin(c, Bin::Or, mh, ml);
-        let rest_mask = k(self, 0x1fff_ffff);
-        let rest = self.s.m.bin(c, Bin::And, lo, rest_mask);
-        // Round to nearest even: up past half, or at half when odd.
-        let half = k(self, 0x1000_0000);
-        let one = k(self, 1);
-        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
-        let at = self.s.m.cmp(c, pred::EQ, rest, half);
-        let odd = self.s.m.bin(c, Bin::And, m, one);
-        let zero = k(self, 0);
-        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
-        let tie = self.s.m.bin(c, Bin::And, at, odd);
-        let up = self.s.m.bin(c, Bin::Or, above, tie);
-        let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
-        // steps the exponent, up to infinity.
-        let bias = k(self, 1023 - 127);
-        let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
-        let ex = self.s.m.bin(c, Bin::Shl, e32, k23);
-        let normal = self.s.m.bin(c, Bin::Add, ex, m);
-        let normal = self.s.m.bin(c, Bin::Add, normal, up);
-        let normal = self.s.m.bin(c, Bin::Or, normal, sign);
-        // Exponents out of the float's range (signed, after rebiasing).
-        let inf = k(self, 0x7f80_0000);
-        let inf = self.s.m.bin(c, Bin::Or, inf, sign);
-        let k255 = k(self, 255);
-        let big = self.s.m.cmp(c, pred::SGE, e32, k255);
-        let small = self.s.m.cmp(c, pred::SLE, e32, zero);
-        let r = self.s.m.select(c, big, inf, normal);
-        let r = self.s.m.select(c, small, sign, r);
-        // Infinity and NaN (a NaN with any mantissa bit set stays a NaN).
-        let all = k(self, 0x7ff);
-        let special = self.s.m.cmp(c, pred::EQ, e, all);
-        let any = self.s.m.bin(c, Bin::Or, mh, ml);
-        let any = self.s.m.bin(c, Bin::Or, any, rest);
-        let nan = self.s.m.cmp(c, pred::NE, any, zero);
-        let quiet = k(self, 0x0040_0000);
-        let quiet = self.s.m.select(c, nan, quiet, zero);
-        let special_bits = self.s.m.bin(c, Bin::Or, inf, quiet);
-        self.s.m.select(c, special, special_bits, r)
     }
 
     /// The low and high dwords of an i64.
@@ -9596,25 +8962,12 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            // The first half of a pair: its second half interpolates the
-            // attribute itself, so nothing needs this half's partial sum.
-            // But an f16 second half that writes the high half of the
-            // register this one wrote keeps the low half as it was (the
-            // console compiler reuses the register; the low half is not
-            // read), so the register needs a value: 0.
-            let name = inst.name();
-            if name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
-                let dst = match &inst.fields {
-                    Fields::Vintrp { dst, .. } => Some(*dst),
-                    Fields::Valu(v) => v.dst,
-                    _ => None,
-                };
-                if let Some(Operand::Vector { reg, .. }) = dst {
-                    let zero = self.s.m.i32(0);
-                    self.write(inst, Reg::V(reg), zero, None);
-                    return Ok(());
-                }
-            }
+            // The first half of a pair: its second half interpolates the attribute itself, so
+            // this half has no value of its own. Where its register is kept, a 16-bit write over
+            // it reads 0 for the half it keeps (`v_fma_mix*`); read as data, the program is
+            // translated once more with first halves evaluated as the pairs they start
+            // ([`with_first_half_pairs`]). (Writing 0 here for every first half changed 59 of
+            // the title's pixel programs that translated already, and translated none more.)
             return Err(FIRST_HALF);
         };
         let name = inst.name();
@@ -9872,8 +9225,9 @@ impl<'a> Lower<'a> {
         };
         self.s.flags |= flags::BARYCENTRICS;
         let entry = self.s.entry;
+        let sig = self.sig_id(true, id);
         let args = [
-            self.s.m.i32(id as u32),
+            self.s.m.i32(sig),
             self.s.m.i32(0),
             self.s.m.i8(col),
             self.s.m.i8(k),
@@ -10004,7 +9358,7 @@ impl<'a> Lower<'a> {
         let addr_u32 = |l: &mut Self, reg_idx: usize| -> Result<V, Why> {
             let r = *regs.get(reg_idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
         let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
@@ -10314,6 +9668,10 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The level comes from the coordinates the size divides: an array's layer
+                // is none of them (DXIL wants it undefined).
+                let mut at = [fu; 3];
+                at[..spatial].copy_from_slice(&cs[..spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -10322,7 +9680,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, at[0], at[1], at[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -10818,7 +10176,7 @@ impl<'a> Lower<'a> {
         };
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
@@ -11466,6 +10824,10 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
+            // (an output a linked pixel program does not read: neither stored nor declared)
+            if !primitive && self.drop_out.get(id).copied().unwrap_or(false) {
+                continue;
+            }
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
@@ -11493,8 +10855,9 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let sig = if primitive { id as u32 } else { self.sig_id(false, id) };
             let mut args = vec![
-                self.s.m.i32(id as u32),
+                self.s.m.i32(sig),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
@@ -11608,7 +10971,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let mut abort = self.abort_block();
+                if self.notes.is_some() {
+                    abort = self.note_block(t, true, abort);
+                }
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -11654,25 +11020,66 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                let wanted = cond;
+                // A loop that goes round by jumps back alone is left at the
+                // limit where it can leave, so the lane goes on with the
+                // program (its jump back still ends the lane, for a way round
+                // that passes no exit). Taken out of the program there, the
+                // pixels of PS_Textured_Eight's runaway search of its shadow
+                // cascades were discarded: holes in the objects it draws.
+                let leaves = if back(self, taken) || back(self, not_taken) {
+                    None
+                } else {
+                    self.jump_loop_exit(b, taken, not_taken)
+                };
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some((h, stay_taken)) = leaves {
+                    if stay_taken {
+                        let ok = self.limit_test(h, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else {
+                        let stop = self.limit_test(h, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                // With loop notes, the exit of a counted back edge passes a
+                // block that counts the lanes leaving at the limit.
+                // (the header, and whether the way that stays in the loop is `taken`)
+                let header = match [taken, not_taken].into_iter().find(|&h| back(self, h)) {
+                    Some(h) => Some((h, h == taken)),
+                    None => leaves,
+                };
+                let noted = match header {
+                    Some((h, true)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, not_taken, f, h, wanted, true);
+                        f = x;
+                        Some((not_taken, pred))
+                    }
+                    Some((h, false)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, taken, t, h, wanted, false);
+                        t = x;
+                        Some((taken, pred))
+                    }
+                    _ => None,
+                };
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
+                        // From an edge block, or from here (or from the
+                        // block after a note).
+                        let from = match noted {
+                            Some((n, pred)) if n == to => pred,
+                            _ if Some(via) == self.block[to] => self.cur,
+                            _ => via,
                         };
                         self.enter_loop(b, to, from);
                     }
@@ -11693,69 +11100,6 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
-    }
-
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
-        }
-    }
-
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
-        let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        self.s.m.tag(phi, Tag::Counter);
-        self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
-    }
-
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
-            return a;
-        }
-        let a = self.s.m.new_block();
-        if self.s.pixel {
-            let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
-        }
-        self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
-        a
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.

@@ -9,9 +9,11 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: only pipelines from streams of vertex or mesh, pixel and
+//! geometry stages and compute pipelines get host pipelines; tessellation
+//! stages and the plain graphics description keep their containers only.
+//! The title's geometry programs (voxelization) were drawn with in none of
+//! the runs so far: that path has only been run offline. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -67,6 +69,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its range of the loop notes (`crate::loop_notes`), given out on its
+    /// first draw.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) loop_slot: OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +125,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                loop_slot: OnceLock::new(),
             })
         })
         .clone()
@@ -135,6 +143,10 @@ pub(crate) struct Translated {
     /// A compute shader's group size (`numthreads`); `[0; 3]` for other
     /// stages. A `DispatchX` that counts threads is made groups with it.
     pub(crate) threads: [u32; 3],
+    /// Whether it can store through a raw address ([`stores_by_address`]):
+    /// only then may it write any copy of title memory by address
+    /// (`crate::memory`), which are then all declared written.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -202,10 +214,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let main = programs.into_iter().find(|p| {
         matches!(
             p.stage,
-            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs | HwStage::Gs
         )
     });
     let threads = match main.as_ref().map(|p| &p.io) {
@@ -213,7 +226,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => [0; 3],
     };
     let used = main.map(|p| p.used).unwrap_or_default();
-    Ok(Translated { host, used, stores, threads })
+    Ok(Translated { host, used, stores, threads, stores_by_address })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -415,6 +428,32 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
+}
+
+/// Whether a console program can store through a raw address: a flat or
+/// global store or atomic (not to scratch), or code that is not all known.
+/// Of the structure builder's 52 programs, 23 have flat or global
+/// accesses and 11 of those store or do atomics that way; the others store
+/// through their root views only. Every copy of title memory by address
+/// declared written for any program that can store had the builder's
+/// first frame put back 378 MB of title memory in 7,001 ranges (run
+/// rt-trace1; 67-85 MB a frame of gameplay without the builder, rt-off1).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -869,6 +908,39 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// A compute program of `words` then `s_endpgm`.
+    #[cfg(windows)]
+    fn program(words: &[u32]) -> victory_shader::NativeProgram {
+        use victory_shader::native::{ComputeIo, HwStage, StageIo};
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+        victory_shader::NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [32, 1, 1] }),
+            code,
+        }
+    }
+
+    /// A store through a raw address (global, flat) is one by address; a
+    /// store through a buffer descriptor stores without being one.
+    #[cfg(windows)]
+    #[test]
+    fn stores_by_address_are_flat_and_global_ones() {
+        // global_store_dword v[0:1], v2, off
+        let global = program(&[0xDC70_8000, 0x007D_0200]);
+        // buffer_store_dword v0, v11, s[0:3], 0 offen
+        let buffer = program(&[0xE070_1000, 0x8000_000B]);
+        // global_load_dword v0, v[0:1], off
+        let load = program(&[0xDC30_8000, 0x007D_0000]);
+        assert!(super::stores(&global) && super::stores_by_address(&global));
+        assert!(super::stores(&buffer) && !super::stores_by_address(&buffer));
+        assert!(!super::stores(&load) && !super::stores_by_address(&load));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

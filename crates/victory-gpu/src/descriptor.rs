@@ -1524,7 +1524,7 @@ mod tests {
         assert_eq!(create(desc, none, &mut h), S_OK);
         let host_heap = heap(h).host().expect("a host view heap");
         let key = std::ptr::from_ref(host_heap) as usize;
-        assert!(crate::memory::ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(crate::memory::ready(&list, host_heap, &[], &[], &[], false).is_some());
         assert!(crate::memory::has_run(key), "the heap's run is kept while it lives");
         assert_eq!(object::release_boxed::<Heap>(h), 0);
         assert!(!crate::memory::has_run(key), "a released heap's run is forgotten");

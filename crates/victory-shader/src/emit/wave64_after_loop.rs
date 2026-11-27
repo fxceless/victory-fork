@@ -381,7 +381,7 @@ fn nvidia_paired_permute_obeys_exec() {
 #[test]
 #[ignore = "requires VICTORY_WAVE_PAIRS=0 and a physical 32-lane GPU"]
 fn exact_permute_obeys_exec() {
-    assert!(!std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"));
+    assert!(std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0"));
     crate::emit::with_wave_pairs(false, permute_half_fixture);
 }
 
@@ -965,8 +965,8 @@ fn execute_wave32_dispatch(
         let entry = format!("VICTORY_WAVE_PAIRS_FP32={mode}");
         assert!(key.windows(entry.len()).any(|w| w == entry.as_bytes()));
     }
+    let global_pairs = crate::emit::wave_pairs_on();
     lower::TEST_HOST_WAVE.set(was);
-    let global_pairs = std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1");
     let paired = global_pairs || crate::emit::WAVE_PAIRS_HERE.get();
     assert_eq!(
         key.last(),
