@@ -2344,4 +2344,100 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// `ISG1`/`OSG1` rows keep element order within the same register, use
+    /// DXIL's canonical system-value names, and ignore `col` on unallocated
+    /// elements (`row == None`), matching what `dxil.dll` expects.
+    #[test]
+    fn signature_parts_match_dxil_validator() {
+        let mk = |name: &str, index, kind, comp, interp, row, col, cols, usage| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp,
+            row,
+            col,
+            cols,
+            usage,
+            half: false,
+        };
+        let finish_ps = |inputs, outputs, load_pair: bool| {
+            let mut s = shader::Shader::new(true);
+            s.inputs = inputs;
+            s.outputs = outputs;
+            let val = if load_pair {
+                let a_args = [s.m.i32(0), s.m.i32(0), s.m.i8(1), s.m.undef(s.t.i32)];
+                let a = s.op(
+                    s.entry,
+                    "loadInput.f32",
+                    super::bitcode::Attr::ReadNone,
+                    s.t.f32,
+                    4,
+                    &a_args,
+                );
+                let b_args = [s.m.i32(1), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
+                let _b = s.op(
+                    s.entry,
+                    "loadInput.f32",
+                    super::bitcode::Attr::ReadNone,
+                    s.t.f32,
+                    4,
+                    &b_args,
+                );
+                a
+            } else {
+                s.m.f32(0)
+            };
+            for ch in 0..4u8 {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(ch), val];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    super::bitcode::Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+            let entry = s.entry;
+            s.m.terminate(entry, super::bitcode::Term::Ret);
+            HostShader {
+                stage: HwStage::Ps,
+                dxil: s.finish(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+            }
+        };
+        // Same-row packed elements listed high-column first (col 2 before col 0).
+        validate(&finish_ps(
+            vec![
+                mk("COLOR", 0, 0, 9, 2, Some(0), 2, 2, 0b10),
+                mk("TEXCOORD", 0, 0, 9, 2, Some(0), 0, 2, 0b01),
+            ],
+            vec![mk("SV_Target", 0, 16, 9, 0, Some(0), 0, 4, 0xf)],
+            true,
+        ));
+        // Non-canonical system-value casing in ISG1 and OSG1.
+        validate(&finish_ps(
+            vec![
+                mk("SV_POSITION", 0, 3, 9, 4, Some(0), 0, 4, 0),
+                mk("SV_ISFRONTFACE", 0, 13, 5, 1, Some(1), 0, 1, 0),
+                mk("SV_SAMPLEINDEX", 0, 12, 5, 1, None, 0, 1, 0),
+            ],
+            vec![mk("SV_TARGET", 0, 16, 9, 0, Some(0), 0, 4, 0xf)],
+            false,
+        ));
+        // Unallocated element with non-zero col in the source signature.
+        validate(&finish_ps(
+            vec![mk("SV_SampleIndex", 0, 12, 5, 1, None, 1, 1, 0)],
+            vec![mk("SV_Target", 0, 16, 9, 0, Some(0), 0, 4, 0xf)],
+            false,
+        ));
+    }
 }
