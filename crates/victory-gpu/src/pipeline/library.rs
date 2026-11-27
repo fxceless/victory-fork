@@ -591,6 +591,7 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SAVE_LOCK: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -600,11 +601,15 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // Serialize the entire file-write and rename sequence across worker saves
+    // and shutdown's `save(true)` so two threads never race on the `.tmp` or
+    // target files after `library.saving.write()` is released.
+    let _save_guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = temp_path(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -614,7 +619,8 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !used_changed && added == 0 {
             return;
         }
         if added == 0 {
@@ -626,6 +632,9 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                if used_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
@@ -634,7 +643,13 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 {
+        replace_library(dir, &tmp).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    } else {
+        Ok(())
+    };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -693,12 +708,29 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
     std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
+/// A unique sibling temporary path for an atomic replacement of `path`.
+fn temp_path(path: &std::path::Path) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("library");
+    path.with_file_name(format!("{stem}.{pid}.{seq}.tmp"))
+}
+
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let tmp = temp_path(path);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -860,5 +892,29 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn temp_paths_are_unique_and_write_atomically_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(EARLY_FILE);
+        let a = temp_path(&target);
+        let b = temp_path(&target);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), target.parent());
+        assert_eq!(b.parent(), target.parent());
+
+        write_atomically(&target, b"first\nsecond").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first\nsecond");
+
+        // Second replacement overwrites cleanly and leaves no `.tmp` files behind.
+        write_atomically(&target, b"updated").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"updated");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
     }
 }
