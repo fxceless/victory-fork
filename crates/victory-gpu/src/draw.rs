@@ -69,7 +69,7 @@ thread_local! {
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
     /// For the run of the texture pass `State::bake_sources_pass` makes
     /// before a draw of the title's skin bake: the title slots that draw
     /// samples and that wait in the queue. That run serves them alone,
@@ -2520,7 +2520,7 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some(budget));
+        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         Self::heap_textures(Into::List(list), heap, host);
         PASS_BUDGET.set(None);
         if bake {
@@ -2570,7 +2570,7 @@ impl State {
                 PASS_SOURCED.set([0; 4]);
                 // No budget of the frame's: the run serves the sources
                 // alone, within their own bytes.
-                PASS_BUDGET.set(Some((0, 0)));
+                PASS_BUDGET.set(Some((0, 0, true)));
                 Self::heap_textures(Into::List(list), heap, host);
                 PASS_BUDGET.set(None);
                 PASS_SOURCES.set(None);
@@ -2858,6 +2858,22 @@ impl State {
         // did or will do.
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
+        let explicit_budget = PASS_BUDGET.get();
+        let mut frame_budget = if crate::texture_budget::enabled() && !only
+            && !explicit_budget.is_some_and(|(_, _, bake)| bake)
+        {
+            static CAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+            let cap = *CAP.get_or_init(|| std::time::Duration::from_millis(
+                std::env::var("VICTORY_TEXTURE_SLICE_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|&ms| ms > 0).unwrap_or(64)
+            ));
+            let backlog = HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed);
+            let Some(pass) = crate::texture_budget::Pass::start(frame, crate::texture_budget::limit(cap, backlog)) else {
+                return;
+            };
+            Some(pass)
+        } else {
+            None
+        };
         // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
         // as if the card had room, within its own bytes.
         let forced = only && bake_sources_mode().0 == BakeMode::Full;
@@ -2899,7 +2915,12 @@ impl State {
             // The bake draw's own, due or not, held or not.
             Some(slots) => host.texture_slots_queued(slots),
             None => {
-                let (due, census) = host.texture_slots_due(frame, 8192);
+                let oldest_first = frame_budget.as_ref().is_some_and(crate::texture_budget::Pass::oldest_first);
+                let (due, census) = if oldest_first {
+                    host.texture_slots_due_budget(frame, 8192, true)
+                } else {
+                    host.texture_slots_due(frame, 8192)
+                };
                 // What the slots shaders pick by index show, every five seconds.
                 #[cfg(feature = "diagnostics")]
                 host.placed_slot_census();
@@ -2959,8 +2980,8 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
+        let (span, bytes_at_most) = match explicit_budget {
+            Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -2980,6 +3001,10 @@ impl State {
             let ahead = matches!(into, Into::Ahead(_));
             if ahead && crate::heap_worker::make_way() {
                 break;
+            }
+            if let Some(budget) = &mut frame_budget {
+                if budget.exhausted() { break; }
+                budget.try_slot();
             }
             // The record the slot has now, and the texture it names held
             // while a thread of ours works on it. (Released meanwhile, or
