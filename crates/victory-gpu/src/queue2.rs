@@ -1044,4 +1044,45 @@ void main() {
         second.down.send(again, &[], 0).expect("sent");
         warp.land();
     }
+
+    #[test]
+    fn warp_copy_lane_keeps_four_blocked_batches_distinct() {
+        let mut warp = Warp::new(1).expect("WARP copy queues");
+        let (source, _) = warp.buffer(64 << 10, false);
+        let outputs: Vec<_> = (0..4).map(|_| warp.buffer(64 << 10, true)).collect();
+        // SAFETY: the gate belongs to this rig and is signalled by the CPU.
+        let gate: ID3D12Fence = unsafe { warp.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        for step in 1..=8u64 {
+            let values = std::array::from_fn::<_, 4, _>(|i| step as u32 * 100 + i as u32);
+            let mut after = 0;
+            for (i, value) in values.into_iter().enumerate() {
+                after = warp.store(&source, i as u32 * 256, value, 0);
+            }
+            let mut pending = Vec::new();
+            for (i, (output, _)) in outputs.iter().enumerate() {
+                let list = warp.second.down.list().expect("copy list");
+                let address = list.1.as_raw();
+                // SAFETY: an open copy list; buffers are retained through land.
+                unsafe { list.1.CopyBufferRegion(output, 0, &source, i as u64 * 256, 4) };
+                let job = warp
+                    .second
+                    .down
+                    .send(list, &[(&gate, step), (&warp.fence, after)], 4)
+                    .expect("queued copy");
+                pending.push((address, job));
+            }
+            let blocked = pending.iter().all(|&(_, job)| !warp.second.down.done(job));
+            // SAFETY: the CPU owns this gate; the fence value is increasing.
+            unsafe { gate.Signal(step) }.unwrap();
+            warp.land();
+            assert!(blocked, "a job completed before the gate was opened");
+            for (i, &(address, _)) in pending.iter().enumerate() {
+                assert!(!pending[..i].iter().any(|&(earlier, _)| earlier == address));
+            }
+            for ((_, ptr), expected) in outputs.iter().zip(values) {
+                // SAFETY: CPU-visible buffer; all GPU jobs are fenced.
+                assert_eq!(unsafe { ptr.cast::<u32>().read_volatile() }, expected);
+            }
+        }
+    }
 }
