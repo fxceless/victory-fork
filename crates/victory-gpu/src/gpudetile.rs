@@ -403,14 +403,18 @@ mod tests {
     }
 
     impl Rig {
-        /// The software adapter only (never the card).
-        fn new() -> Option<Rig> {
-            // SAFETY: plain object creation on a device of our own.
+        /// Use WARP by default, or the same device as the runtime when requested.
+        fn new(hardware: bool) -> Option<Rig> {
+            // SAFETY: plain creation of a device, queue and command list.
             unsafe {
-                let adapter = crate::host::warp_adapter().ok()?;
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                let device = if hardware {
+                    crate::host::host()?.device.clone()
+                } else {
+                    let adapter = crate::host::warp_adapter().ok()?;
+                    let mut device: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                    device?
+                };
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
                     .ok()?;
@@ -434,7 +438,7 @@ mod tests {
                 self.queue.ExecuteCommandLists(&[Some(run)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
                 self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
-                assert_eq!(WaitForSingleObject(self.event, 60_000), WAIT_OBJECT_0, "the software adapter did not finish");
+                assert_eq!(WaitForSingleObject(self.event, 60_000), WAIT_OBJECT_0, "the D3D12 device did not finish");
                 let removed = self.device.GetDeviceRemovedReason();
                 assert!(removed.is_ok(), "device lost: {removed:?}");
                 self.allocator.Reset().unwrap();
@@ -591,12 +595,15 @@ mod tests {
     }
 
     /// The card detiles every addressable mode as the CPU does, byte for
-    /// byte, on the software adapter: BC and plain formats of every element
-    /// size, mip tails, arrays, thick 3D, linear, and levels on demand that
-    /// are not the title's.
+    /// byte: BC and plain formats of every element size, mip tails, arrays,
+    /// thick 3D, linear, and levels on demand. Use WARP by default; set
+    /// VICTORY_TEST_GPU_DETILE_HARDWARE=1 to test the runtime device.
     #[test]
     fn the_card_detiles_as_the_cpu_does() {
-        let Some(mut rig) = Rig::new() else {
+        let hardware = std::env::var_os("VICTORY_TEST_GPU_DETILE_HARDWARE")
+            .is_some_and(|value| value == "1");
+        let Some(mut rig) = Rig::new(hardware) else {
+            assert!(!hardware, "could not create the requested runtime D3D12 device");
             eprintln!("no software adapter: not run");
             return;
         };
@@ -629,6 +636,7 @@ mod tests {
         all &= both(&mut rig, &d, &cases[0], !0b11);
         all &= both(&mut rig, &d, &cases[4], !0b1);
         assert!(all, "the card's detiling differs from the CPU's (see above)");
+        eprintln!("detile readback matched {} cases", cases.len() + 2);
     }
 
     /// The costs this replaces, on this PC (run alone, in release:
