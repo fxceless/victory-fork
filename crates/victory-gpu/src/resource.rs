@@ -2485,6 +2485,46 @@ impl Drop for Resource {
     }
 }
 
+/// A committed buffer of `width` zeroed bytes, for tests elsewhere in the
+/// crate that need a title buffer object.
+#[cfg(test)]
+pub(crate) fn test_buffer(width: u64) -> This {
+    let properties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let null = std::ptr::null();
+    let mut buffer = null;
+    let hr = create_committed(
+        null,
+        &properties,
+        0,
+        &desc,
+        0,
+        null.cast(),
+        &RESOURCE_IIDS[0],
+        &mut buffer,
+    );
+    assert_eq!(hr, S_OK);
+    buffer
+}
+
 pub(crate) extern "system" fn create_committed(
     _: This,
     heap: *const HeapProperties,

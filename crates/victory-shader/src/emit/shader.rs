@@ -37,7 +37,9 @@ pub const LAUNCH_SPACE: u32 = 9;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: a constant buffer view,
+/// or a typed buffer whose element size the host does not know;
+/// [`SLOT_STRIDES_SKIP`]: no buffer view at all).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -46,6 +48,28 @@ pub const LAUNCH_SPACE: u32 = 9;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] entry of a slot that holds no buffer view and no
+/// constant buffer view (a texture's, a null view, nothing): a buffer the
+/// program picks there is read as nothing. With 0 there (as before) such
+/// a slot was read as a constant buffer, and on AMD a texture's descriptor
+/// read as a buffer's points at its image address shifted right by 8: 13
+/// of the 16 page faults recorded for the meshlet culls of the previous
+/// frame's records (`CS_BatchCullMeshlets_Prev`,
+/// `CS_BatchCullPreSkinnedMeshlets_Prev`, with work sent ahead) are such
+/// addresses. Such a buffer reads the null view of its class the host keeps
+/// below the null slot instead ([`NULL_BUFFER_SRV_BELOW`]).
+pub const SLOT_STRIDES_SKIP: u32 = u32::MAX;
+
+/// How far below the host view heap's null slot ([`view_heap_limit`]) the
+/// null views sit that a buffer picked from the heap reads where the host's
+/// table says its slot holds no buffer view ([`SLOT_STRIDES_SKIP`]): one
+/// per descriptor class, so the view matches the access. The null slot's
+/// own 2D view read as a buffer is a mismatch not every GPU survives.
+pub const NULL_BUFFER_SRV_BELOW: u32 = 1;
+/// See [`NULL_BUFFER_SRV_BELOW`]: a raw buffer UAV, for writes.
+pub const NULL_BUFFER_UAV_BELOW: u32 = 2;
+/// See [`NULL_BUFFER_SRV_BELOW`]: a constant buffer view, the lowest.
+pub const NULL_CBV_BELOW: u32 = 3;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -173,7 +197,17 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_VIEW_LIMIT.get() {
+        return limit;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`view_heap_limit`], for its thread only.
+    pub(super) static TEST_VIEW_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) struct Shader {
@@ -459,7 +493,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);

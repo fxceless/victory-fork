@@ -5939,15 +5939,16 @@ impl<'a> Lower<'a> {
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
         // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // (a stride) from a constant buffer (0) and from anything else
+        // (`SLOT_STRIDES_SKIP`, negative), which neither load reads: only
+        // the load that fits the slot runs, and a slot neither fits reads 0.
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let is_buffer = self.s.m.cmp(self.cur, pred::SGT, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -6722,7 +6723,30 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let mut index = self.heap_index(*load, *first, sampler)?;
+                // A buffer (typed, raw, structured, constant) picked from
+                // the heap where the host's table says the slot holds no
+                // buffer view (`SLOT_STRIDES_SKIP`) reads the null view of
+                // its class the host keeps below the null slot
+                // (`NULL_BUFFER_SRV_BELOW`). A texture's descriptor read as
+                // a buffer's is an address of nothing (AMD: the image's
+                // address shifted right by 8).
+                let limit = super::shader::view_heap_limit();
+                if !sampler
+                    && matches!(props.0 & 0xff, 10..=13 | 15)
+                    && limit != 0
+                    && let Some(stride) = self.slot_stride(src)?
+                {
+                    let below = match props.0 & 0xff {
+                        13 => super::shader::NULL_CBV_BELOW,
+                        _ if props.0 & 0x1000 != 0 => super::shader::NULL_BUFFER_UAV_BELOW,
+                        _ => super::shader::NULL_BUFFER_SRV_BELOW,
+                    };
+                    let skip = self.s.m.i32(super::shader::SLOT_STRIDES_SKIP);
+                    let none = self.s.m.cmp(self.cur, pred::EQ, stride, skip);
+                    let null = self.s.m.i32(limit.saturating_sub(below));
+                    index = self.s.m.select(self.cur, none, null, index);
+                }
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);

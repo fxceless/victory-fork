@@ -85,6 +85,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod heap_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -113,9 +115,10 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    LAUNCH_SPACE, mesh_payload_bytes, MEMORY_FAULTS, MEMORY_NOTES, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    LAUNCH_SPACE, mesh_payload_bytes, MEMORY_FAULTS, MEMORY_NOTES, MEMORY_PAGES, NULL_BUFFER_SRV_BELOW, NULL_BUFFER_UAV_BELOW,
+    NULL_CBV_BELOW, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_SKIP,
+    USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.

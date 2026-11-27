@@ -118,8 +118,9 @@ pub(crate) struct HostHeap {
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
-    /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// (`victory_shader::emit::SLOT_STRIDES`; entries: [`stride_entry`]):
+    /// an upload buffer of `SLOT_STRIDES_COUNT` dwords, its GPU address
+    /// and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -995,6 +996,23 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// The table-of-strides entry of a slot that holds `view`, made or a null
+/// view of its kind: a buffer view's stride, 0 for a constant buffer view
+/// (shaders read it as one) and for a buffer's own view (made without a
+/// description: its element size unknown), `SLOT_STRIDES_SKIP` for anything
+/// else, which shaders that pick a buffer there read as nothing.
+fn stride_entry(view: &View) -> u32 {
+    match view {
+        View::Constant(..) => 0,
+        View::Shader(r, None) | View::Unordered(r, _, None)
+            if crate::resource::buffer_bytes(*r as crate::object::This).is_some() =>
+        {
+            0
+        }
+        _ => view_stride(view).unwrap_or(victory_shader::emit::SLOT_STRIDES_SKIP),
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1084,6 +1102,19 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// How many of the title's `count` view slots a host view heap whose null
+/// slot is `null` holds: all of them while they and the `extra` dynamic
+/// slots fit below the null views of each class kept under the null slot
+/// (`victory_shader::emit::NULL_BUFFER_SRV_BELOW`).
+fn view_heap_fit(count: u32, extra: u32, null: u32) -> u32 {
+    let room = null - victory_shader::emit::NULL_CBV_BELOW;
+    if count + extra <= room {
+        count
+    } else {
+        room - extra
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1107,7 +1138,9 @@ impl HostHeap {
         let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
-        // slots, then the dynamic ones, then null up to and with that slot.
+        // slots, then the dynamic ones, then null up to and with that slot,
+        // the three just below it the null views of each class a buffer
+        // picked where the stride table says no buffer view reads.
         if !sampler {
             probe_view_limit();
         }
@@ -1126,14 +1159,15 @@ impl HostHeap {
             }
         } else {
             let size = null + 1;
-            let fitted = if count + extra <= null {
-                count
-            } else {
+            let fitted = view_heap_fit(count, extra, null);
+            if fitted < count {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
-            };
+                tracing::warn!(
+                    count,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
+            }
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
                 Err(e) => {
@@ -1162,9 +1196,10 @@ impl HostHeap {
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
+                // Every slot holds no buffer view yet (`SLOT_STRIDES_SKIP`).
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
-                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    std::ptr::write_bytes(data, 0xFF, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
                 crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
@@ -1214,6 +1249,11 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        }
+        if null != 0 {
+            null_buffer_view(h.cpu(null - victory_shader::emit::NULL_BUFFER_SRV_BELOW));
+            null_buffer_uav(h.cpu(null - victory_shader::emit::NULL_BUFFER_UAV_BELOW));
+            null_constant_view(h.cpu(null - victory_shader::emit::NULL_CBV_BELOW));
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -2021,13 +2061,12 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-        }
+        // Until `mirror` has written the slot (and then the entry), the
+        // entry says it holds no buffer view: the new stride written here
+        // sat beside the slot's old descriptor, a texture's read as a
+        // buffer's.
+        self.set_stride(index, victory_shader::emit::SLOT_STRIDES_SKIP);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -2042,6 +2081,22 @@ impl HostHeap {
                 .insert(index);
         }
         stale
+    }
+
+    /// Writes slot `index`'s entry in the table of strides, which shaders
+    /// read while we write (a dword; the caller orders it against the
+    /// slot's own bytes).
+    fn set_stride(&self, index: u32, entry: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping.
+            unsafe {
+                (*data as *mut u32)
+                    .add(index as usize)
+                    .write_volatile(entry)
+            };
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -2476,8 +2531,9 @@ impl HostHeap {
                 held.slot_changed();
                 made[index as usize] = 0;
                 self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
-                self.make_null(index);
+                // Out of the stride table before the slot is a null 2D view.
                 let _ = self.note_buffer(index, None, false);
+                self.make_null(index);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
@@ -2547,6 +2603,10 @@ impl HostHeap {
             }
             #[cfg(feature = "diagnostics")]
             let keeping = std::time::Instant::now();
+            // The slot holds the view or a null view of its kind: now its
+            // entry may say so, behind the slot's own bytes.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            self.set_stride(index, stride_entry(&view));
             self.keep(index, kept.flatten());
             #[cfg(feature = "diagnostics")]
             if mirror_timing() {
@@ -2571,6 +2631,16 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .get(index as usize)
             .is_some_and(|&key| key != 0)
+    }
+
+    /// Slot `index`'s entry in the table of strides (tests); `None`
+    /// without one.
+    #[cfg(test)]
+    pub(crate) fn stride(&self, index: u32) -> Option<u32> {
+        let (_, _, data) = self.strides.as_ref()?;
+        (index < victory_shader::emit::SLOT_STRIDES_COUNT)
+            // SAFETY: inside the mapping.
+            .then(|| unsafe { (*data as *const u32).add(index as usize).read_volatile() })
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -3895,11 +3965,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        View::Constant(..) => return null_constant_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -3983,6 +4049,39 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// A raw buffer UAV that drops writes and reads zeros.
+fn null_buffer_uav(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
+/// A constant buffer view that reads zeros.
+fn null_constant_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+    // SAFETY: a slot of our heap; a zero location makes a null view.
+    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -4910,6 +5009,119 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    const SKIP: u32 = victory_shader::emit::SLOT_STRIDES_SKIP;
+
+    /// A view of title memory as a structured buffer of 4 elements of
+    /// `stride` bytes (format unknown, dimension buffer, the default
+    /// mapping).
+    fn placed_buffer(stride: u32) -> View {
+        let mut desc = [0u32; 16];
+        desc[..9].copy_from_slice(&[0, 1, 0x1688, 0, 0, 0, 4, stride, 0]);
+        View::Placed(
+            false,
+            [1, 0, 0, 0, 64, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+            desc,
+        )
+    }
+
+    /// Until a slot holds a buffer view, the table of strides says it
+    /// holds none: so it says for every slot of a new heap.
+    #[test]
+    fn the_stride_table_starts_with_every_slot_skipped() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        for index in [0, 7, victory_shader::emit::SLOT_STRIDES_COUNT - 1] {
+            assert_eq!(heap.stride(index), Some(SKIP), "slot {index}");
+        }
+    }
+
+    /// Below a view heap's null slot sit the null views of each class that
+    /// a buffer picked where the stride table says no buffer view reads
+    /// (`NULL_BUFFER_SRV_BELOW`): the title's slots and the dynamic ones
+    /// end below them, also on a host that caps its heap.
+    #[test]
+    fn the_title_slots_end_below_the_null_buffer_views() {
+        let lowest = victory_shader::emit::NULL_CBV_BELOW;
+        assert_eq!(view_heap_fit(1_100_000, DYNAMIC, (1 << 21) - 1), 1_100_000);
+        let capped = PORTABLE_VIEWS - 1;
+        assert_eq!(
+            view_heap_fit(1_100_000, DYNAMIC, capped) + DYNAMIC,
+            capped - lowest
+        );
+        let just = capped - lowest - DYNAMIC;
+        assert_eq!(view_heap_fit(just, DYNAMIC, capped), just);
+        assert_eq!(view_heap_fit(just + 1, DYNAMIC, capped), just);
+    }
+
+    /// What a slot is to hold is noted before `mirror` writes the slot:
+    /// from then until `mirror` has written it, its entry says it holds no
+    /// buffer view, neither the old view's stride (the slot is about to
+    /// change) nor the new one's (beside the old descriptor).
+    #[test]
+    fn the_stride_of_a_noted_slot_stays_skipped_until_mirror_writes_it() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, placed_buffer(16));
+        heap.mirror(1, handle, false);
+        assert_eq!(heap.stride(1), Some(16));
+        let wider = placed_buffer(32);
+        assert!(heap.note_buffer(1, Some(&wider), false).is_empty());
+        assert_eq!(heap.stride(1), Some(SKIP));
+    }
+
+    /// Once `mirror` has written a slot, its entry says what the slot
+    /// holds: a buffer view's stride (its null view's too, before a draw
+    /// makes the view), 0 for a constant buffer view, none for a texture's,
+    /// and none once its record names no view.
+    #[test]
+    fn mirror_publishes_the_stride_of_what_the_slot_holds() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fef_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let texture = View::Placed(
+            false,
+            [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+            desc,
+        );
+        let mut records = [[0u32; 8]; 4];
+        let handles: Vec<u64> = records.iter_mut().map(|r| r.as_mut_ptr() as u64).collect();
+        let views = [
+            (1, placed_buffer(16)),
+            (2, View::Constant(at + 0x1000_0000, 256)),
+            (3, texture),
+        ];
+        for (slot, view) in views {
+            crate::descriptor::record(handles[slot], view);
+            heap.mirror(slot as u32, handles[slot], false);
+        }
+        assert_eq!(heap.stride(1), Some(16));
+        assert_eq!(heap.stride(2), Some(0));
+        assert_eq!(heap.stride(3), Some(SKIP));
+        // Slot 1's record names no view any more; a draw reads it.
+        // SAFETY: record 1, alive in `records`.
+        unsafe { (handles[1] as *mut [u32; 8]).write([0; 8]) };
+        heap.mirror(1, handles[1], true);
+        assert_eq!(heap.stride(1), Some(SKIP));
+    }
+
+    /// A buffer's own view (made without a description) is a buffer view
+    /// whose element size the host does not know: entry 0, as for every
+    /// buffer view before the table told texture slots apart.
+    #[test]
+    fn a_buffers_own_view_is_a_buffer_view_of_unknown_element_size() {
+        let buffer = crate::resource::test_buffer(256) as usize;
+        assert_eq!(stride_entry(&View::Shader(buffer, None)), 0);
+        assert_eq!(stride_entry(&View::Unordered(buffer, 0, None)), 0);
     }
 }
 

@@ -1033,6 +1033,16 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// The null view a host view heap keeps in its null slot (an RGBA8 2D
+    /// SRV of no resource).
+    Null,
+    /// The null views a host view heap keeps just below its null slot, one
+    /// per descriptor class, for buffers picked where the host's table says
+    /// the slot holds no buffer view: a raw buffer SRV, a raw buffer UAV
+    /// and a constant buffer view, each of no resource.
+    NullBuffer,
+    NullUav,
+    NullCbv,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1362,6 +1372,60 @@ impl Host {
                             at,
                         );
                         keep.push(b);
+                    }
+                    View::Null => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+                    }
+                    View::NullBuffer => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    NumElements: 1,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+                    }
+                    View::NullUav => {
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: 1,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            at,
+                        );
+                    }
+                    View::NullCbv => {
+                        dev.CreateConstantBufferView(
+                            Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC::default()),
+                            at,
+                        );
                     }
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
