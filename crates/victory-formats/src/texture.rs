@@ -836,9 +836,11 @@ impl Texture {
         } else {
             1
         };
+        let max_mips = 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros();
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
-            n => n,
+            0 => max_mips,
+            n if n <= max_mips => n,
+            _ => return Err(Error::Invalid),
         };
         let plane = |bytes| Desc {
             dimension: desc.dimension,
@@ -1100,6 +1102,55 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn texture_mip_count_is_bounded_by_spatial_extent() {
+        let array = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 8,
+            height: 4,
+            depth_or_array: 32,
+            mips: 0,
+            format: 28,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        // Array layers do not increase the length of the mip chain.
+        let automatic = Texture::new(&array).unwrap();
+        assert_eq!(automatic.planes[0].layout.mips.len(), 4);
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 4, ..array }),
+            Ok(automatic)
+        );
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 5, ..array }),
+            Err(Error::Invalid)
+        );
+
+        // A volume's depth, unlike an array size, contributes to its chain.
+        let volume = TextureDesc {
+            dimension: Dimension::Tex3d,
+            ..array
+        };
+        let automatic = Texture::new(&volume).unwrap();
+        assert_eq!(automatic.planes[0].layout.mips.len(), 6);
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 6, ..volume }),
+            Ok(automatic)
+        );
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 7, ..volume }),
+            Err(Error::Invalid)
+        );
+
+        let single = TextureDesc {
+            width: 1,
+            height: 1,
+            mips: 2,
+            ..array
+        };
+        assert_eq!(Texture::new(&single), Err(Error::Invalid));
     }
 
     #[test]
