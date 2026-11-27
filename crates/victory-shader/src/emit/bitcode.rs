@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+pub mod facts;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -260,6 +261,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// The console operations several instructions make ([`facts::Made`]), by the last one.
+    made: HashMap<u32, facts::Made>,
+    /// What is known of instructions' values so far ([`Module::facts`]).
+    facts_seen: HashMap<u32, facts::Facts>,
     /// Written without the fast-math flags whatever [`opt::FAST`] says: a program whose
     /// float results must be the console's bit for bit (the ordered paired FP32
     /// reductions), while the others keep the flags.
