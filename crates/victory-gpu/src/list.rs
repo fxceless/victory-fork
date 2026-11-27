@@ -839,6 +839,12 @@ extern "system" fn copy_buffer_region(
         // in order (`crate::host::HostList::card_copy`).
         && !list.card_copy(to as usize, from as usize, len as usize)
     {
+        // A source that flights in the air write: also on the card, behind
+        // them, so that the submission need not settle them to read it
+        // (`VICTORY_CARD_READ_COPY=1`).
+        if list.copy_after_flights(to, from, len as usize) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]

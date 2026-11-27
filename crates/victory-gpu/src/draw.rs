@@ -1115,6 +1115,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if let Some(gpu) = list.card_constant(address, len) {
+        return Some(gpu);
+    }
     // Where shaders wrote (`VICTORY_CARD_FILLS`): copied on the card, in order.
     if crate::host::shaders_wrote(address as usize, len as usize)
         && let Some(gpu) = list.card_fill(&shadow, address, len)
@@ -4139,6 +4142,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = list.card_constant(address, u64::from(size)) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         // Where shaders wrote (`VICTORY_CARD_FILLS`): copied
                         // on the card, in order.
                         if crate::host::shaders_wrote(address as usize, size as usize)

@@ -3101,6 +3101,11 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// A title buffer copy whose source flights in the air write
+    /// ([`readcopy`]): also done on the card, in the list. The flag says the
+    /// CPU copies it at submission as a `Copy` does; unset, the card's copy
+    /// alone is the copy, and nothing waits for flights on its account.
+    CardCopy(usize, usize, usize, std::sync::atomic::AtomicBool),
     /// Work that may write title memory; with the place it writes
     /// (address, bytes) when that is known (the title's memory-to-memory
     /// copies, `crate::list` `copy_memory`): [`near_writes`].
@@ -3112,6 +3117,18 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+}
+
+impl Step {
+    /// Whether the CPU does this step's copy at submission: a `Copy`
+    /// always, a [`Step::CardCopy`] unless the submission left it to the
+    /// card ([`readcopy::decide`]).
+    fn on_cpu(&self) -> bool {
+        match self {
+            Step::CardCopy(.., on_cpu) => on_cpu.load(Ordering::Relaxed),
+            _ => true,
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3142,6 +3159,10 @@ struct Deferred {
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
+    /// With `VICTORY_CARD_READ_COPY=2`: constant buffers copied on the card
+    /// since the last title copy (source, bytes): the host GPU address of
+    /// the copy ([`HostList::card_constant`]).
+    carded: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -3180,6 +3201,14 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// A title copy or work of ours that writes title memory was recorded:
+    /// what the list knew of title memory no longer holds.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.carded.clear();
     }
 }
 
@@ -3839,8 +3868,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
     for list in runs {
         for step in &list.deferred().copies {
+            if !step.on_cpu() {
+                continue;
+            }
             match step {
-                &Step::Copy(dst, src, len) => {
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
@@ -4157,6 +4190,8 @@ mod fill_ahead {
 
 pub(crate) use fill_ahead::wrote as shaders_write;
 pub(crate) use fill_ahead::shaders_wrote;
+
+mod readcopy;
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights (`blocked_by`), which one they are, and whether the wait was
@@ -5015,6 +5050,7 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    readcopy::line_per_frame(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -7107,6 +7143,7 @@ impl Host {
             return;
         };
         let told = !sent.writes.is_empty();
+        readcopy::note_sent(&sent);
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -7158,6 +7195,7 @@ impl Host {
             return 0;
         };
         let number = sent.number;
+        readcopy::note_sent(&sent);
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -7361,6 +7399,9 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        if late {
+            readcopy::decide(runs);
+        }
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
@@ -9179,8 +9220,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-        deferred.gpu_written.clear();
+        deferred.title_written();
         if list_reuse_set() {
             deferred.filled.clear();
         }
@@ -9543,8 +9583,7 @@ impl HostList {
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
-        deferred.refreshed.clear();
-        deferred.gpu_written.clear();
+        deferred.title_written();
         if list_reuse_set() {
             deferred.filled.clear();
         }
@@ -9620,11 +9659,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            if !step.on_cpu() {
+                continue;
+            }
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = StepTimed(
                 match step {
-                    Step::Copy(..) => 0,
+                    Step::Copy(..) | Step::CardCopy(..) => 0,
                     Step::Fill(..) => 1,
                     Step::Refresh(..) => 2,
                     Step::Run(..) => 3,
@@ -9635,7 +9677,8 @@ impl HostList {
                 started,
             );
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
