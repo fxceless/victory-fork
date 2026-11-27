@@ -191,8 +191,8 @@ impl<'a> Lower<'a> {
 
     /// The paired form: an instruction that reads other lanes of the console wave, any of its
     /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
-    /// the thread) and `ds_bpermute_b32`. Lane n and lane n + 32 are the lower and the upper
-    /// lane of host lane n.
+    /// the thread). `ds_bpermute_b32` stays within its own 32-lane half on GFX10.
+    /// Lane n and lane n + 32 are the lower and the upper lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
@@ -228,8 +228,8 @@ impl<'a> Lower<'a> {
                 self.write_i(inst, r, None)?;
             }
             _ => {
-                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
-                // its data, or 0 outside EXEC
+                // GFX10 bpermute addresses only the destination lane's own half.
+                // An inactive source lane supplies zero.
                 let Fields::Ds {
                     dst: Some(Operand::Vector { reg, .. }),
                     addr: Some(addr),
@@ -256,10 +256,9 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let read = [
-                    pick(self, x_lo, x_hi, from_lo),
-                    pick(self, x_lo, x_hi, from_hi),
-                ];
+                let from_lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                let from_hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                let read = [self.read_lane(x_lo, from_lo), self.read_lane(x_hi, from_hi)];
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {
@@ -440,6 +439,10 @@ impl<'a> Lower<'a> {
     fn paired_shape(&mut self, shape: super::super::wave::Shape) -> Result<[V; 2], Why> {
         use super::super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
+            Shape::ActiveF64(..) => return Err("a paired FP64 reduction"),
+            Shape::Prefix(Op::AddF | Op::AddH | Op::MinF | Op::MaxF, ..) => {
+                return Err("a paired floating-point prefix");
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
