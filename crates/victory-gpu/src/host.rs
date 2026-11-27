@@ -10792,7 +10792,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::finish_frame(frame, buffer, footprint);
             }
             // What Present answers was thrown away: a removal it is the
             // first to report then looked as if the next call found it.
