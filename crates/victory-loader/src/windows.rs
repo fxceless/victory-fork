@@ -288,20 +288,8 @@ impl LoadedImage {
     /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
-            let slot = (self.base() + rva as usize) as *mut u64;
-            let mut old = 0;
-            // SAFETY: the parser only yields slots inside the image.
-            if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
-                bail!(
-                    "VirtualProtect(IAT slot {rva:#x}) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
-            unsafe { slot.write_volatile(address as u64) };
-            let mut ignored = 0;
-            // SAFETY: restoring the protection we just changed.
-            unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+            // SAFETY: `self.base()` is a mapped image of `self.info.size_of_image` bytes.
+            unsafe { write_slot_at(self.base(), self.info.size_of_image, rva, address)? };
         }
         Ok(())
     }
@@ -428,5 +416,155 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+/// Writes an 8-byte IAT entry at `base + rva`, preserving per-page protection
+/// even if an unaligned slot straddles a 4 KiB page boundary.
+///
+/// # Safety
+/// `base..base + size_of_image` must be a valid mapped region.
+unsafe fn write_slot_at(base: usize, size_of_image: u32, rva: u32, address: usize) -> Result<()> {
+    const PAGE_SIZE: usize = 0x1000;
+    if !rva
+        .checked_add(8)
+        .is_some_and(|end| end <= size_of_image)
+    {
+        bail!("IAT slot {rva:#x} runs outside the image");
+    }
+    let addr = base
+        .checked_add(rva as usize)
+        .ok_or_else(|| anyhow::anyhow!("IAT slot {rva:#x} address overflow"))?;
+    let slot = addr as *mut u8;
+    let first_page = addr & !(PAGE_SIZE - 1);
+    let last_page = (addr + 7) & !(PAGE_SIZE - 1);
+
+    let write_bytes = |ptr: *mut u8, val: u64| {
+        if (ptr as usize).is_multiple_of(8) {
+            // SAFETY: inside the mapped region, writable, and 8-byte aligned.
+            unsafe { (ptr as *mut u64).write_volatile(val) };
+        } else {
+            // Avoid UB from unaligned `*mut u64::write_volatile`.
+            for (i, byte) in val.to_ne_bytes().into_iter().enumerate() {
+                // SAFETY: `ptr.add(i)` lies within the writable 8-byte slot.
+                unsafe { ptr.add(i).write_volatile(byte) };
+            }
+        }
+    };
+
+    if first_page == last_page {
+        let mut old = 0;
+        // SAFETY: `slot..slot + 8` lies within the mapped region.
+        if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
+            bail!(
+                "VirtualProtect(IAT slot {rva:#x}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        write_bytes(slot, address as u64);
+        let mut ignored = 0;
+        // SAFETY: restoring the protection we just changed.
+        unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+    } else {
+        let len1 = last_page - addr;
+        let len2 = 8 - len1;
+        let page2 = last_page as *const c_void;
+        let mut old1 = 0;
+        // SAFETY: `slot..slot + len1` lies within the first page of the mapped region.
+        if unsafe { VirtualProtect(slot as *const c_void, len1, PAGE_READWRITE, &mut old1) } == 0 {
+            bail!(
+                "VirtualProtect(IAT slot {rva:#x}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut old2 = 0;
+        // SAFETY: `page2..page2 + len2` lies within the second page of the mapped region.
+        if unsafe { VirtualProtect(page2, len2, PAGE_READWRITE, &mut old2) } == 0 {
+            let err = std::io::Error::last_os_error();
+            let mut ignored = 0;
+            // SAFETY: restoring page 1 before returning the error.
+            unsafe { VirtualProtect(slot as *const c_void, len1, old1, &mut ignored) };
+            bail!("VirtualProtect(IAT slot {rva:#x} high page) failed: {err}");
+        }
+        write_bytes(slot, address as u64);
+        let mut ignored = 0;
+        // SAFETY: restoring each page's own original protection.
+        unsafe {
+            VirtualProtect(page2, len2, old2, &mut ignored);
+            VirtualProtect(slot as *const c_void, len1, old1, &mut ignored);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+        PAGE_READONLY, VirtualAlloc, VirtualFree, VirtualQuery,
+    };
+
+    #[test]
+    fn write_slot_handles_unaligned_cross_page_slots_and_preserves_protections() {
+        const PAGE: usize = 0x1000;
+        // SAFETY: allocating two private committed pages for the test.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!mem.is_null());
+        let base = mem as usize;
+
+        let mut old = 0;
+        // Give the two pages distinct non-writable protections.
+        // SAFETY: both pages are committed by `VirtualAlloc` above.
+        unsafe {
+            assert_ne!(VirtualProtect(mem, PAGE, PAGE_READONLY, &mut old), 0);
+            assert_ne!(
+                VirtualProtect((base + PAGE) as *const c_void, PAGE, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
+        }
+
+        let value: usize = 0x0123_4567_89AB_CDEF;
+        // Unaligned slot straddling the boundary between page 0 and page 1.
+        // SAFETY: `base..base + 2 * PAGE` is mapped.
+        unsafe { write_slot_at(base, (2 * PAGE) as u32, (PAGE - 4) as u32, value).unwrap() };
+
+        // SAFETY: reading back the 8 bytes we just wrote inside the mapped pages.
+        let got = unsafe { ((base + PAGE - 4) as *const u64).read_unaligned() };
+        assert_eq!(got, value as u64);
+
+        let mut info1: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut info2: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying our own committed pages.
+        unsafe {
+            assert_ne!(
+                VirtualQuery(mem, &mut info1, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()),
+                0
+            );
+            assert_ne!(
+                VirtualQuery(
+                    (base + PAGE) as *const c_void,
+                    &mut info2,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                ),
+                0
+            );
+        }
+        assert_eq!(info1.Protect, PAGE_READONLY);
+        assert_eq!(info2.Protect, PAGE_EXECUTE_READ);
+
+        // Out-of-bounds RVA is rejected without touching memory.
+        // SAFETY: bounds check fails before any dereference.
+        assert!(unsafe { write_slot_at(base, (2 * PAGE) as u32, (2 * PAGE - 4) as u32, value) }.is_err());
+
+        // SAFETY: freeing the allocation from `VirtualAlloc`.
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
     }
 }

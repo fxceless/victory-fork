@@ -167,7 +167,7 @@ impl ImageInfo {
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
         let exports = parse_exports(&file)?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -359,6 +359,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -376,7 +377,7 @@ fn parse_tls(
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
-        let array_rva = va_to_rva(callbacks_va, image_base)?;
+        let array_rva = va_to_rva(callbacks_va, image_base, size_of_image)?;
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
@@ -385,7 +386,7 @@ fn parse_tls(
             if va == 0 {
                 break;
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            callback_rvas.push(va_to_rva(va, image_base, size_of_image)?);
         }
     }
     Ok(Some(TlsInfo {
@@ -395,9 +396,10 @@ fn parse_tls(
     }))
 }
 
-fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
+fn va_to_rva(va: u64, image_base: u64, size_of_image: u32) -> Result<u32, PeError> {
     va.checked_sub(image_base)
         .and_then(|rva| u32::try_from(rva).ok())
+        .filter(|&rva| rva < size_of_image)
         .ok_or_else(|| PeError::Malformed(format!("VA 0x{va:x} is outside the image")))
 }
 
@@ -543,5 +545,29 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn rejects_tls_callback_outside_image() {
+        let mut body = vec![0u8; 0x100];
+        let image_base: u64 = 0x1_8000_0000;
+        // TLS directory at RVA 0x1000; AddressOfCallBacks points to RVA 0x1040.
+        body[layout::TLS64_ADDRESS_OF_CALLBACKS..layout::TLS64_ADDRESS_OF_CALLBACKS + 8]
+            .copy_from_slice(&(image_base + 0x1040).to_le_bytes());
+        // Callback points past SizeOfImage (0x2000), yet still fits in u32 RVA.
+        body[0x40..0x48].copy_from_slice(&(image_base + 0x4000).to_le_bytes());
+
+        let mut img = synthetic_image(&body);
+        // Clear export directory, set TLS directory (index 9) to RVA 0x1000, size 40.
+        let opt = 0x58;
+        img[opt + 112..opt + 120].fill(0);
+        let tls_dd = opt + layout::OPT_DATA_DIRECTORY + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        img[tls_dd..tls_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[tls_dd + 4..tls_dd + 8].copy_from_slice(&40u32.to_le_bytes());
+
+        assert!(matches!(
+            ImageInfo::parse(&img),
+            Err(PeError::Malformed(_))
+        ));
     }
 }
