@@ -1,9 +1,9 @@
 # Local 16 GiB RAM / 8 GiB VRAM branch
 
 Prepared 2026-11-27. Recommended starting point: **victory-fork/main at
-2eade68cade9b2f8cd2511cc97328e83f58508c3**. The local checkout is
-`C:\workspace\victory-recommended`, branch `local/16gb-8gb`. There is no
-configured network remote, and no GitHub fork, push or pull request was made.
+2eade68cade9b2f8cd2511cc97328e83f58508c3**. These experimental changes were
+prepared on branch `local/16gb-8gb`. Publication does not change the validation
+limits below: a full Rust build and gameplay measurements are still required.
 
 ## Source comparison
 

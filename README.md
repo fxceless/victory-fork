@@ -1,9 +1,9 @@
 # VIctory fork
 
-Local experimental branch: 16 GiB RAM / 8 GiB VRAM safeguards, generic Series S
+Experimental branch: 16 GiB RAM / 8 GiB VRAM safeguards, generic Series S
 launcher and native title upscaling controls. See [the source comparison, fixes
 and validation status](docs/local-low-memory.md). Full Rust build and gameplay
-qualification are pending; nothing from this local branch has been published.
+qualification are pending.
 
 [Performance targets and stutter measurements](docs/performance-targets.md) cover
 the requested 90/120/60/30 FPS goals. These are unverified targets, not achieved
