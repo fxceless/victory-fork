@@ -2075,6 +2075,114 @@ mod atomic_tests {
 }
 
 #[cfg(test)]
+mod static_sampler_tests {
+    use super::*;
+    use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
+
+    /// Linear filtering, comparison less or equal, everything else zero.
+    const WORDS: [u32; 4] = [0x0000_3000, 0, 0x0050_0000, 0];
+
+    /// `image_sample_lz v6, v[1:2]` (`cmp`: `image_sample_c_lz v7, v[3:5]`)
+    /// of the 2D image in s[16:23] with the sampler in s[24:27], one channel.
+    fn sample(cmp: bool) -> [u32; 2] {
+        if cmp {
+            [0xF0BC_0108, 0x00C4_0703]
+        } else {
+            [0xF09C_0108, 0x00C4_0601]
+        }
+    }
+
+    /// A compute program that samples with [`WORDS`] once without and once
+    /// with comparison (`cmp_first`: the comparison first) and stores the
+    /// sum to a UAV.
+    fn translate(cmp_first: bool) -> HostShader {
+        let mut words = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0 (the UAV)
+            0xF40C_0400,
+            0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20 (the image)
+        ];
+        for (n, w) in (24u32..).zip(WORDS) {
+            // s_mov_b32 s<n>, literal
+            words.extend_from_slice(&[0xBE80_03FF | n << 16, w]);
+        }
+        for v in 1..6u32 {
+            words.push(0x7E00_02F0 | v << 17); // v_mov_b32 v<v>, 0.5
+        }
+        words.extend_from_slice(&sample(cmp_first));
+        words.extend_from_slice(&sample(!cmp_first));
+        words.extend_from_slice(&[
+            0x0602_0F06, // v_add_f32 v1, v6, v7
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+            0xBF81_0000,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: [(ResourceType::Uav, 0, 4), (ResourceType::Srv, 8, 8)]
+                .map(|(kind, table_offset_dwords, dwords)| UsedResource {
+                    kind,
+                    root: RootType::Table,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords,
+                    user_data: 0,
+                    slot: 0,
+                })
+                .into(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        emit(&Container::parse(&bytes).unwrap(), &native, &p, &st, &io, &res).unwrap()
+    }
+
+    /// One sampler's words used for a sample and a comparison sample, in
+    /// either order: two static samplers, the comparison one marked so, the
+    /// first used in slot 0; the validator (when present) checks each
+    /// handle's sampler kind against its operation and the slot's metadata.
+    #[test]
+    fn one_samplers_words_with_and_without_comparison_get_two_slots() {
+        for cmp_first in [true, false] {
+            let shader = translate(cmp_first);
+            assert_eq!(shader.samplers, [WORDS, WORDS], "cmp_first {cmp_first}");
+            let plain = StaticSampler::from_words(WORDS);
+            let mut cmp = plain;
+            cmp.filter |= 0x80;
+            let want = if cmp_first { [cmp, plain] } else { [plain, cmp] };
+            assert_eq!(shader.static_samplers, want, "cmp_first {cmp_first}");
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("cmp_first {cmp_first}: {e}"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod barycentric_tests {
     use super::container::SigElement;
     use super::*;
