@@ -40,6 +40,7 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
+    row_sizes: Vec<u64>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
@@ -759,7 +760,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = subresource_bytes(
+                footprint.Offset,
+                f.RowPitch,
+                staging.rows[i],
+                f.Depth,
+                staging.row_sizes[i],
+                staging.bytes,
+            ) as u64;
             list.note_read(
                 || {
                     format!(
@@ -1230,12 +1238,25 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+        for (i, ((footprint, &rows), &row_size)) in self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .zip(&self.row_sizes)
+            .enumerate()
+        {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_bytes(
+                footprint.Offset,
+                f.RowPitch,
+                rows,
+                f.Depth,
+                row_size,
+                self.bytes,
+            );
+            // SAFETY: `footprint.Offset + len <= self.bytes`, inside the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -1253,6 +1274,28 @@ impl Staging {
             }
         }
     }
+}
+
+/// Byte span of one placed subresource inside a D3D12 staging buffer of `total`
+/// bytes. `GetCopyableFootprints` omits trailing row-pitch padding after the
+/// last row of the last subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_bytes(
+    offset: u64,
+    pitch: u32,
+    rows: u32,
+    depth: u32,
+    row_size: u64,
+    total: u64,
+) -> usize {
+    if rows == 0 || depth == 0 {
+        return 0;
+    }
+    let pitch = u64::from(pitch);
+    let rows = u64::from(rows);
+    let depth = u64::from(depth);
+    let exact = (depth - 1) * pitch * rows + (rows - 1) * pitch + row_size;
+    exact.min(total.saturating_sub(offset)) as usize
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1518,6 +1561,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    let mut row_sizes = vec![0u64; count as usize];
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -1528,7 +1572,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            Some(row_sizes.as_mut_ptr()),
             Some(&mut total),
         );
     }
@@ -1549,6 +1593,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         data,
         footprints,
         rows,
+        row_sizes,
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
@@ -1762,5 +1807,35 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn subresource_bytes_stays_within_staging_buffer_for_unpadded_last_row() {
+        use super::subresource_bytes;
+        // 16x4 RGBA16F: RowPitch = 256, row_size = 128, D3D12 total = 3*256 + 128 = 896 (< 1024).
+        let span = subresource_bytes(0, 256, 4, 1, 128, 896);
+        assert_eq!(span, 896);
+        // 2-mip 4x4 RGBA8: mip 0 at 0 (row_size=16), mip 1 (1x1) at 1024 (row_size=4), total = 1028.
+        let mip0 = subresource_bytes(0, 256, 4, 1, 16, 1028);
+        let mip1 = subresource_bytes(1024, 256, 1, 1, 4, 1028);
+        assert_eq!(mip0, 784);
+        assert_eq!(mip1, 4);
+        assert!(1024 + mip1 <= 1028);
+        // 3D 4x4x2 RGBA8: depth = 2, RowPitch = 256, rows = 4, row_size = 16, total = 1808.
+        assert_eq!(subresource_bytes(0, 256, 4, 2, 16, 1808), 1808);
+        // Detiling the 16x4 RGBA16F texture into a slice sized by `subresource_bytes` succeeds.
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: 14 words = 56-byte ResourceDesc.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc)
+            .expect("a console layout")
+            .planes[0]
+            .layout
+            .clone();
+        let tiled = vec![0x3Cu8; layout.size as usize];
+        let mut buf = vec![0u8; 896];
+        layout
+            .detile(&tiled, 0, 0, &mut buf[..span], 256, 256 * 4)
+            .expect("exact unpadded staging slice suffices");
     }
 }
