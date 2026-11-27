@@ -61,23 +61,62 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+/// Where a control of the stand-in gamepad sits on the keyboard. Keys that
+/// are the same on every layout (Esc, Enter, arrows) are named by virtual
+/// key. The letters are named by their place on a US keyboard (scan code):
+/// a player on an AZERTY keyboard gets the same hand position, so the keys
+/// of W A S D are Z Q S D there, rather than letters that happen to match.
+#[derive(Clone, Copy)]
+enum Place {
+    Key(u8),
+    Scan(u32),
+}
+
+impl Place {
+    fn held(self, key: &KeyState) -> bool {
+        match self {
+            Place::Key(vk) => key.virtual_key == vk,
+            Place::Scan(scan) => key.scan_code == scan,
+        }
+    }
+}
+
+// Places named by the letter a US keyboard has there.
+const US_Q: Place = Place::Scan(0x10);
+const US_W: Place = Place::Scan(0x11);
+const US_E: Place = Place::Scan(0x12);
+const US_Y: Place = Place::Scan(0x15);
+const US_I: Place = Place::Scan(0x17);
+const US_A: Place = Place::Scan(0x1E);
+const US_S: Place = Place::Scan(0x1F);
+const US_D: Place = Place::Scan(0x20);
+const US_F: Place = Place::Scan(0x21);
+const US_H: Place = Place::Scan(0x23);
+const US_J: Place = Place::Scan(0x24);
+const US_K: Place = Place::Scan(0x25);
+const US_L: Place = Place::Scan(0x26);
+const US_Z: Place = Place::Scan(0x2C);
+const US_X: Place = Place::Scan(0x2D);
+const US_C: Place = Place::Scan(0x2E);
+
+/// The keyboard's stand-in gamepad (place, button); README lists it.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C (US places).
+const FALLBACK_BUTTONS: [(Place, u32); 15] = [
+    (Place::Key(0x1B), MENU), // Esc
+    (Place::Key(0x09), VIEW), // Tab
+    (Place::Key(0x0D), A),    // Enter
+    (Place::Key(0x20), A),    // Space
+    (Place::Key(0x08), B),    // Backspace
+    (US_X, X),
+    (US_Y, Y),
+    (Place::Key(0x26), UP), // arrows
+    (Place::Key(0x28), DOWN),
+    (Place::Key(0x25), LEFT),
+    (Place::Key(0x27), RIGHT),
+    (US_Q, LEFT_SHOULDER),
+    (US_E, RIGHT_SHOULDER),
+    (US_F, LEFT_STICK),
+    (US_H, RIGHT_STICK),
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -116,8 +155,8 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+    let on = |place: Place| -> f32 {
+        if keys.iter().any(|k| place.held(k)) {
             1.0
         } else {
             0.0
@@ -126,14 +165,14 @@ fn fallback(keys: &[KeyState]) -> PadState {
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter(|(place, _)| on(*place) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_trigger: on(US_Z),
+        right_trigger: on(US_C),
+        left_x: on(US_D) - on(US_A),
+        left_y: on(US_W) - on(US_S),
+        right_x: on(US_L) - on(US_J),
+        right_y: on(US_I) - on(US_K),
     }
 }
 
@@ -1153,7 +1192,15 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    let key = KeyState {
+                        // SAFETY: plain query.
+                        scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                        virtual_key: vk,
+                        ..Default::default()
+                    };
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(place, _)| place.held(&key))
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1308,12 +1355,26 @@ mod tests {
         (hub, host)
     }
 
-    fn key(virtual_key: u8) -> KeyState {
+    fn key_at(virtual_key: u8, scan_code: u32) -> KeyState {
         KeyState {
-            scan_code: u32::from(virtual_key) + 0x100,
+            scan_code,
             virtual_key,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_stand_in_pad_follows_key_places_not_letters() {
+        // AZERTY: Z is where a US keyboard has W, Q where it has A, W where
+        // it has Z.
+        let pad = fallback(&[key_at(b'Z', 0x11), key_at(b'Q', 0x1E), key_at(b'W', 0x2C)]);
+        assert_eq!((pad.left_y, pad.left_x, pad.left_trigger), (1.0, -1.0, 1.0));
+        // A is where a US keyboard has Q: the left shoulder, not a stick.
+        let pad = fallback(&[key_at(b'A', 0x10)]);
+        assert_eq!((pad.buttons, pad.left_x), (LEFT_SHOULDER, 0.0));
+        // Keys that are the same on every layout go by virtual key.
+        assert_eq!(fallback(&[key_at(0x20, 0x39)]).buttons, A);
+        assert_eq!(fallback(&[key_at(0x1B, 0x01)]).buttons, MENU);
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
@@ -1494,7 +1555,12 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![
+            key_at(b'W', 0x11),
+            key_at(0x0D, 0x1C),
+            key_at(b'L', 0x26),
+            key_at(b'C', 0x2E),
+        ];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();

@@ -836,10 +836,13 @@ title's window has focus:
 |------|-----|
 | W A S D / I J K L | left / right stick |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
+| Enter, Space, Backspace, X, Y | A, A, B, X, Y |
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+The letters are the keys at those places on a US keyboard, so on an AZERTY
+keyboard the left stick is Z Q S D and the triggers are W and C.
 
 ## Commands
 
