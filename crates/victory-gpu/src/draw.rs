@@ -4149,11 +4149,10 @@ impl State {
                             host.constant_at(index, gpu, size);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.table_cbv_upload(address, size) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                         #[cfg(feature = "diagnostics")]
                         {

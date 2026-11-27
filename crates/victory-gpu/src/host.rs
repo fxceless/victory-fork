@@ -3142,6 +3142,7 @@ struct Deferred {
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
+    cbv_uploads: cbv_upload::Cache,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -12339,3 +12340,5 @@ mod masked_patch_compile_tests {
         assert!(size > 100);
     }
 }
+
+mod cbv_upload;
