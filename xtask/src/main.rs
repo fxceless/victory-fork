@@ -26,6 +26,14 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Run what CI runs, in CI's order: the policy check, clippy for the
+    /// plain and the diagnostics build, then the tests. Stops at the first
+    /// failure.
+    Check {
+        /// Leave out the tests (clippy and the policy check only).
+        #[arg(long)]
+        no_test: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,7 +53,38 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Check { no_test } => check(&root, no_test),
     }
+}
+
+/// Keep the steps in step with `.github/workflows/ci.yml`.
+fn check(root: &Path, no_test: bool) -> Result<()> {
+    policy::run(root, false)?;
+    let clippy = ["clippy", "--workspace", "--all-targets", "--locked"];
+    let deny = ["--", "-D", "warnings"];
+    let mut steps: Vec<(&str, Vec<&str>)> = vec![
+        ("clippy", [&clippy[..], &deny].concat()),
+        (
+            "clippy, diagnostics build",
+            [&clippy[..], &["--all-features"], &deny].concat(),
+        ),
+    ];
+    if !no_test {
+        steps.push(("tests", vec!["test", "--workspace", "--locked"]));
+    }
+    // `cargo xtask` sets CARGO to the cargo that ran it (same toolchain).
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for (name, args) in steps {
+        println!("== {name}: cargo {}", args.join(" "));
+        let status = Command::new(&cargo)
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .context("running cargo")?;
+        anyhow::ensure!(status.success(), "{name} failed");
+    }
+    println!("all checks passed");
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {

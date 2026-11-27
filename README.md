@@ -777,6 +777,9 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
+To work on this fork, see [CONTRIBUTING.md](CONTRIBUTING.md) (setup, the
+asset policy, `cargo xtask check`).
+
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
 
