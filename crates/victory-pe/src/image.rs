@@ -165,7 +165,7 @@ impl ImageInfo {
             Some(table) => parse_imports(&table, opt.size_of_image())?,
             None => Vec::new(),
         };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
+        let delay_imports = parse_delay_imports(&file, data, opt.image_base(), opt.size_of_image())?;
         let exports = parse_exports(&file)?;
         let tls = parse_tls(&file, data, opt.image_base())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
@@ -279,25 +279,121 @@ fn parse_imports(
 
 fn parse_delay_imports(
     file: &PeFile64<'_>,
+    data: &[u8],
+    image_base: u64,
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let Some(table) = file.delay_load_import_table()? else {
         return Ok(Vec::new());
     };
+    let sections = file.section_table();
     let mut modules = Vec::new();
     let mut descriptors = table.descriptors()?;
     while let Some(desc) = descriptors.next()? {
+        // Bit 0 (`IMAGE_DELAYLOAD_RVA_BASED`) distinguishes RVA-based
+        // descriptors/thunks (MSVC >= 7) from legacy VA-based ones.
+        let rva_based = desc.attributes.get(LE) & pe::IMAGE_DELAYLOAD_RVA_BASED != 0;
+        let resolve_addr = |raw: u64| -> Result<u32, PeError> {
+            let rva = if rva_based {
+                u32::try_from(raw).map_err(|_| {
+                    PeError::Malformed(format!("delay-load RVA 0x{raw:x} is outside the image"))
+                })?
+            } else {
+                raw.checked_sub(image_base)
+                    .and_then(|d| u32::try_from(d).ok())
+                    .ok_or_else(|| {
+                        PeError::Malformed(format!("delay-load VA 0x{raw:x} is outside the image"))
+                    })?
+            };
+            if rva >= size_of_image {
+                return Err(PeError::Malformed(format!(
+                    "delay-load address 0x{raw:x} is outside the image"
+                )));
+            }
+            Ok(rva)
+        };
+
+        let dll_addr = desc.dll_name_rva.get(LE);
+        if dll_addr == 0 {
+            return Err(PeError::Malformed(
+                "delay-load descriptor has null DLL name".into(),
+            ));
+        }
+        let dll_rva = resolve_addr(u64::from(dll_addr))?;
+        let dll_bytes = sections
+            .pe_data_at(data, dll_rva)
+            .and_then(read_c_string)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| PeError::Malformed("invalid delay-load DLL name".into()))?;
+
+        let int_addr = desc.import_name_table_rva.get(LE);
+        let mut mod_entries = Vec::new();
+        if int_addr != 0 {
+            let int_rva = resolve_addr(u64::from(int_addr))?;
+            let iat_rva = resolve_addr(u64::from(desc.import_address_table_rva.get(LE)))?;
+            let thunks = sections
+                .pe_data_at(data, int_rva)
+                .ok_or_else(|| PeError::Malformed("delay-load INT outside of sections".into()))?;
+            let mut terminated = false;
+            for slot in thunks.as_chunks::<8>().0 {
+                let raw_thunk = u64::from_le_bytes(*slot);
+                if raw_thunk == 0 {
+                    terminated = true;
+                    break;
+                }
+                let iat_slot_rva = u32::try_from(mod_entries.len() * 8)
+                    .ok()
+                    .and_then(|offset| iat_rva.checked_add(offset))
+                    .filter(|&rva| rva.checked_add(8).is_some_and(|end| end <= size_of_image))
+                    .ok_or_else(|| {
+                        PeError::Malformed(format!("IAT at {iat_rva:#x} runs outside the image"))
+                    })?;
+                let symbol = if raw_thunk & pe::IMAGE_ORDINAL_FLAG64 != 0 {
+                    ImportSymbol::Ordinal(raw_thunk as u16)
+                } else {
+                    let hint_name_rva = resolve_addr(raw_thunk)?;
+                    let hint_name = sections.pe_data_at(data, hint_name_rva).ok_or_else(|| {
+                        PeError::Malformed("delay-load hint/name outside of sections".into())
+                    })?;
+                    let hint = hint_name
+                        .get(..2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .ok_or_else(|| {
+                            PeError::Malformed("truncated delay-load import hint".into())
+                        })?;
+                    let name = read_c_string(&hint_name[2..])
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            PeError::Malformed("missing delay-load import symbol name".into())
+                        })?;
+                    ImportSymbol::Name {
+                        hint,
+                        name: utf8(name),
+                    }
+                };
+                mod_entries.push(ImportEntry {
+                    symbol,
+                    iat_slot_rva,
+                });
+            }
+            if !terminated {
+                return Err(PeError::Malformed(
+                    "unterminated delay-load import name table".into(),
+                ));
+            }
+        }
+
         modules.push(ImportModule {
-            dll: utf8(table.name(desc.dll_name_rva.get(LE))?),
-            entries: entries(
-                table.thunks(desc.import_name_table_rva.get(LE))?,
-                desc.import_address_table_rva.get(LE),
-                size_of_image,
-                |t| table.import::<ImageNtHeaders64>(t),
-            )?,
+            dll: utf8(dll_bytes),
+            entries: mod_entries,
         });
     }
     Ok(modules)
+}
+
+fn read_c_string(bytes: &[u8]) -> Option<&[u8]> {
+    let nul = bytes.iter().position(|&b| b == 0)?;
+    Some(&bytes[..nul])
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
@@ -543,5 +639,162 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    /// Minimal PE32+ image with two sections (`.didat` at RVA 0x1000, `.rdata`
+    /// at RVA 0x2000) and `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` pointing at 0x1000.
+    fn synthetic_delay_image(image_base: u64, didat: &[u8], rdata: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; 0x200];
+        d[0..2].copy_from_slice(b"MZ");
+        d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x44..0x46].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
+        d[0x46..0x48].copy_from_slice(&2u16.to_le_bytes()); // two sections
+        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        d[0x56..0x58].copy_from_slice(&0x2022u16.to_le_bytes());
+        let opt = 0x58;
+        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        d[opt + 24..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes()); // size_of_image
+        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        // Data directory 13: IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+        let dd13 = opt + 112 + pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT * 8;
+        d[dd13..dd13 + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[dd13 + 4..dd13 + 8].copy_from_slice(&0x40u32.to_le_bytes());
+
+        let write_sec = |buf: &mut [u8], at: usize, name: &[u8; 6], rva: u32, raw_off: u32| {
+            buf[at..at + 6].copy_from_slice(name);
+            buf[at + 8..at + 12].copy_from_slice(&0x200u32.to_le_bytes());
+            buf[at + 12..at + 16].copy_from_slice(&rva.to_le_bytes());
+            buf[at + 16..at + 20].copy_from_slice(&0x200u32.to_le_bytes());
+            buf[at + 20..at + 24].copy_from_slice(&raw_off.to_le_bytes());
+        };
+        let sec0 = opt + 240;
+        write_sec(&mut d, sec0, b".didat", 0x1000, 0x200);
+        write_sec(&mut d, sec0 + 40, b".rdata", 0x2000, 0x400);
+
+        d.resize(0x600, 0);
+        d[0x200..0x200 + didat.len()].copy_from_slice(didat);
+        d[0x400..0x400 + rdata.len()].copy_from_slice(rdata);
+        d
+    }
+
+    #[test]
+    fn delay_imports_resolve_across_sections() {
+        let put32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        // Descriptors and IAT live in `.didat` (RVA 0x1000); DLL name, INT,
+        // and hint/name entry live in `.rdata` (RVA 0x2000).
+        let mut didat = vec![0u8; 0x100];
+        put32(&mut didat, 0, pe::IMAGE_DELAYLOAD_RVA_BASED);
+        put32(&mut didat, 4, 0x2000); // dll_name_rva in .rdata
+        put32(&mut didat, 12, 0x1080); // import_address_table_rva in .didat
+        put32(&mut didat, 16, 0x2020); // import_name_table_rva in .rdata
+
+        let mut rdata = vec![0u8; 0x100];
+        rdata[0x00..0x0C].copy_from_slice(b"delayed.dll\0");
+        put64(&mut rdata, 0x20, 0x2040); // named import RVA in .rdata
+        put64(&mut rdata, 0x28, pe::IMAGE_ORDINAL_FLAG64 | 7); // ordinal #7
+        put64(&mut rdata, 0x30, 0); // terminator
+        rdata[0x40..0x42].copy_from_slice(&0x002Au16.to_le_bytes()); // hint
+        rdata[0x42..0x4C].copy_from_slice(b"DelayCall\0");
+
+        let img = synthetic_delay_image(0x1_8000_0000, &didat, &rdata);
+        let info = ImageInfo::parse(&img).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        let m = &info.delay_imports[0];
+        assert_eq!(m.dll, "delayed.dll");
+        assert_eq!(m.entries.len(), 2);
+        assert_eq!(
+            m.entries[0].symbol,
+            ImportSymbol::Name {
+                hint: 0x2A,
+                name: "DelayCall".into(),
+            }
+        );
+        assert_eq!(m.entries[0].iat_slot_rva, 0x1080);
+        assert_eq!(m.entries[1].symbol, ImportSymbol::Ordinal(7));
+        assert_eq!(m.entries[1].iat_slot_rva, 0x1088);
+    }
+
+    #[test]
+    fn delay_imports_support_legacy_va_descriptors_and_thunks() {
+        let put32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        // Legacy delay-load descriptor (attributes == 0): descriptor fields
+        // and non-ordinal INT thunks hold VAs relative to image_base.
+        let base: u64 = 0x0040_0000;
+        let mut didat = vec![0u8; 0x100];
+        put32(&mut didat, 0, 0); // attributes: VA-based (bit 0 clear)
+        put32(&mut didat, 4, (base + 0x2000) as u32);
+        put32(&mut didat, 12, (base + 0x1090) as u32);
+        put32(&mut didat, 16, (base + 0x2020) as u32);
+
+        let mut rdata = vec![0u8; 0x100];
+        rdata[0x00..0x0B].copy_from_slice(b"legacy.dll\0");
+        put64(&mut rdata, 0x20, base + 0x2040);
+        put64(&mut rdata, 0x28, pe::IMAGE_ORDINAL_FLAG64 | 99);
+        put64(&mut rdata, 0x30, 0);
+        rdata[0x40..0x42].copy_from_slice(&3u16.to_le_bytes());
+        rdata[0x42..0x4B].copy_from_slice(b"OldEntry\0");
+
+        let img = synthetic_delay_image(base, &didat, &rdata);
+        let info = ImageInfo::parse(&img).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        let m = &info.delay_imports[0];
+        assert_eq!(m.dll, "legacy.dll");
+        assert_eq!(m.entries.len(), 2);
+        assert_eq!(
+            m.entries[0].symbol,
+            ImportSymbol::Name {
+                hint: 3,
+                name: "OldEntry".into(),
+            }
+        );
+        assert_eq!(m.entries[0].iat_slot_rva, 0x1090);
+        assert_eq!(m.entries[1].symbol, ImportSymbol::Ordinal(99));
+        assert_eq!(m.entries[1].iat_slot_rva, 0x1098);
+    }
+
+    #[test]
+    fn delay_imports_reject_invalid_va_and_high_bit_rva_thunks() {
+        let put32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        // Keep all structures inside `.didat` (single section) so failures test
+        // VA/RVA validation rather than cross-section lookup.
+        let mut didat = vec![0u8; 0x100];
+        didat[0x40..0x46].copy_from_slice(b"a.dll\0");
+        put64(&mut didat, 0x50, 0x1060); // hint/name RVA in .didat
+        put64(&mut didat, 0x58, 0);
+        didat[0x60..0x62].copy_from_slice(&0u16.to_le_bytes());
+        didat[0x62..0x67].copy_from_slice(b"Func\0");
+
+        // Case 1: attributes == 0 (legacy VA) with an image_base above 4 GiB
+        // makes the 32-bit descriptor VA smaller than image_base -> Malformed.
+        put32(&mut didat, 0, 0);
+        put32(&mut didat, 4, 0x1040);
+        put32(&mut didat, 12, 0x1080);
+        put32(&mut didat, 16, 0x1050);
+        let img_bad_va = synthetic_delay_image(0x1_8000_0000, &didat, &[]);
+        assert!(matches!(
+            ImageInfo::parse(&img_bad_va),
+            Err(PeError::Malformed(_))
+        ));
+
+        // Case 2: RVA-based non-ordinal thunk with upper bits set (0x1_0000_1060)
+        // must be rejected rather than silently truncated to 0x1060.
+        put32(&mut didat, 0, pe::IMAGE_DELAYLOAD_RVA_BASED);
+        put64(&mut didat, 0x50, 0x1_0000_1060);
+        let img_high_thunk = synthetic_delay_image(0x1_8000_0000, &didat, &[]);
+        assert!(matches!(
+            ImageInfo::parse(&img_high_thunk),
+            Err(PeError::Malformed(_))
+        ));
     }
 }
