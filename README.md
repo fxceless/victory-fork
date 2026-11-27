@@ -10,6 +10,19 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Linux (experimental)
+
+Build the Windows runtime on Linux and launch it with **GE-Proton through
+umu-run**, with output in your existing terminal. See the
+[Linux guide](docs/linux.md) for setup, Nix development shells, configuration
+and troubleshooting.
+
+**Tested by [@MiguVT](https://github.com/MiguVT): launches, but not playable.**
+On an RTX 3090 / Ryzen 9 5950X running NixOS, the cinematic loads but is
+dark, with only occasional sky visibility, at approximately **6,275 ms/frame
+(0.16 FPS)**. See the [Linux test report](docs/linux.md#reported-test-miguvt)
+for hardware, software and remaining reproduction details.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

@@ -16,6 +16,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  linux-cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm shellcheck
+          cargo install --locked cargo-xwin
+      - name: Check launch scripts
+        run: shellcheck scripts/*-linux.sh
+      - name: Cross-compile Windows runtime
+        run: ./scripts/build-linux.sh
+
   check:
     runs-on: windows-latest
     timeout-minutes: 60
