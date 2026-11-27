@@ -60,6 +60,15 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
+fn checked_copy_completion(value: u64) -> windows::core::Result<u64> {
+    if value == u64::MAX {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+        ));
+    }
+    Ok(value)
+}
+
 /// `VICTORY_QUEUE2`, a sum of bits; unset or 0: off, everything goes
 /// through the one direct queue as before.
 ///
@@ -224,7 +233,7 @@ impl Lane {
         // SAFETY: a plain query; a list is reset only when the job it ran
         // in is done; plain object creation otherwise.
         unsafe {
-            let done = self.fence.GetCompletedValue();
+            let done = checked_copy_completion(self.fence.GetCompletedValue())?;
             let free = {
                 let mut state = lock(&self.state);
                 state.spare.iter().position(|(job, _)| *job <= done).map(|at| state.spare.swap_remove(at).1)
@@ -280,7 +289,7 @@ impl Lane {
     /// Whether the card has run `job`.
     pub(crate) fn done(&self, job: u64) -> bool {
         // SAFETY: a plain query.
-        unsafe { self.fence.GetCompletedValue() >= job }
+        unsafe { checked_copy_completion(self.fence.GetCompletedValue()).is_ok_and(|done| done >= job) }
     }
 
     /// Waits on this thread, with its `event`, until the card has run
@@ -288,9 +297,14 @@ impl Lane {
     pub(crate) fn wait(&self, job: u64, event: HANDLE) -> windows::core::Result<()> {
         // SAFETY: the lane's fence and the caller's event.
         unsafe {
-            if self.fence.GetCompletedValue() < job {
+            if checked_copy_completion(self.fence.GetCompletedValue())? < job {
                 self.fence.SetEventOnCompletion(job, event)?;
-                WaitForSingleObject(event, INFINITE);
+                if WaitForSingleObject(event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    return Err(windows::core::Error::from_thread());
+                }
+                if checked_copy_completion(self.fence.GetCompletedValue())? < job {
+                    return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+                }
             }
         }
         Ok(())
@@ -591,6 +605,16 @@ mod tests {
         assert_eq!(busy_stretch(Some(at(5)), at(10), at(14)), 4_000);
         // (The clock's own lateness never makes a stretch negative.)
         assert_eq!(busy_stretch(Some(at(20)), at(10), at(14)), 0);
+    }
+
+    #[test]
+    fn removed_copy_fence_is_not_a_completed_job() {
+        assert_eq!(super::checked_copy_completion(0).unwrap(), 0);
+        assert_eq!(super::checked_copy_completion(u64::MAX - 1).unwrap(), u64::MAX - 1);
+        assert_eq!(
+            super::checked_copy_completion(u64::MAX).unwrap_err().code(),
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED
+        );
     }
 
     /// A landing buffer is given out again only when the card has passed
