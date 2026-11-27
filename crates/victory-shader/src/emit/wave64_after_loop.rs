@@ -530,7 +530,7 @@ fn fp32_expected(op: u32, ident: u32, values: [u32; 4], active: u32, lds: bool) 
     let old = lanes;
     lanes = std::array::from_fn(|i| fp32_reference(op, old[i ^ 15], old[i]));
     let old = lanes;
-    lanes = std::array::from_fn(|i| fp32_reference(op, old[(i / 16 ^ 1) * 16], old[i]));
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[((i / 16) ^ 1) * 16], old[i]));
     let result = fp32_reference(op, lanes[32], lanes[0]);
     (0..64)
         .flat_map(|lane| [result, lane, lane, lane])
