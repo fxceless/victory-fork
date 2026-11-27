@@ -643,10 +643,13 @@ void main() {
         pso: ID3D12PipelineState,
         /// Direct lists sent and not waited for yet.
         flown: Vec<CopyList>,
+        /// Last, so it is let go after the device.
+        _one: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Warp {
         fn new(bits: u32) -> Option<Warp> {
+            let _one = crate::inplace::tests::one_warp_at_a_time();
             // SAFETY: plain DXGI and D3D12 set-up on the software adapter.
             unsafe {
                 let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -708,6 +711,7 @@ void main() {
                     root,
                     pso,
                     flown: Vec::new(),
+                    _one,
                 })
             }
         }
