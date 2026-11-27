@@ -171,6 +171,29 @@ fn whole_writes() -> bool {
     })
 }
 
+/// Queued pulls (copy, page, frame seen) split into those due at `frame`
+/// and those still waiting for their lists to run.
+fn split_due(pulls: Vec<(usize, u64, u64)>, frame: u64) -> (Vec<(usize, u64, u64)>, Vec<(usize, u64, u64)>) {
+    pulls.into_iter().partition(|&(_, _, seen)| frame >= seen + PULL_AFTER)
+}
+
+/// Pages seen again collapse to their oldest and latest sightings. The
+/// latest alone (as before) never came due while a page was written every
+/// frame, so its bytes never reached title memory (#1438); the oldest is
+/// pulled on time, the latest still pulls what was written after it.
+fn collapse(pulls: &mut Vec<(usize, u64, u64)>) {
+    pulls.sort_unstable();
+    let mut out = Vec::with_capacity(pulls.len());
+    for seen in pulls.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        let (oldest, latest) = (seen[0], seen[seen.len() - 1]);
+        out.push(oldest);
+        if latest != oldest {
+            out.push(latest);
+        }
+    }
+    *pulls = out;
+}
+
 /// Runs of consecutive pages in sorted `pages`, as (first page, count).
 fn runs(pages: &[u64]) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
@@ -366,12 +389,8 @@ impl Memory {
         // in the copy, and (unless a list declared it and copied it back)
         // not in title memory, where the title reads results back.
         let frame = self.frame;
-        let mut keep = Vec::new();
-        for (n, page, seen) in std::mem::take(&mut self.pulls) {
-            if frame < seen + PULL_AFTER {
-                keep.push((n, page, seen));
-                continue;
-            }
+        let (due, mut keep) = split_due(std::mem::take(&mut self.pulls), frame);
+        for (n, page, _) in due {
             match self.copies[n].pull_back(page * PAGE, PAGE) {
                 Some(bytes) => {
                     if bytes > 0 {
@@ -384,9 +403,7 @@ impl Memory {
                 None => keep.push((n, page, frame)),
             }
         }
-        // Pages seen again collapse to their latest sighting.
-        keep.sort_unstable_by_key(|&(n, page, seen)| (n, page, std::cmp::Reverse(seen)));
-        keep.dedup_by_key(|&mut (n, page, _)| (n, page));
+        collapse(&mut keep);
         self.pulls = keep;
     }
 
@@ -647,4 +664,48 @@ pub(crate) fn forget_heap(heap: &HostHeap) {
 #[cfg(test)]
 pub(crate) fn has_run(key: usize) -> bool {
     MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use super::{PULL_AFTER, collapse, split_due};
+
+    /// The queue as `take_written` runs it, a frame at a time: the page is
+    /// seen written at each frame of `seen_at`; the frames it was pulled at.
+    fn pulled(seen_at: &[u64], frames: u64) -> Vec<u64> {
+        let (mut queue, mut out) = (Vec::new(), Vec::new());
+        for frame in 0..frames {
+            if seen_at.contains(&frame) {
+                queue.push((0, 7, frame));
+            }
+            let (due, mut keep) = split_due(std::mem::take(&mut queue), frame);
+            out.extend(due.iter().map(|_| frame));
+            collapse(&mut keep);
+            queue = keep;
+        }
+        out
+    }
+
+    /// #1438: a page written every frame is still pulled, PULL_AFTER frames
+    /// after it was first seen, and again while the writes go on.
+    #[test]
+    fn a_page_written_every_frame_is_still_pulled() {
+        let every: Vec<u64> = (0..10).collect();
+        let got = pulled(&every, 10);
+        assert_eq!(got.first(), Some(&PULL_AFTER), "pulls: {got:?}");
+        assert!(got.len() >= 2, "pulled again while written: {got:?}");
+    }
+
+    /// The writes after the last pull are pulled too, once they stop.
+    #[test]
+    fn the_last_writes_are_pulled_after_they_stop() {
+        let got = pulled(&[0, 1, 2, 3, 4], 12);
+        assert_eq!(got.last(), Some(&(4 + PULL_AFTER)), "pulls: {got:?}");
+    }
+
+    /// One sighting: one pull, on time; nothing queued twice.
+    #[test]
+    fn one_sighting_one_pull() {
+        assert_eq!(pulled(&[2], 10), vec![2 + PULL_AFTER]);
+    }
 }
