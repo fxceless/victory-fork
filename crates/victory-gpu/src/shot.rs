@@ -506,7 +506,7 @@ pub(crate) fn line(list: usize, text: &str) {
 /// Whether pictures of host format `format` can be shown
 /// (`capture::to_rgba`'s formats, by the texture's own format).
 fn shows(format: i32) -> bool {
-    matches!(format, 1..=2 | 9..=16 | 19..=65 | 87..=93)
+    matches!(format, 1..=2 | 9..=16 | 19..=65 | 85..=93 | 115)
 }
 
 /// `list` says which title texture a host copy is of, while a shot
@@ -1075,7 +1075,7 @@ mod tests {
     fn the_formats_shown_are_the_ones_the_pictures_decode() {
         // Every format `shows` names decodes, and one it does not name
         // does not (a block-compressed one: never a target).
-        for format in (1..=2).chain(9..=16).chain(19..=65).chain(87..=93) {
+        for format in (1..=2).chain(9..=16).chain(19..=65).chain(85..=93).chain([115]) {
             assert!(super::shows(format));
             let pixel = [0u8; 16];
             assert!(crate::capture::to_rgba(format as u32, 1, 1, 16, &pixel).is_some(), "format {format}");
