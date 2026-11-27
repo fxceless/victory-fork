@@ -736,6 +736,9 @@ Speed and memory:
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
+Input:
+- Pads XInput does not list are read over HID and fill the slots XInput leaves empty: DualShock 4 and DualSense (and Edge) on USB or Bluetooth, with rumble, and any other HID gamepad or joystick. A generic pad is read by its usages: X/Y the left stick, Z/Rz (or Rx/Ry) the right one, the hat the D-pad, buttons in the usual DirectInput order; `VICTORY_PAD_BUTTONS` names other button numbers for A, B, X, Y, LB, RB, LT, RT, View, Menu, LS, RS (comma-separated).
+
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
