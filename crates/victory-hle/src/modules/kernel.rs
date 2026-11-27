@@ -63,8 +63,9 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
+    let ansi = host::encode_acp(&path);
     // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(path.as_bytes(), unsafe {
+    copy_truncated(&ansi, unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
 }
@@ -97,6 +98,7 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
 }
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
@@ -155,21 +157,17 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
-    if (name as usize) < 0x1_0000 {
-        tracing::warn!(
-            module = m.name,
-            ordinal = name as usize,
-            "GetProcAddress by ordinal"
-        );
-        return std::ptr::null_mut();
-    }
-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    let symbol: std::borrow::Cow<'_, str> = if (name as usize) < 0x1_0000 {
+        std::borrow::Cow::Owned(format!("#{}", name as usize))
+    } else {
+        // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+        unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy()
+    };
+    match m.exports.iter().find(|e| e.name == symbol) {
         Some(e) => e.address as *mut c_void,
         None => {
-            tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            tracing::warn!(module = m.name, name = %symbol, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -397,6 +395,7 @@ mod host {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
+    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
@@ -437,6 +436,51 @@ mod host {
     pub(super) fn set_last_error(code: u32) {
         // SAFETY: see above.
         unsafe { SetLastError(code) }
+    }
+
+    pub(super) fn encode_acp(path: &str) -> Vec<u8> {
+        let wide: Vec<u16> = path.encode_utf16().collect();
+        if wide.is_empty() {
+            return Vec::new();
+        }
+        let Ok(len) = i32::try_from(wide.len()) else {
+            return path.as_bytes().to_vec();
+        };
+        // SAFETY: queries the CP_ACP byte length of `wide`.
+        let need = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if need <= 0 {
+            return path.as_bytes().to_vec();
+        }
+        let mut out = vec![0u8; need as usize];
+        // SAFETY: `out` has room for `need` bytes.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                out.as_mut_ptr(),
+                need,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if written <= 0 {
+            return path.as_bytes().to_vec();
+        }
+        out.truncate(written as usize);
+        out
     }
 
     pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
@@ -552,6 +596,10 @@ mod host {
     }
 
     pub(super) fn set_last_error(_: u32) {}
+
+    pub(super) fn encode_acp(path: &str) -> Vec<u8> {
+        path.as_bytes().to_vec()
+    }
 
     pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
@@ -683,5 +731,51 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[test]
+    fn pseudo_module_ordinals_and_ansi_module_file_name_work() {
+        let base = 0x7300_0000_0000usize;
+        let path_str = "C:\\caf\u{00E9}\\game.exe";
+        runtime::set_image_path(base, std::path::Path::new(path_str));
+        let module = base as *mut c_void;
+
+        // GetModuleFileNameA encodes with CP_ACP so Win32 A APIs decode it back cleanly.
+        let mut ansi = [0u8; 64];
+        let na = GetModuleFileNameA(module, ansi.as_mut_ptr(), ansi.len() as u32);
+        assert!(na > 0);
+        assert_eq!(ansi[na as usize], 0);
+        #[cfg(windows)]
+        {
+            let mut roundtrip = [0u16; 64];
+            // SAFETY: decodes the CP_ACP bytes returned by GetModuleFileNameA back to UTF-16.
+            let nw = unsafe {
+                windows_sys::Win32::Globalization::MultiByteToWideChar(
+                    windows_sys::Win32::Globalization::CP_ACP,
+                    0,
+                    ansi.as_ptr(),
+                    na as i32,
+                    roundtrip.as_mut_ptr(),
+                    roundtrip.len() as i32,
+                )
+            };
+            assert!(nw > 0);
+            assert_eq!(String::from_utf16_lossy(&roundtrip[..nw as usize]), path_str);
+        }
+
+        // Pseudo-module ordinal lookup resolves GameInput.dll #1 (`GameInputCreate`).
+        let gi = LoadLibraryA(c"gameinput.dll".as_ptr().cast());
+        assert!(!gi.is_null());
+        assert_eq!(
+            GetProcAddress(gi, std::ptr::without_provenance(1)) as usize,
+            crate::registry::lookup("gameinput.dll", "#1").unwrap()
+        );
+        assert!(GetProcAddress(gi, std::ptr::without_provenance(2)).is_null());
+        #[cfg(windows)]
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_PROC_NOT_FOUND
+        );
     }
 }
