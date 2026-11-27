@@ -451,6 +451,26 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.nonuniform_handles += u32::from(nonuniform);
+        self.marked_heap_handle(block, index, sampler, nonuniform, props)
+    }
+
+    /// The handle a buffer's size is asked through (`descriptor_data`):
+    /// marked non-uniform for AMD's compiler, which reads a null pointer
+    /// compiling the query through a uniform one, and not counted in
+    /// `nonuniform_handles`, its index being the same in every lane.
+    pub fn size_handle(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        self.marked_heap_handle(block, index, false, true, props)
+    }
+
+    fn marked_heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -479,7 +499,6 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
