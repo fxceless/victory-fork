@@ -67,6 +67,7 @@ impl Mode {
 /// A title callback and its context (addresses, so tasks can cross threads).
 #[derive(Clone, Copy)]
 struct Task {
+    queue_id: u64,
     context: usize,
     callback: usize,
 }
@@ -74,9 +75,15 @@ struct Task {
 impl Task {
     fn new(context: *mut c_void, callback: Callback) -> Task {
         Task {
+            queue_id: 0,
             context: context as usize,
             callback: callback as usize,
         }
+    }
+
+    fn with_queue(mut self, queue_id: u64) -> Task {
+        self.queue_id = queue_id;
+        self
     }
 
     fn run(self, canceled: bool) {
@@ -190,9 +197,12 @@ impl Pool {
     }
 }
 
+static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
+    id: u64,
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
@@ -201,6 +211,7 @@ pub struct Queue {
 impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
         Arc::new(Queue {
+            id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
@@ -214,6 +225,7 @@ impl Queue {
         if self.terminated.load(Ordering::Acquire) {
             return E_ABORT;
         }
+        let task = task.with_queue(self.id);
         if delay_ms == 0 {
             self.deliver(port, task);
         } else {
@@ -369,8 +381,8 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued (callbacks see `canceled`), refuses new
-/// work, then calls `callback`.
+/// Cancels what is still queued on this queue (callbacks see `canceled`),
+/// refuses new work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,
@@ -382,7 +394,18 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let mut pending = Vec::new();
+        {
+            let mut tasks = lock(&port.tasks);
+            tasks.retain(|task| {
+                if task.queue_id == queue.id {
+                    pending.push(*task);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
@@ -1333,5 +1356,243 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_composite_queue_preserves_base_queue_callbacks() {
+        struct Record {
+            log: *const Mutex<Vec<(u32, bool)>>,
+            id: u32,
+        }
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: points to a `Record` kept alive for the whole test.
+            let entry = unsafe { &*context.cast::<Record>() };
+            // SAFETY: points to `log` kept alive for the whole test.
+            lock(unsafe { &*entry.log }).push((entry.id, canceled));
+        }
+
+        let log = Mutex::new(Vec::new());
+        let records = [
+            Record {
+                log: &raw const log,
+                id: 1,
+            },
+            Record {
+                log: &raw const log,
+                id: 2,
+            },
+            Record {
+                log: &raw const log,
+                id: 3,
+            },
+            Record {
+                log: &raw const log,
+                id: 4,
+            },
+        ];
+
+        let (mut base, mut composite) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut base), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(base, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(base, COMPLETION, &mut completion), S_OK);
+        assert_eq!(
+            XTaskQueueCreateComposite(work, completion, &mut composite),
+            S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                base,
+                WORK,
+                0,
+                (&raw const records[0]).cast_mut().cast(),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                composite,
+                WORK,
+                0,
+                (&raw const records[1]).cast_mut().cast(),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                base,
+                COMPLETION,
+                0,
+                (&raw const records[2]).cast_mut().cast(),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                composite,
+                COMPLETION,
+                0,
+                (&raw const records[3]).cast_mut().cast(),
+                Some(record),
+            ),
+            S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueTerminate(composite, false, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(*lock(&log), vec![(2, true), (4, true)]);
+
+        assert!(XTaskQueueDispatch(base, WORK, 0));
+        assert!(!XTaskQueueDispatch(base, WORK, 0));
+        assert!(XTaskQueueDispatch(base, COMPLETION, 0));
+        assert!(!XTaskQueueDispatch(base, COMPLETION, 0));
+        assert_eq!(
+            *lock(&log),
+            vec![(2, true), (4, true), (1, false), (3, false)]
+        );
+
+        XTaskQueueCloseHandle(composite);
+        XTaskQueueCloseHandle(base);
+    }
+
+    #[test]
+    fn terminating_composite_queue_preserves_fifo_and_unlocks_before_canceling() {
+        struct Reentrant {
+            log: *const Mutex<Vec<(u32, bool)>>,
+            id: u32,
+            base: *const Queue,
+            composite: *const Queue,
+            followup: *mut c_void,
+        }
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: points to a `Reentrant` kept alive for the whole test.
+            let entry = unsafe { &*context.cast::<Reentrant>() };
+            // SAFETY: points to `log` kept alive for the whole test.
+            lock(unsafe { &*entry.log }).push((entry.id, canceled));
+            if canceled && !entry.followup.is_null() {
+                // Re-enter queue APIs from the cancellation callback: would
+                // deadlock if the port lock were still held.
+                assert_eq!(
+                    XTaskQueueSubmitDelayedCallback(
+                        entry.composite,
+                        WORK,
+                        0,
+                        entry.followup,
+                        Some(record),
+                    ),
+                    E_ABORT
+                );
+                assert_eq!(
+                    XTaskQueueSubmitDelayedCallback(
+                        entry.base,
+                        WORK,
+                        0,
+                        entry.followup,
+                        Some(record),
+                    ),
+                    S_OK
+                );
+            }
+        }
+
+        let (mut base, mut composite) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut base), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(base, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(base, COMPLETION, &mut completion), S_OK);
+        assert_eq!(
+            XTaskQueueCreateComposite(work, completion, &mut composite),
+            S_OK
+        );
+
+        let log = Mutex::new(Vec::new());
+        let followup = Reentrant {
+            log: &raw const log,
+            id: 6,
+            base,
+            composite,
+            followup: std::ptr::null_mut(),
+        };
+        let entries = [
+            Reentrant {
+                log: &raw const log,
+                id: 1,
+                base,
+                composite,
+                followup: std::ptr::null_mut(),
+            },
+            Reentrant {
+                log: &raw const log,
+                id: 2,
+                base,
+                composite,
+                followup: (&raw const followup).cast_mut().cast(),
+            },
+            Reentrant {
+                log: &raw const log,
+                id: 3,
+                base,
+                composite,
+                followup: std::ptr::null_mut(),
+            },
+            Reentrant {
+                log: &raw const log,
+                id: 4,
+                base,
+                composite,
+                followup: std::ptr::null_mut(),
+            },
+            Reentrant {
+                log: &raw const log,
+                id: 5,
+                base,
+                composite,
+                followup: std::ptr::null_mut(),
+            },
+        ];
+
+        for (i, queue) in [base, composite, base, composite, base]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    queue,
+                    WORK,
+                    0,
+                    (&raw const entries[i]).cast_mut().cast(),
+                    Some(record),
+                ),
+                S_OK
+            );
+        }
+
+        assert_eq!(
+            XTaskQueueTerminate(composite, false, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(*lock(&log), vec![(2, true), (4, true)]);
+
+        while XTaskQueueDispatch(base, WORK, 0) {}
+        assert_eq!(
+            *lock(&log),
+            vec![
+                (2, true),
+                (4, true),
+                (1, false),
+                (3, false),
+                (5, false),
+                (6, false),
+            ]
+        );
+
+        XTaskQueueCloseHandle(composite);
+        XTaskQueueCloseHandle(base);
     }
 }
