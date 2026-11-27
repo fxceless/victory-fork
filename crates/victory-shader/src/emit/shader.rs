@@ -78,6 +78,12 @@ pub const MEMORY_FAULTS: u32 = 4096;
 /// Dwords of the [`SLOT_FAULTS`] buffer in all: the fault notes, then one
 /// written flag per directory page (dword [`MEMORY_FAULTS`] + page).
 pub const MEMORY_NOTES: u32 = MEMORY_FAULTS + MEMORY_PAGES;
+/// The root SRV `t<SLOT_VIEW_MAP>` in [`ROOT_CBV_SPACE`] for capped hosts
+/// (NVIDIA `PORTABLE_VIEWS = 1_000_000`) when `VICTORY_VIEW_PAGER=1`:
+/// virtual-to-physical view-heap indirection table.
+pub const SLOT_VIEW_MAP: u8 = 252;
+/// Dwords of the [`SLOT_VIEW_MAP`] table: virtual view indices below 2^21.
+pub const SLOT_VIEW_MAP_COUNT: u32 = 1 << 21;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -174,6 +180,19 @@ pub fn set_view_heap_limit(null_slot: u32) {
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `ResourceHeap` descriptor indices remap through [`SLOT_VIEW_MAP`].
+static VIEW_PAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enables or disables [`SLOT_VIEW_MAP`] indirection for shaders translated from now on.
+pub fn set_view_heap_paged(enabled: bool) {
+    VIEW_PAGER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether shaders translated now remap `ResourceHeap` indices through [`SLOT_VIEW_MAP`].
+pub fn view_heap_paged() -> bool {
+    VIEW_PAGER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {

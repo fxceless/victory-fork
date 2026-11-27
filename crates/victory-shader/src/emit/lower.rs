@@ -110,9 +110,20 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_paging(parts, super::shader::view_heap_paged())
+}
+
+#[cfg(test)]
+pub(crate) fn lower_paged_for_test(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_paging(parts, true)
+}
+
+fn lower_with_paging(parts: &Parts, view_heap_paged: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut state = Lower::new(parts, &bad);
+        state.view_heap_paged = view_heap_paged;
+        match state.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -337,6 +348,8 @@ struct Lower<'a> {
     lds_last: Option<bool>,
     lane_scalars: HashSet<Value>,
     abort: Option<usize>,
+    /// Remap `RootType::ResourceHeap` descriptor indices via `SLOT_VIEW_MAP`.
+    view_heap_paged: bool,
 }
 
 #[derive(Default)]
@@ -1515,6 +1528,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            view_heap_paged: false,
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -6881,7 +6895,7 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let (slot, _) = self.heap_index_raw(*load, *first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6984,10 +6998,10 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -7014,20 +7028,59 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let slot = self.s.m.bin(c, Bin::LShr, at, shift);
+        if !sampler && root == RootType::ResourceHeap && self.view_heap_paged {
+            Ok(self.remap_view_index(slot))
+        } else {
+            Ok(slot)
+        }
+    }
+
+    /// Remaps a virtual `ResourceHeap` descriptor index through `SLOT_VIEW_MAP`.
+    fn remap_view_index(&mut self, slot: V) -> V {
+        let c = self.cur;
+        let last = self.s.m.i32(super::shader::SLOT_VIEW_MAP_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let clamped = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(clamped, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, clamped, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEW_MAP);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        let (slot, root) = self.heap_index_raw(load, first, sampler)?;
+        if !sampler && root == RootType::ResourceHeap && self.view_heap_paged {
+            Ok(self.remap_view_index(slot))
+        } else {
+            Ok(slot)
+        }
+    }
+
+    fn heap_index_raw(&mut self, load: Site, first: u8, sampler: bool) -> Result<(V, RootType), Why> {
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(r @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => r,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -7054,7 +7107,7 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        Ok((self.s.m.bin(c, Bin::LShr, addr, shift), root))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

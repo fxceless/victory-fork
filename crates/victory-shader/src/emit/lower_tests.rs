@@ -849,3 +849,70 @@ fn the_builders_prefix_sum_lowers_and_validates_as_a_spilled_dispatch_x_program(
         v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
     }
 }
+
+#[test]
+fn paged_resource_heap_emits_valid_dxil_with_view_map_srv() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xE030_2000,
+        0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let root = |root: RootType, user_data: u8, slot: u8| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: if root == RootType::Descriptor { 2 } else { 1 },
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![root(RootType::ResourceHeap, 0, 0)],
+        used: vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = crate::ir::build(&native.code, false, 32).unwrap();
+    let st = crate::structure::structure(&p).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&p, &native).unwrap();
+    let parts = super::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    };
+    let unpaged = super::lower_with_paging(&parts, false).unwrap();
+    assert!(!unpaged.root_srvs.contains(&crate::emit::shader::SLOT_VIEW_MAP));
+    let mut paged = super::lower_paged_for_test(&parts).unwrap();
+    assert!(paged.root_srvs.contains(&crate::emit::shader::SLOT_VIEW_MAP));
+    assert!(paged.root_srvs.contains(&crate::emit::shader::SLOT_STRIDES));
+    if let Ok(mut v) = crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref()) {
+        v.validate(&mut paged.dxil).expect("DXIL validation failed for SLOT_VIEW_MAP");
+    }
+}
