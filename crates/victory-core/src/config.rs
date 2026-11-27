@@ -50,17 +50,13 @@ impl Config {
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
+        let file = match locate_config(&path, explicit.is_some())? {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Some((path, text))
+            }
+            None => None,
         };
         let (source, parsed) = match file {
             Some((path, text)) => {
@@ -116,6 +112,29 @@ impl Config {
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
+    }
+}
+
+/// Chooses the config file to read: the resolved `path` when it is a file,
+/// otherwise `None` — unless `explicit` (VICTORY_CONFIG was set), in which
+/// case a path that is missing or is not a file is an error rather than a
+/// silent fall-back to the defaults.
+fn locate_config(path: &Path, explicit: bool) -> Result<Option<PathBuf>> {
+    if path.is_file() {
+        Ok(Some(path.to_path_buf()))
+    } else if explicit {
+        if path.exists() {
+            anyhow::bail!(
+                "VICTORY_CONFIG points at {}, which is not a file",
+                path.display()
+            );
+        }
+        anyhow::bail!(
+            "VICTORY_CONFIG points at {}, which does not exist",
+            path.display()
+        );
+    } else {
+        Ok(None)
     }
 }
 
@@ -186,6 +205,34 @@ mod tests {
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
         );
+    }
+
+    #[test]
+    fn locate_config_reads_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("victory.toml");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(locate_config(&file, true).unwrap(), Some(file));
+    }
+
+    #[test]
+    fn locate_config_without_explicit_falls_back_to_defaults() {
+        let missing = Path::new("no-such-dir").join("victory.toml");
+        assert_eq!(locate_config(&missing, false).unwrap(), None);
+    }
+
+    #[test]
+    fn locate_config_explicit_missing_reports_does_not_exist() {
+        let missing = Path::new("no-such-dir").join("victory.toml");
+        let err = locate_config(&missing, true).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn locate_config_explicit_directory_reports_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = locate_config(dir.path(), true).unwrap_err().to_string();
+        assert!(err.contains("is not a file"), "{err}");
     }
 
     #[test]
