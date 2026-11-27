@@ -12,6 +12,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+
+pub(crate) mod view_cache;
 use crate::host::host;
 
 /// The locks [`HostHeap::kept`] is spread over: slot `i` is behind lock
@@ -2114,6 +2116,18 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
+    }
+
+    /// As [`HostHeap::make_at`], a texture view copied from the cache of
+    /// views made ([`view_cache`]; `key`: the view's record).
+    pub(crate) fn make_at_cached(&self, index: u32, view: &View, key: u64) {
+        if !self.sampler
+            && let Some(copied) = view_cache::cache().and_then(|c| c.copy(view, key, self.cpu(index)))
+        {
+            self.keep(index, Some(copied.texture));
+            return;
+        }
+        self.make_at(index, view);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.

@@ -2097,6 +2097,21 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Tests: lets the host copy of texture `this` go, as `let_go_idle` does
+/// for one the title no longer uses: the next use makes another.
+#[cfg(all(test, windows))]
+pub(crate) fn let_go_host_copy(this: This) {
+    let r = resource(this);
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        crate::texture::unstage(this);
+        made.take()
+    };
+    if gone.is_some() {
+        r.host.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {

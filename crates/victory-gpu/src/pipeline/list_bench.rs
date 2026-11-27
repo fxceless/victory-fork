@@ -800,7 +800,9 @@ fn table_parts() {
 /// The tables made afresh for draws show the views their title slots
 /// hold: each texture slot's descriptor is the one the host makes of the
 /// view, and the slot holds that view's host texture, in a first list and
-/// in the lists after it.
+/// in the lists after it; with the cache of views made
+/// (`VICTORY_TABLE_VIEW_CACHE`) off, then on (its second list and the
+/// next copy every view the first made).
 #[test]
 fn tables_show_their_views() {
     if crate::host::host().is_none() {
@@ -810,7 +812,8 @@ fn tables_show_their_views() {
     let heap = crate::descriptor::heap(scene.heap).host().unwrap();
     let tables = 64;
     ready(&scene, scene.tabled);
-    for pass in 0..3 {
+    for (pass, cached) in [false, true, true].into_iter().enumerate() {
+        crate::descriptor::host::view_cache::set_on(cached);
         let l = graphics_list(&scene, scene.tabled);
         for t in 0..tables {
             draw_sequence(&l, &scene, l.list, t, true);
@@ -826,15 +829,16 @@ fn tables_show_their_views() {
                 assert_eq!(
                     heap.slot_bytes(first + v),
                     crate::descriptor::host::made_bytes(&view).unwrap(),
-                    "table {t} view {v} (list {pass}): the descriptor of its view"
+                    "table {t} view {v} (list {pass}, cache {cached}): the descriptor of its view"
                 );
                 assert_eq!(
                     heap.kept_at(first + v).as_ref(),
                     crate::resource::host_resource(texture as This),
-                    "table {t} view {v} (list {pass}): holds its host texture"
+                    "table {t} view {v} (list {pass}, cache {cached}): holds its host texture"
                 );
             }
         }
         l.close();
     }
+    crate::descriptor::host::view_cache::set_on(false);
 }
