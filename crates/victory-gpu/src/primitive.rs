@@ -129,6 +129,9 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        return sign | 0x7e00; // a quiet NaN
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +150,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest, ties to even: a carry out of the mantissa is
+    // added into the exponent (`2 - 2^-12` is 2.0); at most it reaches
+    // infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    sign | (half + ((man + 0x0fff + ((man >> 13) & 1)) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -233,5 +237,25 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// A fourth corner halfway between two halves goes to the even one, and
+    /// a NaN corner stays NaN instead of becoming infinity.
+    #[test]
+    fn half_corners_round_ties_to_even_and_keep_nan() {
+        let corner = |corners: [u16; 3]| {
+            let src: Vec<u8> = corners.iter().flat_map(|h| h.to_le_bytes()).collect();
+            let mut dst = vec![0u8; 6 * 2];
+            expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+            u16::from_le_bytes([dst[10], dst[11]])
+        };
+        // 1 + 2^-11 lies between 0x3c00 and 0x3c01.
+        assert_eq!(corner([0x3c00, 0x0000, 0x1000]), 0x3c00);
+        // 1 + 3 * 2^-11 lies between 0x3c01 and 0x3c02.
+        assert_eq!(corner([0x3c01, 0x0000, 0x1000]), 0x3c02);
+        let nan = corner([0x7e00, 0x0000, 0x0000]);
+        assert!(half_to_f32(nan).is_nan(), "{nan:#06x}");
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
     }
 }
