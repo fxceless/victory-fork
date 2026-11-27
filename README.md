@@ -222,11 +222,11 @@ numbers are estimates until a run carries them.**
   one look in five seconds); a line a second with the peak (`VICTORY_VIDEO_LOOK=0`: none); and
   what Present answers, which was thrown away.
 - **The fourth loss (38 minutes in, with `VICTORY_D3D12_DRED=faults`)**: removal reason 0x887A0005
-  again, and the runtime reported no page fault address, so it was not the card reading freed or
-  unmapped memory. The three long sessions all ended on the way to the same place in the story,
-  so the trigger looks tied to what is drawn or made there, not to the time played. Nothing in the
-  last seconds of the three logs is found only there (pipelines made, textures made). The tracing
-  cost nothing measurable up to 4,000 draws a frame.
+  again, and the runtime reported no page fault address. The cause remains open. Later builds
+  also log the runtime's DRED device state when available. The three long sessions all ended on
+  the way to the same place in the story, so the trigger looks tied to what is drawn or made
+  there. The pipeline and texture creation events in the last seconds of all three logs also
+  appeared earlier. The tracing cost nothing measurable up to 4,000 draws a frame.
 - **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
   the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
   with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
