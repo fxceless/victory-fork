@@ -313,6 +313,24 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+#[cfg(test)]
+fn retire_into<T: 'static>(
+    queue: &Mutex<Vec<(u64, Retired)>>,
+    started: u64,
+    finished: u64,
+    object: T,
+) -> bool {
+    if started <= finished {
+        drop(object);
+        return true;
+    }
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started, Retired(Box::new(object))));
+    false
+}
+
 /// Whether descriptor slots written again with the object they already
 /// held let the old reference go at once instead of retiring it, and
 /// [`bury`] sorts what it drops outside the lock (`VICTORY_RETIRE_LEAN=1`;
@@ -399,8 +417,12 @@ fn bury(finished: u64) {
         reap(done.into_iter().map(|(_, object)| object).collect());
         return;
     }
+    bury_from(&RETIRED, finished);
+}
+
+fn bury_from(queue: &Mutex<Vec<(u64, Retired)>>, finished: u64) {
     let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = queue.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
@@ -1535,6 +1557,38 @@ mod tests {
         drop(shadows);
         // SAFETY: the lists completed and the copies were unregistered.
         unsafe { VirtualFree(allocation, 0, MEM_RELEASE); }
+    }
+
+    /// A retirement is held while a submission is running, and let go only
+    /// once that submission has finished. The heap of an in-place buffer
+    /// relies on this: the title cannot decommit, free or protect pages a
+    /// standing heap locks, so `VirtualFree` answers error 87 until the host
+    /// has let the heap go.
+    #[test]
+    fn a_retirement_waits_for_the_submission_that_was_running() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        struct Mark(Arc<AtomicU64>);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, super::Ordering::Relaxed);
+            }
+        }
+
+        let queue = super::Mutex::new(Vec::new());
+        let dropped = Arc::new(AtomicU64::new(0));
+        // A submission is running: started 1, finished 0.
+        assert!(!super::retire_into(&queue, 1, 0, Mark(dropped.clone())));
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while a submission runs");
+        super::bury_from(&queue, 0);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while that submission is unfinished");
+        super::bury_from(&queue, 1);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 1, "let go once it finished");
+
+        // Nothing running: it goes at once, and nothing is kept.
+        assert!(super::retire_into(&queue, 1, 1, Mark(dropped.clone())));
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 2, "nothing was running to wait for");
     }
 
     #[test]
