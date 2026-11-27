@@ -227,11 +227,53 @@ fn spare_most() -> u64 {
     })
 }
 
+/// Returns a folded write-generation digest for `[addr, addr + len)` when the
+/// range is backed by tracked physical-page views, or `None` to fall back to
+/// CPU BLAKE3 hashing.
+pub type PageGenOracle = fn(usize, usize) -> Option<u64>;
+
+static PAGE_GEN_ORACLE: std::sync::OnceLock<PageGenOracle> = std::sync::OnceLock::new();
+
+/// Registers the HLE physical-page generation oracle used when
+/// `VICTORY_TEXTURE_DIRTY_GEN=1` is enabled.
+pub fn set_page_gen_oracle(oracle: PageGenOracle) {
+    let _ = PAGE_GEN_ORACLE.set(oracle);
+}
+
+fn dirty_gen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DIRTY_GEN").is_some_and(|v| v == "1"))
+}
+
+fn hash_oracle_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HASH_ORACLE").is_some_and(|v| v == "1"))
+}
+
+/// Checks `oracle(start, size)` when `enabled` is true. Returns `(matched,
+/// new_digest)` where `matched` is true iff `last.gen_digest == Some(digest)`.
+fn check_gen_digest(
+    last: &Last,
+    start: usize,
+    size: usize,
+    oracle: Option<PageGenOracle>,
+    enabled: bool,
+) -> (bool, Option<u64>) {
+    if !enabled {
+        return (false, None);
+    }
+    let Some(digest) = oracle.and_then(|f| f(start, size)) else {
+        return (false, None);
+    };
+    (last.gen_digest == Some(digest), Some(digest))
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    gen_digest: Option<u64>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -1207,15 +1249,30 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
+            let (gen_match, new_digest) = check_gen_digest(
+                last,
+                start,
+                size,
+                PAGE_GEN_ORACLE.get().copied(),
+                dirty_gen_enabled(),
+            );
+            if gen_match && !hash_oracle_enabled() {
+                return 0;
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
+                    last.gen_digest = new_digest;
                     return false;
                 }
+                if gen_match && last.hash.is_some() {
+                    tracing::warn!(start = format_args!("{start:#x}"), size, "VICTORY_TEXTURE_HASH_ORACLE: texture bytes changed without a generation bump");
+                }
                 last.hash = Some(hash);
+                last.gen_digest = new_digest;
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1229,15 +1286,30 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        let (gen_match, new_digest) = check_gen_digest(
+            last,
+            start,
+            size,
+            PAGE_GEN_ORACLE.get().copied(),
+            dirty_gen_enabled(),
+        );
+        if gen_match && !hash_oracle_enabled() {
+            return 0;
+        }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    last.gen_digest = new_digest;
                     return size;
                 }
+                if gen_match && last.hash.is_some() {
+                    tracing::warn!(start = format_args!("{start:#x}"), size, "VICTORY_TEXTURE_HASH_ORACLE: texture bytes changed without a generation bump");
+                }
                 last.hash = Some(hash);
+                last.gen_digest = new_digest;
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1251,9 +1323,14 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.gen_digest = new_digest;
             return size;
         }
+        if gen_match && last.hash.is_some() {
+            tracing::warn!(start = format_args!("{start:#x}"), size, "VICTORY_TEXTURE_HASH_ORACLE: texture bytes changed without a generation bump");
+        }
         last.hash = Some(hash);
+        last.gen_digest = new_digest;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1917,5 +1994,45 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn dirty_gen_skips_rehash_when_digest_unchanged_and_detiles_when_bumped() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GEN: AtomicU64 = AtomicU64::new(1);
+        fn oracle(addr: usize, len: usize) -> Option<u64> {
+            if addr == 0 {
+                return None;
+            }
+            Some(GEN.load(Ordering::Relaxed) ^ (len as u64))
+        }
+
+        let mut last = super::Last::default();
+        // First check: no prior digest, so not matched, returns Some(digest).
+        let (matched, d1) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert!(d1.is_some());
+        last.gen_digest = d1;
+
+        // Unchanged generation: matches, so BLAKE3 + detile are skipped.
+        let (matched, d2) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(matched);
+        assert_eq!(d2, d1);
+
+        // Bumped generation: mismatch, so caller re-hashes/detiles.
+        GEN.fetch_add(1, Ordering::Relaxed);
+        let (matched, d3) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert_ne!(d3, d1);
+
+        // Oracle returns None (non-view memory): falls back to BLAKE3.
+        let (matched, d4) = super::check_gen_digest(&last, 0, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert!(d4.is_none());
+
+        // Disabled switch: never skips even when digest matches.
+        let (matched, d5) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), false);
+        assert!(!matched);
+        assert!(d5.is_none());
     }
 }
