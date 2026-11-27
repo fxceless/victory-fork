@@ -62,7 +62,7 @@ const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers 1/Z and 3/C.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -116,7 +116,7 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+    let on = |vk: u8| -> f32 {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
         } else {
@@ -128,8 +128,8 @@ fn fallback(keys: &[KeyState]) -> PadState {
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: on(b'1').max(on(b'Z')),
+        right_trigger: on(b'3').max(on(b'C')),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -1494,17 +1494,17 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'1'), key(b'3')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
         let state =
             slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
-        assert_eq!(count(r), 4);
+        assert_eq!(count(r), 5);
         let mut got = [KeyState::default(); 8];
-        assert_eq!(state(r, 8, got.as_mut_ptr()), 4);
-        assert_eq!(got[..4], keys[..]);
+        assert_eq!(state(r, 8, got.as_mut_ptr()), 5);
+        assert_eq!(got[..5], keys[..]);
         release(r);
 
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
@@ -1514,6 +1514,7 @@ mod tests {
                 buttons: A,
                 left_y: 1.0,
                 right_x: 1.0,
+                left_trigger: 1.0,
                 right_trigger: 1.0,
                 ..Default::default()
             }
