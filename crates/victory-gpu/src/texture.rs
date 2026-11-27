@@ -570,7 +570,8 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 // mapped and skipped (30 frames), 7 partly mapped and read, 8 hashed in
 // place and unchanged, 9 hashed in place and changed, 10 through the copy;
 // and 11 textures read more than once in one frame (reads past the first,
-// their bytes). Logged every ten seconds as totals since the start.
+// their bytes). Logged every ten seconds as totals since the start and as
+// per-frame averages over the interval since the previous line.
 #[cfg(feature = "diagnostics")]
 thread_local! {
     /// Diagnostics: the check under way reads a guarded, unwritten texture
@@ -587,17 +588,47 @@ fn checked(what: usize, bytes: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     CHECKS[what][0].fetch_add(1, Relaxed);
     CHECKS[what][1].fetch_add(bytes as u64, Relaxed);
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    struct Prev {
+        at: std::time::Instant,
+        frame: u64,
+        counts: [[u64; 2]; 12],
+    }
+    static LAST: Mutex<Option<Prev>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.is_none_or(|at| at.elapsed().as_secs() >= 10) {
-        *last = Some(std::time::Instant::now());
-        let text: Vec<String> = CHECKS
+    if last.as_ref().is_none_or(|p| p.at.elapsed().as_secs() >= 10) {
+        let now = std::time::Instant::now();
+        let frame = crate::frame::current();
+        let cur: [[u64; 2]; 12] =
+            std::array::from_fn(|i| [CHECKS[i][0].load(Relaxed), CHECKS[i][1].load(Relaxed)]);
+        let prev = last.replace(Prev {
+            at: now,
+            frame,
+            counts: cur,
+        });
+        let d_frames = prev.as_ref().map_or(frame, |p| frame.saturating_sub(p.frame));
+        let denom = d_frames.max(1) as f64;
+        let text: Vec<String> = cur
             .iter()
-            .map(|c| format!("{}/{}", c[0].load(Relaxed), c[1].load(Relaxed) >> 20))
+            .map(|c| format!("{}/{}", c[0], c[1] >> 20))
+            .collect();
+        let per_frame: Vec<String> = (0..12)
+            .map(|i| {
+                let dc = cur[i][0].saturating_sub(prev.as_ref().map_or(0, |p| p.counts[i][0]));
+                let db = cur[i][1].saturating_sub(prev.as_ref().map_or(0, |p| p.counts[i][1]));
+                format!(
+                    "{:.1}/{:.2}",
+                    dc as f64 / denom,
+                    db as f64 / (1024.0 * 1024.0) / denom
+                )
+            })
             .collect();
         tracing::info!(
             "texture checks so far (checks/MB): watched-read {} watched-unwritten {} guarded-unwritten {} guarded-turn-read {} unlocked-read {} unlocked-failed {} partial-skipped {} partial-read {} inplace-unchanged {} inplace-changed {} through-copy {} read-again-same-frame {}",
             text[0], text[1], text[2], text[3], text[4], text[5], text[6], text[7], text[8], text[9], text[10], text[11]
+        );
+        tracing::info!(
+            "texture checks per frame (last {} frames, checks/MB): watched-read {} watched-unwritten {} guarded-unwritten {} guarded-turn-read {} unlocked-read {} unlocked-failed {} partial-skipped {} partial-read {} inplace-unchanged {} inplace-changed {} through-copy {} read-again-same-frame {}",
+            d_frames, per_frame[0], per_frame[1], per_frame[2], per_frame[3], per_frame[4], per_frame[5], per_frame[6], per_frame[7], per_frame[8], per_frame[9], per_frame[10], per_frame[11]
         );
     }
 }
