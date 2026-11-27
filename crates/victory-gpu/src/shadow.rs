@@ -4082,116 +4082,134 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
-            // As the refresh itself asks (`update_free`): the journal if
-            // the submission's asking covered the range, else the kernel,
-            // else the guards. The journal alone said nothing for copies
-            // of view memory, which is guarded and not write-watched, and
-            // those were all of run 99's cases: the flights were settled
-            // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
-            };
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
+        thread_local! {
+            static MERGE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        MERGE_BUF.with(|cell| {
+            let mut title_buf = cell.borrow_mut();
+            let mut taken_pages: Vec<usize> = Vec::new();
+            for (a, e) in busy {
+                // As the refresh itself asks (`update_free`): the journal if
+                // the submission's asking covered the range, else the kernel,
+                // else the guards. The journal alone said nothing for copies
+                // of view memory, which is guarded and not write-watched, and
+                // those were all of run 99's cases: the flights were settled
+                // 4-5 times a frame for "0 pages looked at".
+                let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                    MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
+                    return true;
+                };
+                let stale: Vec<usize> = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    stale_pages_in(base, &copied, a, e, &written)
+                };
+                if stale.is_empty() {
                     continue;
                 }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
+                if title_buf.len() < PAGE {
+                    title_buf.resize(PAGE, 0);
                 }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    // Lean ([`patch_lean_now`]): a page of many runs is
-                    // patched under the cap too.
-                    let lean = runs.len() <= *runs_left
-                        && runs.len() > patch_page_runs()
-                        && masked_patch_now()
-                        && patch_lean_now();
-                    if runs.len() > *runs_left || lean {
-                        // Past the cap: the page's exact changed bytes as a
-                        // masked patch ([`masked_patch_now`]), no settle.
-                        if masked_patch_now() && at + n <= u32::MAX as usize {
-                            if lean {
-                                PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
-                                PATCH_LEAN[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                taken_pages.clear();
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let n = hi - lo;
+                    let title = &mut title_buf[..n];
+                    // The lock of the copy's reference (the snapshot, or the
+                    // CPU's side of a copy in the card's memory), from before
+                    // title memory is read until the title's bytes are in: with
+                    // the copy-back on its own thread ([`relay`]) that thread
+                    // puts what the card wrote into title memory and into the
+                    // reference under the same lock, and a page read before
+                    // such a merge and compared after it would take the card's
+                    // bytes for the title's.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked at
+                    // again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
+                    if self.card.is_some() {
+                        // SAFETY: inside the mapping of the copy's CPU side,
+                        // which only the submitting thread writes.
+                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let runs = joined_over(changed_runs(title, held), merge_gap());
+                        // Lean ([`patch_lean_now`]): a page of many runs is
+                        // patched under the cap too.
+                        let lean = runs.len() <= *runs_left
+                            && runs.len() > patch_page_runs()
+                            && masked_patch_now()
+                            && patch_lean_now();
+                        if runs.len() > *runs_left || lean {
+                            // Past the cap: the page's exact changed bytes as a
+                            // masked patch ([`masked_patch_now`]), no settle.
+                            if masked_patch_now() && at + n <= u32::MAX as usize {
+                                if lean {
+                                    PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
+                                    PATCH_LEAN[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                                }
+                                let exact = changed_runs(title, held);
+                                self.card_patched(at, title, &exact);
+                                for &(r, m) in &exact {
+                                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                                }
+                            } else {
+                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                return true;
                             }
-                            let exact = changed_runs(title, held);
-                            self.card_patched(at, title, &exact);
-                            for &(r, m) in &exact {
+                        } else {
+                            *runs_left -= runs.len();
+                            for (r, m) in runs {
                                 held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                self.card_changed(at + r, at + r + m);
                                 MERGED[1].fetch_add(1, Ordering::Relaxed);
                                 MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                             }
-                        } else {
-                            MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                            return true;
                         }
                     } else {
-                        *runs_left -= runs.len();
-                        for (r, m) in runs {
+                        let Some(snapshot) = before.as_mut() else {
+                            MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
+                            return true;
+                        };
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                        for (r, m) in changed_runs(title, held) {
+                            // SAFETY: inside the copy's mapping. The card may be
+                            // writing the copy beside these bytes; they are
+                            // written here and nothing around them.
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            self.card_changed(at + r, at + r + m);
                             MERGED[1].fetch_add(1, Ordering::Relaxed);
                             MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                         }
                     }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    drop(before);
+                    // Taken, if the range holds all of the page that is in the
+                    // copy; else the rest of it is the refresh's, which notes
+                    // only whole pages, and the page is looked at again.
+                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                        taken_pages.push(page);
                     }
                 }
-                drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                if !taken_pages.is_empty() {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                    for page in &taken_pages {
+                        if let Some(at) = copied.get_mut(page - base) {
+                            *at = now;
+                        }
                     }
                 }
             }
-        }
-        false
+            false
+        })
     }
 
     /// At submission: copies what changed of `[address, address + len)`

@@ -4539,6 +4539,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    stale_under_flights_spans(&spans)
+}
+
+fn stale_under_flights_spans(spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -7427,26 +7434,60 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            use std::sync::Arc;
+            let mut watched: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut pending: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            let mut pending_at: std::collections::HashMap<usize, Option<usize>> = std::collections::HashMap::new();
+            let mut last_watched: (usize, usize, usize) = (0, usize::MAX, 0);
+            let mut last_pending: (usize, Option<usize>) = (0, None);
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let key = Arc::as_ptr(shadow) as usize;
+                        if !shadow.unwatched() {
+                            if last_watched.0 == key {
+                                last_watched.1 = last_watched.1.min(*address);
+                                last_watched.2 = last_watched.2.max(*address + *len);
+                            } else {
+                                if last_watched.0 != 0 {
+                                    let entry = watched.entry(last_watched.0).or_insert((usize::MAX, 0));
+                                    *entry = (entry.0.min(last_watched.1), entry.1.max(last_watched.2));
+                                }
+                                last_watched = (key, *address, *address + *len);
+                            }
+                        }
+                        if behind {
+                            let at = if last_pending.0 == key {
+                                last_pending.1
+                            } else {
+                                let at = *pending_at.entry(key).or_insert_with(|| {
+                                    shadow.writes_pending().then(|| {
+                                        pending.push((shadow.clone(), usize::MAX, 0));
+                                        pending.len() - 1
+                                    })
+                                });
+                                last_pending = (key, at);
+                                at
+                            };
+                            if let Some(at) = at {
+                                let s = &mut pending[at];
+                                (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                            }
+                        }
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            if last_watched.0 != 0 {
+                let entry = watched.entry(last_watched.0).or_insert((usize::MAX, 0));
+                *entry = (entry.0.min(last_watched.1), entry.1.max(last_watched.2));
+            }
+            let ranges: Vec<(usize, usize)> = watched.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights_spans(&pending) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
@@ -10042,21 +10083,33 @@ impl Batch {
         }
         let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
         // The refreshes that hold written bytes: done now, before the write.
-        let pending = std::mem::take(&mut self.refreshes);
-        let (due, keep): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| touches(r.1, r.2));
+        // Fast path: when no pending refresh overlaps, keep `self.refreshes`
+        // and `self.index` untouched without allocating or rebuilding the map.
+        let mut due = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let r = &self.refreshes[i];
+            if touches(r.1, r.2) {
+                due.push(self.refreshes.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
         NEAR[3].fetch_add(due.len() as u64, Relaxed);
-        NEAR[4].fetch_add(keep.len() as u64, Relaxed);
+        NEAR[4].fetch_add(self.refreshes.len() as u64, Relaxed);
         if !due.is_empty() {
+            let keep = std::mem::take(&mut self.refreshes);
             self.refreshes = due;
             self.flush();
+            self.refreshes = keep;
+            self.index.clear();
+            self.index.extend(
+                self.refreshes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| (std::sync::Arc::as_ptr(&r.0) as usize, idx)),
+            );
         }
-        self.refreshes = keep;
-        self.index = self
-            .refreshes
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (std::sync::Arc::as_ptr(&r.0) as usize, i))
-            .collect();
         // Textures: checked again only where the write lands.
         let before = self.textures.len();
         let spans = &self.texture_spans;
