@@ -2987,6 +2987,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    #[cfg(feature = "diagnostics")]
+    trace: Vec<crate::draw_trace::Event>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -7161,11 +7163,17 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            let trace = crate::draw_trace::Batch::before(runs, &self.fence);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(trace) = trace {
+                trace.sent(*submitted, signalled.is_ok());
+            }
             self.card_sent();
             prep_part(5, prepared);
             if let Err(e) = signalled {
@@ -7208,13 +7216,21 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let trace = crate::draw_trace::Batch::before(
+                if timing() { &runs[i..=i] } else { runs },
+                &self.fence,
+            );
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                let signalled = self.queue.Signal(&self.fence, *submitted);
+                #[cfg(feature = "diagnostics")]
+                if let Some(trace) = trace {
+                    trace.sent(*submitted, signalled.is_ok());
+                }
+                let waited = signalled
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
@@ -8642,6 +8658,16 @@ impl HostList {
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_event(&self, event: crate::draw_trace::Event) {
+        self.deferred().trace.push(event);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_events(&self) -> Vec<crate::draw_trace::Event> {
+        self.deferred().trace.clone()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

@@ -47,6 +47,8 @@ pub(crate) struct Staging {
     bytes: u64,
     memory: *const u8,
     last: Mutex<Last>,
+    #[cfg(feature = "diagnostics")]
+    trace_row_bytes: Vec<u64>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
     /// the upload only then. (Every list that sampled a title texture
@@ -800,6 +802,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    #[cfg(feature = "diagnostics")]
+    if crate::draw_trace::enabled() {
+        list.trace_event(crate::draw_trace::Event::Upload(texture.clone(), staging.clone()));
+    }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -949,6 +955,35 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Fingerprint texel bytes in the actual upload buffer after deferred fills.
+    /// Sample three rows per subresource, excluding D3D12 pitch padding.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_sample(&self) -> u64 {
+        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hash = blake3::Hasher::new();
+        for ((foot, &rows), &bytes) in self.footprints.iter().zip(&self.rows).zip(&self.trace_row_bytes)
+        {
+            let rows = rows as usize * foot.Footprint.Depth as usize;
+            let bytes = bytes as usize;
+            if rows == 0 || bytes == 0 {
+                continue;
+            }
+            hash.update(&(rows as u64).to_le_bytes());
+            hash.update(&(bytes as u64).to_le_bytes());
+            let n = bytes.min(64);
+            for row in [0, rows / 2, rows - 1] {
+                let start = foot.Offset as usize + row * foot.Footprint.RowPitch as usize;
+                for x in [0, (bytes - n) / 2, bytes - n] {
+                    // SAFETY: row counts and unpadded widths come from this
+                    // staging buffer's D3D12 copy footprints. Refreshes use last.
+                    let part = unsafe { std::slice::from_raw_parts(self.data.add(start + x), n) };
+                    hash.update(part);
+                }
+            }
+        }
+        u64::from_le_bytes(hash.finalize().as_bytes()[..8].try_into().unwrap())
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1518,6 +1553,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    #[cfg(feature = "diagnostics")]
+    let mut trace_row_bytes = if crate::draw_trace::enabled() {
+        vec![0u64; count as usize]
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "diagnostics")]
+    let row_sizes = (!trace_row_bytes.is_empty()).then_some(trace_row_bytes.as_mut_ptr());
+    #[cfg(not(feature = "diagnostics"))]
+    let row_sizes = None;
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -1528,7 +1573,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            row_sizes,
             Some(&mut total),
         );
     }
@@ -1554,6 +1599,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         last: Mutex::default(),
+        #[cfg(feature = "diagnostics")]
+        trace_row_bytes,
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),

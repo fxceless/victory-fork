@@ -40,6 +40,8 @@ mod stats;
 mod spread;
 #[cfg(windows)]
 mod draw;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod draw_trace;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

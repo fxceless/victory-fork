@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
+#[cfg(feature = "diagnostics")]
+mod trace;
+
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -554,6 +557,9 @@ pub(crate) struct State {
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
     last_indirect: (u64, u64),
+    /// Actual byte offsets substituted for graphics tables on the traced pipeline.
+    #[cfg(feature = "diagnostics")]
+    trace_bases: Vec<(victory_shader::HwStage, u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1737,6 +1743,10 @@ impl State {
         // slots).
         let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
         let mut staged: Vec<(u64, u32)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let trace = !compute && crate::draw_trace::pixel(p).is_some();
+        #[cfg(feature = "diagnostics")]
+        self.trace_bases.clear();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1748,6 +1758,12 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
                 return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            if trace {
+                self.trace_bases.extend(
+                    made.iter().map(|&(slot, offset)| (t.host.stage, slot, offset)),
+                );
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -3501,8 +3517,13 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
-        if !compute && !list_slots().is_empty() {
-            text.push_str(&self.slots_text());
+        if !compute
+            && !list_slots().is_empty()
+            && let Some(stage) = p.stages.iter().find(|s| {
+                list_slots().iter().any(|w| s.shader.hash.starts_with(w.as_str()))
+            })
+        {
+            text.push_str(&self.slots_text(stage, |_, _, _, _| {}));
         }
         text
     }
@@ -3523,19 +3544,15 @@ impl State {
     /// dword 688. A word that is a small number by chance and names a
     /// texture gets a line too.
     #[cfg(feature = "diagnostics")]
-    fn slots_text(&self) -> String {
+    fn slots_text(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        mut words: impl FnMut(&str, crate::draw_trace::WordSource, usize, &[u32]),
+    ) -> String {
         use std::fmt::Write;
         const MATERIALS: u32 = 160;
         const GLOBAL: u32 = 688;
         const DRAW_CONSTANTS: u32 = 56;
-        let wanted = list_slots();
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return String::new();
-        };
-        let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
-        else {
-            return String::new();
-        };
         let Some(heap) = self
             .heaps
             .iter()
@@ -3567,11 +3584,14 @@ impl State {
             match range {
                 // A small buffer or constants: its words.
                 Some((address, len)) if len <= 2048 => {
-                    Self::slot_words(&mut text, heap, &label, address, len as usize);
+                    Self::slot_words(
+                        &mut text, heap, &label, address, len as usize,
+                        crate::draw_trace::WordSource::Fixed(address), &mut words,
+                    );
                     if u.slot == 1 && u.table_offset_dwords == DRAW_CONSTANTS && len >= 0x20 {
                         let mut word = [0u8; 4];
                         if crate::host::read_into((address + 0x1c) as *const u8, &mut word) {
-                            material = Some(u32::from_le_bytes(word));
+                            material = Some((u32::from_le_bytes(word), address + 0x1c));
                         }
                     }
                 }
@@ -3593,29 +3613,35 @@ impl State {
         let uses = |slot: u8, dwords: u32| {
             t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dwords)
         };
-        if let Some(at) = material
+        if let Some((at, index_at)) = material
             && uses(0, MATERIALS)
             && let Some((base, len)) = entry(0, MATERIALS).as_ref().and_then(crate::descriptor::host::buffer_range)
         {
             let at = u64::from(at);
             let _ = write!(text, "\n    ~material record at {at:#x} of the buffer at {base:#x} bytes {len}");
+            let record = |skip| crate::draw_trace::WordSource::Material { base, len, index_at, skip };
             if at + 64 <= len {
-                Self::slot_words(&mut text, heap, "M", base + at, 64);
+                Self::slot_words(&mut text, heap, "M", base + at, 64, record(0), &mut words);
             }
             if at + 1936 + 512 <= len {
-                Self::slot_words(&mut text, heap, "M+1936", base + at + 1936, 512);
+                Self::slot_words(&mut text, heap, "M+1936", base + at + 1936, 512, record(1936), &mut words);
             }
         }
         if uses(0, GLOBAL)
             && let Some(slot) = t.used.iter().find(|u| u.root == RootType::Constants).map(|u| u.slot)
-            && let Some(Root::Constants(words)) = self.roots_ref(false).get(usize::from(slot))
-            && let Some(&at) = words.get(1)
+            && let Some(Root::Constants(root_words)) = self.roots_ref(false).get(usize::from(slot))
+            && let Some(&at) = root_words.get(1)
             && let Some((base, len)) = entry(0, GLOBAL).as_ref().and_then(crate::descriptor::host::buffer_range)
         {
             let at = u64::from(at);
-            let _ = write!(text, "\n    ~root constants {words:08x?}: record at {at:#x} of the buffer at {base:#x} bytes {len}");
+            let _ = write!(text,
+                "\n    ~root constants {root_words:08x?}: record at {at:#x} of the buffer at {base:#x} bytes {len}"
+            );
             if at + 64 <= len {
-                Self::slot_words(&mut text, heap, "G", base + at, 64);
+                Self::slot_words(
+                    &mut text, heap, "G", base + at, 64,
+                    crate::draw_trace::WordSource::Fixed(base + at), &mut words,
+                );
             }
         }
         text
@@ -3625,15 +3651,21 @@ impl State {
     /// line), and a `~slot` line for every word of them that names a
     /// texture view in `heap`.
     #[cfg(feature = "diagnostics")]
-    fn slot_words(text: &mut String, heap: &crate::descriptor::Heap, label: &str, address: u64, len: usize) {
+    fn slot_words(
+        text: &mut String, heap: &crate::descriptor::Heap, label: &str, address: u64,
+        len: usize, source: crate::draw_trace::WordSource,
+        observe: &mut impl FnMut(&str, crate::draw_trace::WordSource, usize, &[u32]),
+    ) {
         use std::fmt::Write;
         let mut bytes = vec![0u8; len.min(512) & !3];
         if bytes.is_empty() || !crate::host::read_into(address as *const u8, &mut bytes) {
+            observe(label, source, bytes.len(), &[]);
             let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}: unreadable");
             return;
         }
         let words: Vec<u32> =
             bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        observe(label, source, bytes.len(), &words);
         let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}:");
         for w in &words {
             let _ = write!(text, " {w:08x}");
@@ -3705,6 +3737,8 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    self.trace_draw(list, || format!("mesh {x}"));
                     self.mesh_scissor(list, true);
                     // With the launch stage the count goes to it as a root
                     // constant (`crate::launch`).
@@ -4289,6 +4323,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.trace_draw(list, || format!("draw {count} {instances} {from} {first_instance}"));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4392,6 +4428,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.trace_draw(list, || format!("indexed {indices} {instances} {first} {base} {first_instance}"));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4844,6 +4882,12 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind != DISPATCH {
+            self.trace_draw(list, || {
+                format!("indirect {kind} max {max} stride {stride} counted {}", count.is_some())
+            });
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
