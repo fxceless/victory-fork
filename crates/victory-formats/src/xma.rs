@@ -133,6 +133,9 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
 fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let index = start / PACKET_BITS;
     let header = packet(data, index)?;
+    if HEADER_BITS + header.first_frame_bit as usize >= PACKET_BITS {
+        return None;
+    }
     let mut at = index * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
     let mut number = 0;
     while at < start {
@@ -148,12 +151,30 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
         number += 1;
     }
     let last = number + 1 >= header.frames;
+    let end_pkt = end.checked_sub(1)? / PACKET_BITS;
+    let need_next_packet = end.is_multiple_of(PACKET_BITS)
+        || (end / PACKET_BITS == index && last)
+        || (end / PACKET_BITS != index && packet(data, end_pkt)?.frames == 0);
     let mut end = end;
-    if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) {
-        // The next frame begins in the next packet of this stream.
-        let next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
-        let header = packet(data, next)?;
-        end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
+    if need_next_packet {
+        // Advance through this stream's skip chain until a packet that starts
+        // at least one frame, skipping `frames == 0` continuation/empty packets
+        // whose `first_frame_bit` is 0x7fff.
+        let mut cur = end_pkt;
+        loop {
+            let skip = packet(data, cur)?.skip as usize;
+            cur = cur.checked_add(1)?.checked_add(skip)?;
+            let next_header = packet(data, cur)?;
+            if next_header.frames == 0 {
+                continue;
+            }
+            let first_bit = next_header.first_frame_bit as usize;
+            if HEADER_BITS + first_bit >= PACKET_BITS {
+                return None;
+            }
+            end = cur.checked_mul(PACKET_BITS)? + HEADER_BITS + first_bit;
+            break;
+        }
     }
     (end / 8 < data.len()).then_some(end)
 }
@@ -1151,6 +1172,60 @@ mod tests {
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.
         assert_eq!(c.next, None);
+    }
+
+    #[test]
+    fn next_frame_handles_zero_frame_continuation_and_empty_packets() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        let put = |data: &mut Vec<u8>, at: usize, value: u32, width: u32| {
+            for i in 0..width as usize {
+                let bit = (value >> (width as usize - 1 - i)) & 1;
+                let p = at + i;
+                data[p / 8] = (data[p / 8] & !(1 << (7 - p % 8))) | ((bit as u8) << (7 - p % 8));
+            }
+        };
+
+        // Case 1: Frame A starts in packet 0 (20000 bits), finishes inside
+        // packet 1 (frames=0, first=0x7fff, rest is 0xFF padding), and Frame B
+        // starts in packet 2.
+        let mut data = vec![0xffu8; 3 * PACKET_BYTES];
+        put(&mut data, 0, header(1, 0, 0), 32);
+        put(&mut data, PACKET_BITS, header(0, 0x7fff, 0), 32);
+        put(&mut data, 2 * PACKET_BITS, header(1, 0, 0), 32);
+        put(&mut data, HEADER_BITS, 20_000, 15);
+        let b_start = 2 * PACKET_BITS + HEADER_BITS;
+        put(&mut data, b_start, 80, 15);
+
+        let a = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!((a.bits, a.next), (20_000, Some(b_start)));
+        let b = read_frame(&data, b_start).unwrap();
+        assert_eq!((b.bits, b.next), (80, None));
+
+        // Case 2: Frame A finishes inside packet 0; packet 1 is an empty packet
+        // (frames=0, first=0x7fff, skip=1) skipping an interleaved packet 2,
+        // and Frame B begins in packet 3.
+        let mut data = vec![0xffu8; 4 * PACKET_BYTES];
+        put(&mut data, 0, header(1, 0, 0), 32);
+        put(&mut data, PACKET_BITS, header(0, 0x7fff, 1), 32);
+        put(&mut data, 2 * PACKET_BITS, header(1, 0, 0), 32); // other stream
+        put(&mut data, 3 * PACKET_BITS, header(1, 16, 0), 32);
+        put(&mut data, HEADER_BITS, 100, 15);
+        let b_start = 3 * PACKET_BITS + HEADER_BITS + 16;
+        put(&mut data, b_start, 64, 15);
+
+        let a = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!((a.bits, a.next), (100, Some(b_start)));
+        let b = read_frame(&data, b_start).unwrap();
+        assert_eq!((b.bits, b.next), (64, None));
+
+        // Case 3: A packet claiming frames > 0 with an out-of-packet first_frame_bit
+        // (e.g. 0x7fff) is rejected instead of jumping into another packet's header.
+        let mut bad = vec![0xffu8; 4 * PACKET_BYTES];
+        put(&mut bad, 0, header(1, 0, 0), 32);
+        put(&mut bad, PACKET_BITS, header(1, 0x7fff, 0), 32);
+        put(&mut bad, HEADER_BITS, 100, 15);
+        let a = read_frame(&bad, HEADER_BITS).unwrap();
+        assert_eq!(a.next, None);
     }
 
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
