@@ -982,20 +982,21 @@ fn texture_cpu_profile() -> bool {
 }
 
 struct TextureCpuTimer {
+    counters: &'static [AtomicU64; 3],
     phase: usize,
     since: std::time::Instant,
 }
 impl TextureCpuTimer {
     fn next(&mut self) {
         let now = std::time::Instant::now();
-        TEXTURE_CPU_US[self.phase].fetch_add(now.duration_since(self.since).as_micros() as u64, Ordering::Relaxed);
+        self.counters[self.phase].fetch_add(now.duration_since(self.since).as_micros() as u64, Ordering::Relaxed);
         self.phase += 1;
         self.since = now;
     }
 }
 impl Drop for TextureCpuTimer {
     fn drop(&mut self) {
-        TEXTURE_CPU_US[self.phase].fetch_add(self.since.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.counters[self.phase].fetch_add(self.since.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 pub(crate) fn texture_cpu_line(frames: f64) {
@@ -2890,7 +2891,7 @@ impl State {
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
         let mut cpu_profile = (!only && texture_cpu_profile()).then(|| TextureCpuTimer {
-            phase: 0, since: std::time::Instant::now(),
+            counters: &TEXTURE_CPU_US, phase: 0, since: std::time::Instant::now(),
         });
         // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
         // as if the card had room, within its own bytes.
@@ -5547,4 +5548,22 @@ mod tests {
         // No thread along an axis: nothing runs.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
     }
+}
+
+#[test]
+fn texture_cpu_timer_accounts_for_phase_transitions_and_early_drop() {
+    static TEST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let earlier = || std::time::Instant::now() - std::time::Duration::from_millis(1);
+    let mut timer = TextureCpuTimer { counters: &TEST, phase: 0, since: earlier() };
+    timer.next();
+    timer.since = earlier();
+    timer.next();
+    timer.since = earlier();
+    drop(timer);
+    assert!(TEST.iter().all(|c| c.load(Ordering::Relaxed) >= 1000));
+    let before = TEST.each_ref().map(|c| c.load(Ordering::Relaxed));
+    drop(TextureCpuTimer { counters: &TEST, phase: 0, since: earlier() });
+    assert!(TEST[0].load(Ordering::Relaxed) >= before[0] + 1000);
+    assert_eq!(TEST[1].load(Ordering::Relaxed), before[1]);
+    assert_eq!(TEST[2].load(Ordering::Relaxed), before[2]);
 }
