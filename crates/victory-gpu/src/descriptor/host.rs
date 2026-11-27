@@ -2051,20 +2051,32 @@ impl HostHeap {
     /// old heap, and must not free the new one's slots ([NEXT_ID]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        self.release_many(id, [(first, n)]);
+    }
+
+    pub(crate) fn release_many(&self, id: u64, ranges: impl IntoIterator<Item = (u32, u32)>) {
         if id != self.id {
             return;
         }
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let mut given = 0;
+        let mut valid = false;
+        for (first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                valid = true;
+                given += slots.iter().filter(|taken| **taken).count() as u32;
+                slots.fill(false);
+            }
+        }
+        if valid {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -4887,6 +4899,22 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn batched_release_counts_overlaps_once_and_rejects_stale_owners() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let first = heap.dynamic(16).unwrap();
+        let free = || heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        let before = free();
+        heap.release_many(heap.id().wrapping_add(1), [(first, 16)]);
+        assert_eq!(free(), before);
+        heap.release_many(heap.id(), [(0, 16), (first, 8), (first + 4, 8)]);
+        assert_eq!(free(), before + 12);
+        heap.release_many(heap.id(), [(first, 16), (first, 16)]);
+        assert_eq!(free(), heap.dynamic);
     }
 }
 
