@@ -129,6 +129,10 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        // A quiet NaN: the payload may sit only in bits the half drops.
+        return sign | 0x7e00;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +151,14 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest, ties to even as above: a carry out of the mantissa
+    // is added into the exponent (`2 - 2^-12` is 2.0); at most it reaches
+    // infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let q = man >> 13;
+    let r = man & 0x1fff;
+    let m = q + u32::from(r > 0x1000 || (r == 0x1000 && (q & 1) != 0));
+    sign | (half + m) as u16
 }
 
 #[cfg(test)]
@@ -233,5 +241,114 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// Normal values halfway between two halves go to the even mantissa,
+    /// as subnormals already did (#245). An R16_FLOAT element at 1.0, 0 and
+    /// 2^-11: the fourth corner is 1 + 2^-11, halfway between 0x3c00 and
+    /// 0x3c01.
+    #[test]
+    fn normal_halves_round_ties_to_even() {
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
+        // Just past the tie still rounds up.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-23)), 0x3c01);
+        let src: Vec<u8> = [0x3c00_u16, 0x0000, 0x1000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = vec![0u8; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        assert_eq!(dst[10..], 0x3c00_u16.to_le_bytes());
+    }
+
+    /// A NaN stays a NaN instead of becoming infinity (#245), whatever its
+    /// payload: one only in the low f32 mantissa bits must not lose it.
+    #[test]
+    fn nan_stays_nan_in_half() {
+        let is_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+        for bits in [0x7fc0_0000, 0x7f80_0001, 0x7fbf_ffff, 0xffc0_0000_u32] {
+            let h = f32_to_half(f32::from_bits(bits));
+            assert!(is_nan(h), "{bits:#x} -> {h:#x}");
+            assert_eq!(h & 0x8000 != 0, bits >> 31 != 0, "{bits:#x} keeps its sign");
+        }
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+        // A quiet NaN corner with the other two at zero.
+        let src: Vec<u8> = [0x7e00_u16, 0x0000, 0x0000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = vec![0u8; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        let fourth = u16::from_le_bytes([dst[10], dst[11]]);
+        assert!(is_nan(fourth), "{fourth:#x}");
+    }
+
+    /// The half nearest `v`, ties to the even one, found by search over the
+    /// halves' exact values rather than by bit manipulation.
+    fn reference_half(v: f32) -> u16 {
+        let sign = if v.is_sign_negative() { 0x8000 } else { 0 };
+        let a = f64::from(v.abs());
+        // 0x7c00 is valued 2^16 here, one step past the largest half: that
+        // makes overflow (from 65520 on, a tie with an odd 0x7bff) fall out.
+        let value = |h: u16| {
+            let (e, m) = (i32::from(h >> 10), f64::from(h & 0x3ff));
+            if e == 0 {
+                m * 2f64.powi(-24)
+            } else {
+                (1024.0 + m) * 2f64.powi(e - 25)
+            }
+        };
+        if a >= 65536.0 {
+            return sign | 0x7c00;
+        }
+        // Largest `lo` with value(lo) <= a.
+        let (mut lo, mut hi) = (0u16, 0x7c00u16);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if value(mid) <= a { lo = mid } else { hi = mid }
+        }
+        let (d_lo, d_hi) = (a - value(lo), value(hi) - a);
+        let up = d_hi < d_lo || (d_hi == d_lo && lo & 1 != 0);
+        sign | if up { hi } else { lo }
+    }
+
+    /// `f32_to_half` against the reference over every half, every halfway
+    /// point and the f32 values either side of it, and a sweep of f32 bits.
+    #[test]
+    fn half_conversion_matches_a_reference() {
+        let check = |v: f32| {
+            for v in [v, -v] {
+                assert_eq!(
+                    f32_to_half(v),
+                    reference_half(v),
+                    "{v:e} ({:#x})",
+                    v.to_bits()
+                );
+            }
+        };
+        for h in 0..0x7c00u16 {
+            let (lo, hi) = (half_to_f32(h), half_to_f32(h + 1));
+            let mid = if h == 0x7bff {
+                65520.0
+            } else {
+                (lo + hi) / 2.0
+            };
+            check(lo);
+            for v in [
+                mid,
+                f32::from_bits(mid.to_bits() - 1),
+                f32::from_bits(mid.to_bits() + 1),
+            ] {
+                check(v);
+            }
+        }
+        for bits in (0..0x7f80_0000u32).step_by(0x1001) {
+            check(f32::from_bits(bits));
+        }
+        check(f32::MAX);
+        check(f32::INFINITY);
     }
 }
