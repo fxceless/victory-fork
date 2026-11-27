@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Debug-session artifacts (state/PROGRESS.md, RUNLOG.md, DECISIONS.md and
+# state/findings/*.md stay tracked; raw run logs and frame captures do not -
+# they're large and/or binary, and the policy check above applies).
+/state/captures/
+/state/*.log

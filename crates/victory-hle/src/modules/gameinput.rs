@@ -115,6 +115,13 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// `VICTORY_KEYBOARD_PAD=1`: keep the keyboard stand-in pad on regardless
+/// of any real pad's connection state.
+fn keyboard_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("VICTORY_KEYBOARD_PAD").is_ok_and(|v| v == "1"))
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -454,7 +461,10 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        // `VICTORY_KEYBOARD_PAD=1`: the keyboard stand-in pad stays on even
+        // with a real pad connected (a spuriously-enumerated XInput device,
+        // or simply wanting the keyboard, otherwise silently disabled).
+        let any_pad = !keyboard_forced() && pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
