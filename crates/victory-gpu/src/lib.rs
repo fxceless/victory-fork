@@ -100,3 +100,20 @@ pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// For switches set to `alt` (twenty seconds with, twenty without): which
+/// half of each forty seconds is "with". 1 by default, the second half, as
+/// before; `VICTORY_ALT_FLIP=1` makes it the first.
+///
+/// Why: the phases start with the process, so in a scripted scene (a
+/// cutscene from a save, driven by a key file) each half falls on the same
+/// stretches of the scene in every launch, and the scene's own difference
+/// between those stretches is read as the switch's. Measured on an RTX
+/// 5090 in the opening cutscene: `VICTORY_SYNC_BESIDE=alt` read +11.3 % in
+/// a launch as before and +0.9 % flipped; `VICTORY_REAPER=alt` +14.4 % and
+/// +1.9 %. One launch each way puts "with" on every stretch once: the mean
+/// of the two has the scene taken out.
+pub fn alt_on_phase() -> u64 {
+    static PHASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PHASE.get_or_init(|| u64::from(std::env::var_os("VICTORY_ALT_FLIP").is_none_or(|v| v != "1")))
+}
