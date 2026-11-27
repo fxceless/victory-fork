@@ -539,6 +539,23 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Adjacent mapping calls noted and joined (`VICTORY_XMEM_WHOLE_MB`,
+    /// [`whole_bytes`]); empty while it is off.
+    joins: Joins,
+}
+
+impl Physical {
+    /// What the view at `at` shows there, if a view of ours is there.
+    fn slice_at(&self, at: usize) -> Option<Slice> {
+        self.views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _))| at < *base + size)
+            .map(|(base, (_, s))| Slice {
+                index: s.index + (at - base) / PAGE,
+                section: s.section.clone(),
+            })
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -567,9 +584,41 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    let section = match new_section(size) {
+        Ok(section) => section,
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+    };
+    tracing::debug!(
+        n,
+        flags = format_args!("{flags:#x}"),
+        "XMemAllocatePhysicalPages"
+    );
+    let mut physical = physical();
+    let first = physical.next_page;
+    physical.next_page += n * FRAMES;
+    for index in 0..n {
+        let slice = Slice {
+            section: section.clone(),
+            index,
+        };
+        let number = first + index * FRAMES;
+        physical.pages.insert(number, slice);
+        // SAFETY: the title passes room for `n` page numbers.
+        unsafe { pages.add(index).write(number) };
+    }
+    1
+}
+
+/// A pagefile-backed section of `size` bytes for physical pages, its pages
+/// committed when first mapped or written (`commit`): the title asks for
+/// 6.1 GiB at once, which a busy host often cannot commit (error 1450).
+/// Told to the GPU side.
+fn new_section(size: usize) -> Result<Arc<Section>, std::io::Error> {
     // SAFETY: plain section creation.
     let handle = unsafe {
         CreateFileMappingW(
@@ -586,35 +635,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         )
     };
     if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+        return Err(std::io::Error::last_os_error());
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
-    }
-    1
+    Ok(Arc::new(Section(handle)))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -852,15 +878,40 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
+        if whole_bytes().is_some() {
+            physical.joins.forget(base, n * PAGE);
+        }
         return address;
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    if let Some(min) = whole_bytes() {
+        // Beside earlier calls: one span with them, perhaps a section of
+        // its own ([`join`], [`whole`]).
+        join(&mut physical, base, pages, min);
+        let slices: Vec<Option<Slice>> = pages.iter().map(|p| physical.pages.get(p).cloned()).collect();
+        match whole(&mut physical, base, pages, &slices, min) {
+            Whole::Not => {}
+            Whole::Mapped => return address,
+            Whole::Failed => return std::ptr::null_mut(),
+        }
+    }
+    if !map_runs(&mut physical, base, pages) {
+        return std::ptr::null_mut();
+    }
+    address
+}
+
+/// Maps the pages `pages` name at `base` (unmapped already), a view per
+/// run of consecutive slices of one section; false if a page is unknown
+/// or the host refuses.
+fn map_runs(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
+    let n = pages.len();
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
+            return false;
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -872,12 +923,19 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+        // `VICTORY_XMEM_WHOLE_MB`: the range may be several placeholders
+        // that views of a joined section left ([`map_pieces`]).
+        let mapped = if whole_bytes().is_some() {
+            map_pieces(physical, base + i * PAGE, run * PAGE, &first)
+        } else {
+            map(physical, base + i * PAGE, run * PAGE, first)
+        };
+        if !mapped {
+            return false;
         }
         i += run;
     }
-    address
+    true
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -889,6 +947,20 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 ) -> BOOL {
     if addresses.is_null() {
         return 0;
+    }
+    // `VICTORY_XMEM_WHOLE_MB`: pages onto consecutive addresses, enough to
+    // be joined, are one mapping call.
+    if let Some(min) = whole_bytes()
+        && !pages.is_null()
+        && n.saturating_mul(PAGE) >= WHOLE_PIECE.min(min / 4)
+    {
+        // SAFETY: the title passes `n` addresses and `n` pages.
+        let (first, numbers) = unsafe { (*addresses as usize, std::slice::from_raw_parts(pages, n)) };
+        // SAFETY: as above.
+        let consecutive = (0..n).all(|i| unsafe { *addresses.add(i) as usize } == first.wrapping_add(i * PAGE));
+        if first.is_multiple_of(PAGE) && consecutive && numbers.iter().all(|&p| p != 0) {
+            return (!XMemMapPhysicalPages(first as *mut c_void, n, numbers.as_ptr()).is_null()).into();
+        }
     }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
@@ -943,16 +1015,7 @@ fn alias(to: usize, from: usize, len: usize) -> bool {
             break;
         }
         let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+        let Some(slice) = physical.slice_at(at) else {
             return false;
         };
         // Counted only: whether this page follows the one mapped just
@@ -1179,6 +1242,566 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
     }
+}
+
+// `VICTORY_XMEM_WHOLE_MB`: adjacent mapping calls joined into one run of a
+// section of their own.
+
+/// `VICTORY_XMEM_WHOLE_MB=<n>` (unset, 0 or not a number: off, as before):
+/// adjacent mapping calls below 4 GiB that together reach `n` MB (up to
+/// 1 GiB) are joined ([`join`]): their pages become consecutive slices of
+/// one section made for the span, each call at its place in it, whatever
+/// the order of the calls ([`whole`]). A single call of `n` MB or more is
+/// taken the same way. The span is then one run of one section, which the
+/// GPU side can open as a host heap where the title has it
+/// (`VICTORY_INPLACE_CONSTANTS`, `OpenExistingHeapFromAddress1` on a view
+/// of that run).
+///
+/// Why: the title reserves its 174 MB constants heap and maps it in three
+/// adjacent calls, out of address order (about 47 MB, then 100 MB above
+/// it, then 27 MB below them), from pages that are not one run of one
+/// section. Mapped by runs, that is views of several sections.
+///
+/// What it costs: each joined call's pages are copied once into the new
+/// section, under the mapping lock; a span that grows is made anew and its
+/// pages copied again (147 MB, then 174 MB for the heap). The old pages'
+/// committed bytes stay committed until their section goes. Calls above
+/// 4 GiB are left alone.
+fn whole_bytes() -> Option<usize> {
+    static BYTES: LazyLock<Option<usize>> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_XMEM_WHOLE_MB")
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|&mb| mb > 0)?;
+        tracing::info!(
+            "xmem whole: adjacent mapping calls below 4 GiB that reach {mb} MB together (up to 1 GiB) become one run of a section \
+             of their own (VICTORY_XMEM_WHOLE_MB)"
+        );
+        Some(mb.saturating_mul(MIB))
+    });
+    *BYTES
+}
+
+/// The largest span [`whole`] takes.
+const WHOLE_MOST: usize = 1024 * MIB;
+
+/// The smallest call [`join`] notes (with the switch's size under 4 MB: a
+/// quarter of it). Smaller ones, page-by-page streaming, map as before.
+const WHOLE_PIECE: usize = MIB;
+
+/// [`join`] and [`whole`] take memory below this only: what the card reads
+/// in place must lie there, and the title's big pools above it are shown at
+/// other addresses as well.
+const WHOLE_BELOW: usize = 1 << 32;
+
+/// At most this many runs of other addresses that show a call's pages too
+/// (mapped again onto the new slices) before [`whole`] leaves the call.
+const WHOLE_ALIASES: usize = 4096;
+
+/// At most this many spans are kept (the oldest not joined goes first).
+const SPANS_MOST: usize = 256;
+
+/// What [`join`] and [`whole`] keep (in [`Physical`]).
+#[derive(Default)]
+struct Joins {
+    /// Mapping calls of [`WHOLE_PIECE`] and more below 4 GiB, as spans of
+    /// adjacent calls.
+    spans: Vec<Span>,
+    /// Spans joined, by address: each has a section of its own.
+    joined: BTreeMap<usize, Joined>,
+}
+
+/// Adjacent mapping calls.
+struct Span {
+    start: usize,
+    end: usize,
+    /// Joined: a section of its own ([`Joins::joined`] at `start`).
+    joined: bool,
+    /// The calls: address and page numbers.
+    pieces: Vec<(usize, Vec<usize>)>,
+}
+
+/// A joined span's section.
+struct Joined {
+    size: usize,
+    /// Made at the first call into it that [`whole`] takes.
+    section: Option<Arc<Section>>,
+    /// The section could not be made: left alone.
+    refused: bool,
+    /// The page number last given each slice of the section (0: none); a
+    /// slice is another page's only while that number still names it.
+    owners: Vec<usize>,
+}
+
+impl Joins {
+    /// The title unmaps `[base, base + len)`: the calls noted there are no
+    /// more (a span not joined with none left goes).
+    fn forget(&mut self, base: usize, len: usize) {
+        let end = base + len;
+        for span in &mut self.spans {
+            span.pieces.retain(|(at, numbers)| *at + numbers.len() * PAGE <= base || *at >= end);
+        }
+        self.spans.retain(|s| s.joined || !s.pieces.is_empty());
+    }
+
+    /// Keeps `span`, making room for it.
+    fn keep(&mut self, span: Span) {
+        if self.spans.len() >= SPANS_MOST
+            && let Some(i) = self.spans.iter().position(|s| !s.joined)
+        {
+            self.spans.remove(i);
+        }
+        self.spans.push(span);
+    }
+
+    /// `[at, at + size)` is joined, its section made when first needed;
+    /// joined spans it overlaps go (their sections live on in the slices
+    /// their pages are).
+    fn track(&mut self, at: usize, size: usize) {
+        let pages = size.div_ceil(PAGE);
+        let end = at + pages * PAGE;
+        let over: Vec<usize> =
+            self.joined.range(..end).filter(|(s, r)| **s + r.size > at).map(|(s, _)| *s).collect();
+        for s in over {
+            self.joined.remove(&s);
+        }
+        let joined = Joined { size: pages * PAGE, section: None, refused: false, owners: vec![0; pages] };
+        self.joined.insert(at, joined);
+    }
+}
+
+/// Before [`whole`] takes the call of `numbers` at `base` (unmapped
+/// already): a call exactly beside earlier ones (a [`Span`] of them) that
+/// together with them reaches `min` bytes makes the whole span a joined
+/// one, with a section of its own, and the earlier calls' pages are moved
+/// into it at once; [`whole`] then takes the call as one into the span. A
+/// joined span that grows is made anew, its pages moved once more. Calls
+/// inside a joined span take the place of what they cover in it.
+fn join(physical: &mut Physical, base: usize, numbers: &[usize], min: usize) {
+    let (bytes, end) = (numbers.len() * PAGE, base + numbers.len() * PAGE);
+    if bytes < WHOLE_PIECE.min(min / 4) || end > WHOLE_BELOW || !base.is_multiple_of(PAGE) {
+        return;
+    }
+    let joins = &mut physical.joins;
+    if let Some(span) = joins.spans.iter_mut().find(|s| s.joined && s.start <= base && end <= s.end) {
+        span.pieces.retain(|(at, ns)| *at + ns.len() * PAGE <= base || *at >= end);
+        span.pieces.push((base, numbers.to_vec()));
+        return;
+    }
+    // Spans the call overlaps otherwise are forgotten.
+    let mut dropped: Vec<usize> = Vec::new();
+    joins.spans.retain(|s| {
+        let keep = s.end <= base || s.start >= end;
+        if !keep && s.joined {
+            dropped.push(s.start);
+        }
+        keep
+    });
+    for at in dropped {
+        joins.joined.remove(&at);
+    }
+    let left = joins.spans.iter().position(|s| s.end == base);
+    let right = joins.spans.iter().position(|s| s.start == end);
+    let start = left.map_or(base, |i| joins.spans[i].start);
+    let stop = right.map_or(end, |i| joins.spans[i].end);
+    let merged = stop - start;
+    let mut beside: Vec<usize> = [left, right].into_iter().flatten().collect();
+    beside.sort_unstable_by(|a, b| b.cmp(a));
+    let taken: Vec<Span> = beside.into_iter().map(|i| joins.spans.remove(i)).collect();
+    let call = (base, numbers.to_vec());
+    if taken.is_empty() {
+        joins.keep(Span { start: base, end, joined: false, pieces: vec![call] });
+        return;
+    }
+    let mut earlier: Vec<(usize, Vec<usize>)> = taken.iter().flat_map(|s| s.pieces.iter().cloned()).collect();
+    earlier.sort_unstable_by_key(|p| p.0);
+    let shared = {
+        let mine: std::collections::HashSet<usize> = numbers.iter().copied().collect();
+        earlier.iter().any(|(_, ns)| ns.iter().any(|p| mine.contains(p)))
+    };
+    if merged < min || merged > WHOLE_MOST || shared {
+        if merged >= min {
+            let why = if shared { "a page of the call is an earlier call's too" } else { "over 1024 MB together" };
+            tracing::info!(
+                address = format_args!("{base:#x}"),
+                span = format_args!("{start:#x}+{merged:#x}"),
+                why,
+                "xmem whole: adjacent calls not joined (VICTORY_XMEM_WHOLE_MB)"
+            );
+        }
+        if taken.iter().any(|s| s.joined) {
+            // Those stay as they were; the call is a span of its own.
+            for span in taken {
+                joins.keep(span);
+            }
+            joins.keep(Span { start: base, end, joined: false, pieces: vec![call] });
+        } else {
+            let mut pieces = earlier;
+            pieces.push(call);
+            joins.keep(Span { start, end: stop, joined: false, pieces });
+        }
+        return;
+    }
+    let grown: Vec<String> =
+        taken.iter().filter(|s| s.joined).map(|s| format!("{:#x}+{:#x}", s.start, s.end - s.start)).collect();
+    joins.track(start, merged);
+    tracing::info!(
+        address = format_args!("{base:#x}"),
+        bytes,
+        span = format_args!("{start:#x}+{merged:#x}"),
+        mb = merged >> 20,
+        earlier = earlier.len(),
+        grown_from = %grown.join(", "),
+        "xmem whole: adjacent calls joined: one section for the span, the earlier calls' pages moved into it (VICTORY_XMEM_WHOLE_MB)"
+    );
+    let mut pieces = Vec::with_capacity(earlier.len() + 1);
+    for (at, ns) in earlier {
+        let len = ns.len() * PAGE;
+        // Still what the title mapped there?
+        let still = ns.iter().enumerate().all(|(k, p)| {
+            physical.pages.get(p).is_some_and(|s| {
+                physical
+                    .slice_at(at + k * PAGE)
+                    .is_some_and(|there| Arc::ptr_eq(&there.section, &s.section) && there.index == s.index)
+            })
+        });
+        if !still {
+            tracing::info!(
+                address = format_args!("{at:#x}"),
+                bytes = len,
+                "xmem whole: an earlier call left where it is: the title mapped other pages there since"
+            );
+            continue;
+        }
+        unmap(physical, at, len);
+        let slices: Vec<Option<Slice>> = ns.iter().map(|p| physical.pages.get(p).cloned()).collect();
+        let done = match whole(physical, at, &ns, &slices, min) {
+            Whole::Mapped => true,
+            Whole::Failed => false,
+            Whole::Not => map_runs(physical, at, &ns),
+        };
+        if !done {
+            tracing::warn!(
+                address = format_args!("{at:#x}"),
+                bytes = len,
+                "xmem whole: an earlier call's pages not mapped again after the move (the host refused)"
+            );
+        }
+        pieces.push((at, ns));
+    }
+    pieces.push(call);
+    physical.joins.keep(Span { start, end: stop, joined: true, pieces });
+}
+
+/// What [`whole`] did with a mapping call.
+enum Whole {
+    /// Nothing: map it as before.
+    Not,
+    /// Mapped, as consecutive slices of a section of its own.
+    Mapped,
+    /// The host failed after the pages were moved: the call fails.
+    Failed,
+}
+
+/// Maps `numbers` at `base` (unmapped already, [`unmap`]) as consecutive
+/// slices of one section: the section of the joined span the call lies in,
+/// at the call's place in it, or else (a call of `min` bytes or more, below
+/// 4 GiB) a new section of exactly the call's size. Each page that is not
+/// that slice yet has its bytes copied into it, and its page number names
+/// it from then on (DirectStorage writes, frees and later mappings go
+/// there); any other address that shows such a page is mapped again onto
+/// the new slice (the old one back if the host refuses, said in the log).
+/// The old slices are left to their sections, unnamed. Pages the title maps
+/// or unmaps there later go page by page as ever ([`unmap`] cuts the view).
+///
+/// `slices`: what each number names now. With [`PHYSICAL`] and the change
+/// of mapping held. Says on one line what it did, or why not when the call
+/// was one to take.
+fn whole(physical: &mut Physical, base: usize, numbers: &[usize], slices: &[Option<Slice>], min: usize) -> Whole {
+    let (n, bytes) = (numbers.len(), numbers.len() * PAGE);
+    let end = base + bytes;
+    if n == 0 || !base.is_multiple_of(PAGE) || end > WHOLE_BELOW {
+        return Whole::Not;
+    }
+    let not = |why: String| {
+        tracing::info!(
+            address = format_args!("{base:#x}"),
+            bytes,
+            mb = bytes >> 20,
+            why = %why,
+            "xmem whole: a mapping call mapped as before, by runs of its pages' sections (VICTORY_XMEM_WHOLE_MB)"
+        );
+        Whole::Not
+    };
+    let within = physical
+        .joins
+        .joined
+        .range(..=base)
+        .next_back()
+        .filter(|(at, r)| end <= **at + r.size)
+        .map(|(at, _)| *at);
+    // The section and the slice of it the call's first page becomes.
+    let (section, offset, span) = match within {
+        Some(at) => {
+            let Some(r) = physical.joins.joined.get_mut(&at) else {
+                return Whole::Not;
+            };
+            if r.refused || bytes < WHOLE_PIECE.min(min / 4) {
+                return Whole::Not;
+            }
+            if r.section.is_none() {
+                match new_section(r.size) {
+                    Ok(section) => r.section = Some(section),
+                    Err(error) => {
+                        r.refused = true;
+                        return not(format!("no section of {} MB for its span {at:#x}: {error}", r.size >> 20));
+                    }
+                }
+            }
+            (r.section.clone(), (base - at) / PAGE, Some((at, r.size)))
+        }
+        // Made below, once the call is known to be taken.
+        None if (min..=WHOLE_MOST).contains(&bytes) => (None, 0, None),
+        None => return Whole::Not,
+    };
+    let Some(old) = slices.iter().cloned().collect::<Option<Vec<Slice>>>() else {
+        return not("a page the title does not own".into());
+    };
+    let mut seen = std::collections::HashSet::with_capacity(n);
+    if !numbers.iter().all(|&p| seen.insert(p)) {
+        return not("a page twice in the call".into());
+    }
+    // Which pages are their slice already (in a joined span's section).
+    let is_slice = |s: &Slice, index: usize| {
+        section.as_ref().is_some_and(|section| Arc::ptr_eq(&s.section, section) && s.index == index)
+    };
+    let placed: Vec<bool> = old.iter().enumerate().map(|(k, s)| is_slice(s, offset + k)).collect();
+    if let Some(section) = &section
+        && placed.iter().all(|&p| p)
+    {
+        // As they are: mapped again by the placeholders the views left
+        // (one view over them all would fail).
+        let again = map_pieces(physical, base, bytes, &Slice { section: section.clone(), index: offset });
+        return if again { Whole::Mapped } else { Whole::Failed };
+    }
+    let mut runs: Vec<(Slice, usize)> = Vec::new();
+    for slice in &old {
+        match runs.last_mut() {
+            Some((first, k)) if Arc::ptr_eq(&first.section, &slice.section) && slice.index == first.index + *k => {
+                *k += 1;
+            }
+            _ => runs.push((slice.clone(), 1)),
+        }
+    }
+    if span.is_none() && runs.len() == 1 {
+        // One run of one section already.
+        return Whole::Not;
+    }
+    if let Some((at, _)) = span
+        && let Some(r) = physical.joins.joined.get(&at)
+    {
+        // A slice another page still is: that page is the title's, mapped
+        // wherever; not taken from it.
+        for k in (0..n).filter(|&k| !placed[k]) {
+            let owner = r.owners[offset + k];
+            let taken = owner != 0
+                && owner != numbers[k]
+                && physical.pages.get(&owner).is_some_and(|s| is_slice(s, offset + k));
+            if taken {
+                return not(format!("slice {:#x} of its span's section is page {owner:#x}'s still", offset + k));
+            }
+        }
+    }
+    let mut sections: Vec<usize> = runs.iter().map(|r| Arc::as_ptr(&r.0.section) as usize).collect();
+    sections.sort_unstable();
+    sections.dedup();
+    // Other addresses that show the pages that move (the call's own range
+    // is unmapped already), as runs: address, first page of the call, pages.
+    let mut elsewhere: Vec<(usize, usize)> = old
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| !placed[k])
+        .flat_map(|(k, s)| {
+            physical.shown.get(&s.key(0)).into_iter().flatten().map(move |&at| (at, k))
+        })
+        .collect();
+    elsewhere.sort_unstable();
+    let mut aliases: Vec<(usize, usize, usize)> = Vec::new();
+    for (at, k) in elsewhere {
+        match aliases.last_mut() {
+            Some((from, first, len)) if *from + *len * PAGE == at && *first + *len == k => *len += 1,
+            _ => aliases.push((at, k, 1)),
+        }
+    }
+    if aliases.len() > WHOLE_ALIASES {
+        return not(format!("its pages are shown elsewhere too in {} runs", aliases.len()));
+    }
+    let section = match section {
+        Some(section) => section,
+        None => match new_section(bytes) {
+            Ok(section) => section,
+            Err(error) => return not(format!("no section of {} MB: {error}", bytes >> 20)),
+        },
+    };
+    // The bytes the moving pages hold (pages never committed hold zeros,
+    // as the new ones do), by runs of the call that are runs of a section
+    // too.
+    let took = std::time::Instant::now();
+    let mut copied = 0usize;
+    let mut k = 0;
+    while k < n {
+        if placed[k] {
+            k += 1;
+            continue;
+        }
+        let first = &old[k];
+        let len = 1 + (k + 1..n)
+            .take_while(|&j| {
+                !placed[j] && Arc::ptr_eq(&old[j].section, &first.section) && old[j].index == first.index + (j - k)
+            })
+            .count();
+        match copy_pages(first, len, &Slice { section: section.clone(), index: offset + k }) {
+            Some(bytes) => copied += bytes,
+            None => return not(format!("the bytes of its pages not copied: {}", std::io::Error::last_os_error())),
+        }
+        k += len;
+    }
+    let copy_ms = took.elapsed().as_secs_f64() * 1000.0;
+    for (k, number) in numbers.iter().enumerate() {
+        // (A page freed meanwhile stays freed: numbers are never given out
+        // again.)
+        if let Some(slice) = physical.pages.get_mut(number) {
+            *slice = Slice { section: section.clone(), index: offset + k };
+        }
+    }
+    if let Some((at, _)) = span
+        && let Some(r) = physical.joins.joined.get_mut(&at)
+    {
+        r.owners[offset..offset + n].copy_from_slice(numbers);
+    }
+    let mut restored = 0;
+    for &(at, first, len) in &aliases {
+        unmap(physical, at, len * PAGE);
+        if map_pieces(physical, at, len * PAGE, &Slice { section: section.clone(), index: offset + first }) {
+            continue;
+        }
+        // Not left showing nothing: what it showed before (its bytes as
+        // they were now; the page's writes go to the new slice from now).
+        unmap(physical, at, len * PAGE);
+        let back = (0..len).all(|p| map_pieces(physical, at + p * PAGE, PAGE, &old[first + p]));
+        tracing::warn!(
+            alias = format_args!("{at:#x}"),
+            bytes = len * PAGE,
+            call = format_args!("{base:#x}"),
+            back,
+            "xmem whole: another address that showed the call's pages not mapped onto the new section; its old pages mapped \
+             back there (back=false: it shows nothing)"
+        );
+        restored += 1;
+    }
+    let handle = section.0 as usize;
+    let mapped = map_pieces(physical, base, bytes, &Slice { section, index: offset });
+    let span = match span {
+        Some((at, size)) => format!("{at:#x}+{size:#x}"),
+        None => "none (a section of the call's own)".into(),
+    };
+    tracing::info!(
+        address = format_args!("{base:#x}"),
+        bytes,
+        mb = bytes >> 20,
+        section = format_args!("{handle:#x}"),
+        span = %span,
+        slice = format_args!("{:#x}", offset * PAGE),
+        moved = placed.iter().filter(|&&p| !p).count(),
+        was_views = runs.len(),
+        was_sections = sections.len(),
+        elsewhere = aliases.len(),
+        elsewhere_not_moved = restored,
+        copied_mb = copied >> 20,
+        copy_ms = format_args!("{copy_ms:.1}"),
+        mapped,
+        "xmem whole: a mapping call made one run of a section of its own (VICTORY_XMEM_WHOLE_MB)"
+    );
+    if mapped { Whole::Mapped } else { Whole::Failed }
+}
+
+/// [`map`] of `[base, base + len)`, which [`unmap`] may have left as
+/// several placeholders (one per view it took away): a view per
+/// placeholder, the slices following on from `slice`; page by page where
+/// the host refuses a piece.
+fn map_pieces(physical: &mut Physical, base: usize, len: usize, slice: &Slice) -> bool {
+    let end = base + len;
+    let at_slice = |at: usize| Slice { section: slice.section.clone(), index: slice.index + (at - base) / PAGE };
+    let mut at = base;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query of our own address space; the structure is ours.
+        let got = unsafe {
+            VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+        };
+        let region_end = if got == 0 { end } else { (info.BaseAddress as usize + info.RegionSize).min(end) };
+        let piece = (region_end.max(at + PAGE) - at).next_multiple_of(PAGE).min(end - at);
+        if !map(physical, at, piece, at_slice(at)) {
+            if piece == PAGE {
+                return false;
+            }
+            for page in (at..at + piece).step_by(PAGE) {
+                if !map(physical, page, PAGE, at_slice(page)) {
+                    return false;
+                }
+            }
+        }
+        at += piece;
+    }
+    true
+}
+
+/// Copies the committed bytes of `n` slices from `from` on into as many
+/// from `to` on, committing those: the bytes copied. `None` if the host
+/// gave no view or commit, or the two overlap in one section.
+fn copy_pages(from: &Slice, n: usize, to: &Slice) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, UnmapViewOfFile};
+    if Arc::ptr_eq(&from.section, &to.section) && from.index < to.index + n && to.index < from.index + n {
+        return None;
+    }
+    let len = n * PAGE;
+    let mut target = View::map(to, n)?;
+    let offset = (from.index * PAGE) as u64;
+    // A view of the source that commits nothing: its pages never committed
+    // are left as zeros.
+    // SAFETY: slices of a section we own; the view is unmapped below.
+    let source = unsafe { MapViewOfFile(from.section.0, FILE_MAP_READ, (offset >> 32) as u32, offset as u32, len) };
+    if source.Value.is_null() {
+        return None;
+    }
+    let read = source.Value as usize;
+    let (mut at, mut copied) = (0, 0);
+    while at < len {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query of our own view; the structure is ours.
+        let got = unsafe {
+            VirtualQueryEx(GetCurrentProcess(), (read + at) as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+        };
+        // (Regions end on 4 KiB pages; our views commit whole 64 KiB ones.)
+        let next = if got == 0 {
+            len
+        } else {
+            (info.BaseAddress as usize + info.RegionSize).saturating_sub(read).max(at + 4096).min(len)
+        };
+        if got != 0 && info.State == MEM_COMMIT {
+            // SAFETY: committed bytes of our view of the source, into our
+            // view of the target (other pages of other sections).
+            let bytes = unsafe { std::slice::from_raw_parts((read + at) as *const u8, next - at) };
+            target.bytes()[at..next].copy_from_slice(bytes);
+            copied += next - at;
+        }
+        at = next;
+    }
+    // SAFETY: our own view.
+    unsafe { UnmapViewOfFile(source) };
+    Some(copied)
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1765,5 +2388,198 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A reservation of `n` pages below 4 GiB, where `whole` takes memory.
+    fn reserve_low(n: usize) -> *mut c_void {
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, ADDRESS_32BIT, PAGE_READWRITE);
+        assert!(!at.is_null() && (at as usize) + n * PAGE <= WHOLE_BELOW);
+        at
+    }
+
+    /// A mapping call as `XMemMapPhysicalPages` makes it with
+    /// `VICTORY_XMEM_WHOLE_MB` of `min` bytes (the switch itself is off in
+    /// tests): [`join`] and [`whole`], else as before.
+    fn call_whole(at: *mut c_void, from: usize, numbers: &[usize], min: usize) -> bool {
+        let base = at as usize + from * PAGE;
+        let done = {
+            let mut physical = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            unmap(&mut physical, base, numbers.len() * PAGE);
+            join(&mut physical, base, numbers, min);
+            let slices: Vec<Option<Slice>> = numbers.iter().map(|p| physical.pages.get(p).cloned()).collect();
+            whole(&mut physical, base, numbers, &slices, min)
+        };
+        match done {
+            Whole::Mapped => true,
+            Whole::Not => XMemMapPhysicalPages(base as *mut c_void, numbers.len(), numbers.as_ptr()) == base as *mut c_void,
+            Whole::Failed => false,
+        }
+    }
+
+    /// The `n` pages at `at` are consecutive slices of one section, from its
+    /// first on, each with the byte `from + k + 1` first (as the GPU side's
+    /// in-place census needs them: one run of one section); the section.
+    fn one_run(at: *mut c_void, n: usize, from: usize, what: &str) -> Arc<Section> {
+        let section = {
+            let physical = physical();
+            let first = physical.slice_at(at as usize).expect("mapped");
+            for k in 0..n {
+                let slice = physical.slice_at(at as usize + k * PAGE).expect("mapped");
+                assert!(
+                    Arc::ptr_eq(&slice.section, &first.section) && slice.index == k,
+                    "{what}: page {k} is slice {k}"
+                );
+            }
+            first.section.clone()
+        };
+        for k in 0..n {
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { at.cast::<u8>().add(k * PAGE).read() }, (from + k) as u8 + 1, "{what}: page {k} kept its bytes");
+        }
+        section
+    }
+
+    /// One test that joins calls at a time: spans of two tests could lie
+    /// side by side (their reservations may), and they would be joined.
+    fn joining_alone() -> MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forgets what the tests above noted at `[at, at + n pages)`.
+    fn forget_joins(at: *mut c_void, n: usize) {
+        let (start, end) = (at as usize, at as usize + n * PAGE);
+        let mut physical = physical();
+        physical.joins.spans.retain(|s| s.end <= start || s.start >= end);
+        physical.joins.joined.retain(|&s, r| s + r.size <= start || s >= end);
+    }
+
+    /// `VICTORY_XMEM_WHOLE_MB`: one call of pages of two allocations, out of
+    /// order, one of them shown at another address too, becomes one view of
+    /// a section of its own, with their bytes; the other address, writes by
+    /// page number and later page-by-page mappings follow.
+    #[test]
+    fn a_whole_call_is_one_run_of_a_section_of_its_own() {
+        let (a, b) = (allocate(3), allocate(2));
+        let numbers = [b[0], a[2], a[0], b[1], a[1]];
+        for (k, &p) in numbers.iter().enumerate() {
+            assert!(write_physical(&[p], 0, &[k as u8 + 1; 16]));
+        }
+        // Two of the pages shown at another address too, as two views.
+        let (at, other) = (reserve_low(5), reserve_low(2));
+        assert_eq!(XMemMapPhysicalPages(other, 2, [a[2], a[0]].as_ptr()), other);
+        {
+            let mut physical = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            let slices: Vec<Option<Slice>> = numbers.iter().map(|p| physical.pages.get(p).cloned()).collect();
+            assert!(matches!(whole(&mut physical, at as usize, &numbers, &slices, PAGE), Whole::Mapped));
+            let (size, slice) = physical.views.get(&(at as usize)).expect("one view");
+            assert_eq!((*size, slice.index), (5 * PAGE, 0));
+            assert!(slices.iter().flatten().all(|s| !Arc::ptr_eq(&s.section, &slice.section)));
+        }
+        let section = one_run(at, 5, 0, "one call");
+        let byte = |p: *mut c_void, off: usize| {
+            // SAFETY: mapped read-write.
+            unsafe { p.cast::<u8>().add(off).read() }
+        };
+        // The other address shows the page's new slice.
+        // SAFETY: mapped read-write.
+        unsafe { at.cast::<u8>().add(PAGE).write(0x77) };
+        assert_eq!(byte(other, 0), 0x77);
+        // Writes by page number land in the run.
+        assert!(write_physical(&[a[0]], 1, &[0x55]));
+        assert_eq!(byte(at, 2 * PAGE + 1), 0x55);
+        assert_eq!(byte(other, PAGE + 1), 0x55);
+        assert!(page_window(&numbers, 0, 5 * PAGE).is_some(), "one run now");
+        // A page unmapped and mapped again in the middle: page by page.
+        let middle = at.wrapping_byte_add(2 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(byte(at, 3 * PAGE), 4);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, [a[0]].as_ptr()), middle);
+        assert_eq!(byte(middle, 1), 0x55);
+        {
+            let physical = physical();
+            let (_, slice) = physical.views.get(&(middle as usize)).expect("a view of the page");
+            assert!(Arc::ptr_eq(&slice.section, &section) && slice.index == 2);
+        }
+        drop(section);
+        for (p, n) in [(at, 5), (other, 2)] {
+            assert_eq!(XMemMapPhysicalPages(p, n, std::ptr::null()), p);
+        }
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(2, b.as_ptr()), 1);
+    }
+
+    /// `VICTORY_XMEM_WHOLE_MB`: three adjacent calls of one reservation, out
+    /// of address order (the top, the bottom, then the middle that joins
+    /// them), each of pages out of order across allocations, end as
+    /// consecutive slices of the joined span's one section. Mapping the same
+    /// pages there again changes nothing, and a page the title still has
+    /// keeps its slice of the section.
+    #[test]
+    fn adjacent_calls_out_of_order_are_one_run_of_a_section() {
+        let _one = joining_alone();
+        let (a, b) = (allocate(3), allocate(3));
+        let numbers = [b[0], a[2], a[0], b[2], a[1], b[1]];
+        for (k, &p) in numbers.iter().enumerate() {
+            assert!(write_physical(&[p], 0, &[k as u8 + 1; 16]));
+        }
+        let at = reserve_low(6);
+        let min = 6 * PAGE;
+        assert!(call_whole(at, 4, &numbers[4..6], min), "the top: as before");
+        assert!(call_whole(at, 0, &numbers[0..2], min), "the bottom: as before");
+        assert!(call_whole(at, 2, &numbers[2..4], min), "the middle joins them");
+        let section = one_run(at, 6, 0, "three calls");
+        assert!(page_window(&numbers, 0, 6 * PAGE).is_some(), "one run of pages");
+        // The same pages again, in one call: as they are.
+        assert!(call_whole(at, 0, &numbers, min));
+        assert!(Arc::ptr_eq(&one_run(at, 6, 0, "again"), &section));
+        // Page numbers[3] is still the title's at slice 3: another page for
+        // that place is not given the slice.
+        let c = allocate(1);
+        {
+            let mut physical = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            let slices = vec![physical.pages.get(&c[0]).cloned()];
+            assert!(matches!(whole(&mut physical, at as usize + 3 * PAGE, &c, &slices, min), Whole::Not));
+        }
+        drop(section);
+        assert_eq!(XMemMapPhysicalPages(at, 6, std::ptr::null()), at);
+        forget_joins(at, 6);
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(3, b.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, c.as_ptr()), 1);
+    }
+
+    /// `VICTORY_XMEM_WHOLE_MB`: three adjacent calls in the title's order for
+    /// its constants heap (the middle one, under the size alone, then the
+    /// one above, then the one below) are joined into one span when the
+    /// second comes, the span grown at the third, and end as consecutive
+    /// slices of one section, with their bytes.
+    #[test]
+    fn adjacent_calls_in_the_titles_order_are_joined_and_grown() {
+        let _one = joining_alone();
+        let (a, b, c) = (allocate(3), allocate(3), allocate(2));
+        let (bottom, middle, top) = ([c[1], c[0]], [a[2], a[0], a[1]], [b[1], b[2], b[0]]);
+        let all: Vec<usize> = bottom.iter().chain(&middle).chain(&top).copied().collect();
+        for (k, &p) in all.iter().enumerate() {
+            assert!(write_physical(&[p], 0, &[k as u8 + 1; 16]));
+        }
+        let at = reserve_low(8);
+        let min = 4 * PAGE;
+        assert!(call_whole(at, 2, &middle, min), "under the size alone: as before");
+        assert!(call_whole(at, 5, &top, min), "joined with the middle");
+        let first = one_run(at.wrapping_byte_add(2 * PAGE), 6, 2, "two calls");
+        assert!(call_whole(at, 0, &bottom, min), "the span grown");
+        let section = one_run(at, 8, 0, "three calls");
+        assert!(!Arc::ptr_eq(&first, &section), "a span that grows is made anew");
+        assert!(page_window(&all, 0, 8 * PAGE).is_some(), "one run of pages");
+        drop((first, section));
+        assert_eq!(XMemMapPhysicalPages(at, 8, std::ptr::null()), at);
+        forget_joins(at, 8);
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(3, b.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(2, c.as_ptr()), 1);
     }
 }
