@@ -1,7 +1,7 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -269,6 +269,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let dump = FailDump::from_env();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -299,7 +300,8 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            let dump = dump.as_ref();
+                            translate(job, entry.path(), &seen, dump, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -391,6 +393,7 @@ fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
+    dump: Option<&FailDump>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -477,20 +480,76 @@ fn translate(
             return;
         }
     }
-    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
-    // has them (`.cdxil`), to work on a translator gap offline
-    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before = dump.map(|_| FailDump::counts(&t.failed));
     translate_programs(&container, programs, &example, t, checks);
-    if let (Some(dir), Some(before)) = (dump, before) {
-        for (reason, (n, _)) in &t.failed {
-            let was = before.get(reason).copied().unwrap_or(0);
-            if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+    if let (Some(dump), Some(before)) = (dump, before) {
+        dump.record(&before, &t.failed, &bytes);
+    }
+}
+
+/// `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+/// has them (`.cdxil`), to work on a translator gap offline. The count is kept for the whole
+/// command, across files and threads (each thread's tally only sees its own containers).
+struct FailDump {
+    dir: PathBuf,
+    /// Reason → samples handed out so far.
+    taken: Mutex<HashMap<String, usize>>,
+}
+
+impl FailDump {
+    const PER_REASON: usize = 3;
+
+    fn from_env() -> Option<Self> {
+        std::env::var_os("VICTORY_FAIL_DUMP").map(|dir| Self::new(dir.into()))
+    }
+
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, taken: Mutex::new(HashMap::new()) }
+    }
+
+    /// Programs per reason in a tally, to compare after one container.
+    fn counts(failed: &BTreeMap<String, (usize, String)>) -> BTreeMap<String, usize> {
+        failed.iter().map(|(k, v)| (k.clone(), v.0)).collect()
+    }
+
+    /// Writes the container once for each reason that stopped one of its programs (`failed`
+    /// grew from `before`), while that reason has fewer than three samples.
+    fn record(
+        &self,
+        before: &BTreeMap<String, usize>,
+        failed: &BTreeMap<String, (usize, String)>,
+        bytes: &[u8],
+    ) {
+        for (reason, (n, _)) in failed {
+            if *n > before.get(reason).copied().unwrap_or(0)
+                && let Some(name) = self.claim(reason)
+            {
+                let _ = std::fs::create_dir_all(&self.dir);
+                let _ = std::fs::write(self.dir.join(name), bytes);
             }
         }
+    }
+
+    /// The next sample's file name for `reason`, or `None` once it has three. The name is
+    /// the reason made safe for a path, plus a hash of the whole reason so that reasons
+    /// alike up to the cut or the replaced characters get files of their own.
+    fn claim(&self, reason: &str) -> Option<String> {
+        let slot = {
+            let mut taken = lock(&self.taken);
+            let n = taken.entry(reason.to_owned()).or_default();
+            if *n >= Self::PER_REASON {
+                return None;
+            }
+            *n += 1;
+            *n - 1
+        };
+        let stem: String = reason
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(60)
+            .collect();
+        let hash = &blake3::hash(reason.as_bytes()).to_hex()[..8];
+        Some(format!("{stem}_{hash}_{slot}.cdxil"))
     }
 }
 
@@ -883,4 +942,90 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::FailDump;
+
+    /// A fresh tally's failures after one container, as each file's workers start with.
+    fn failed(reasons: &[&str]) -> BTreeMap<String, (usize, String)> {
+        let mut f = BTreeMap::new();
+        for r in reasons {
+            f.entry(r.to_string()).or_insert((0, String::new())).0 += 1;
+        }
+        f
+    }
+
+    /// The files written, by name.
+    fn samples(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return BTreeMap::new();
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, std::fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fail_dump_keeps_first_three_of_a_reason_across_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = FailDump::new(tmp.path().to_owned());
+        // Five inputs (files, or workers of one file), each with a tally of its own, whose
+        // container fails with the same reason; the first one's container fails twice.
+        let reason = "unsupported opcode V_FOO";
+        for i in 0..5u8 {
+            let f = failed(&[reason, reason][..if i == 0 { 2 } else { 1 }]);
+            dump.record(&BTreeMap::new(), &f, &[i]);
+        }
+        let got = samples(tmp.path());
+        let mut kept: Vec<_> = got.values().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, [vec![0], vec![1], vec![2]], "{:?}", got.keys());
+    }
+
+    #[test]
+    fn fail_dump_names_reasons_that_sanitize_alike_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = FailDump::new(tmp.path().to_owned());
+        let long = "x".repeat(60);
+        let (a, b) = (format!("{long}a"), format!("{long}b"));
+        let reasons = ["bad operand: v0", "bad operand; v0", &a, &b];
+        for (i, r) in (0u8..).zip(reasons) {
+            dump.record(&BTreeMap::new(), &failed(&[r]), &[i]);
+        }
+        let got = samples(tmp.path());
+        assert_eq!(got.len(), 4, "{:?}", got.keys());
+    }
+
+    #[test]
+    fn fail_dump_only_counts_reasons_the_container_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = FailDump::new(tmp.path().to_owned());
+        // `a` was in the tally before this container; only `b` is its failure.
+        dump.record(&FailDump::counts(&failed(&["a"])), &failed(&["a", "b"]), b"c");
+        let got = samples(tmp.path());
+        assert_eq!(got.len(), 1);
+        assert!(got.keys().all(|k| k.starts_with("b_")), "{:?}", got.keys());
+    }
+
+    #[test]
+    fn fail_dump_slots_are_distinct_between_threads() {
+        let dump = FailDump::new(Path::new("unused").to_owned());
+        let names: Vec<_> = std::thread::scope(|s| {
+            let all: Vec<_> = (0..8).map(|_| s.spawn(|| dump.claim("r"))).collect();
+            all.into_iter().filter_map(|h| h.join().unwrap()).collect()
+        });
+        let mut distinct = names.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!((names.len(), distinct.len()), (3, 3), "{names:?}");
+    }
 }
