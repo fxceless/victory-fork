@@ -90,6 +90,46 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub mesh_shaders: bool,
+    pub shader_model_6_6: bool,
+    pub name: String,
+    pub vram_bytes: usize,
+}
+
+#[cfg(windows)]
+pub fn gpu_info() -> Option<GpuInfo> {
+    let h = host::host()?;
+    // Report the adapter the runtime device actually uses, not the one with
+    // the most VRAM: on multi-GPU machines those can differ.
+    let (name, vram_bytes) = adapter_info(&h.device).unwrap_or_else(|| ("unknown".to_owned(), 0));
+    Some(GpuInfo {
+        mesh_shaders: h.mesh_shaders(),
+        shader_model_6_6: h.shader_model_6_6(),
+        name,
+        vram_bytes,
+    })
+}
+
+#[cfg(windows)]
+fn adapter_info(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> Option<(String, usize)> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter3, IDXGIFactory4};
+    // SAFETY: the device exposes its adapter LUID.
+    let luid = unsafe { device.GetAdapterLuid() };
+    // SAFETY: plain DXGI factory creation.
+    let factory = unsafe { CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok()? };
+    // SAFETY: looking up the adapter by LUID.
+    let adapter: IDXGIAdapter3 = unsafe { factory.EnumAdapterByLuid(luid).ok()? };
+    // SAFETY: reading the adapter's description.
+    let desc = unsafe { adapter.GetDesc1().ok()? };
+    let name = String::from_utf16_lossy(&desc.Description)
+        .trim_end_matches('\0')
+        .to_owned();
+    Some((name, desc.DedicatedVideoMemory))
+}
+
+#[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
