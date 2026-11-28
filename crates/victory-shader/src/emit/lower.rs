@@ -9519,11 +9519,15 @@ impl<'a> Lower<'a> {
                         };
                         let c = self.cur;
                         let z = self.s.m.i32(0);
-                        let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
+                        // The upper half is chosen only when the lower half has no lane in EXEC
+                        // and the upper half has one; if neither has a lane, the console reads
+                        // lane 0 (the lower half). Use a single select: a nested select of hi
+                        // inside lo is miscompiled on NVIDIA 595.112.07 to return hi even when
+                        // the lower half has an active lane.
+                        let none_lo = self.s.m.cmp(c, pred::EQ, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
-                        // neither half has a lane in EXEC: the console reads lane 0
-                        let hi = self.s.m.select(c, in_hi, hi, lo);
-                        self.s.m.select(c, in_lo, lo, hi)
+                        let upper = self.s.m.bin(c, Bin::And, none_lo, in_hi);
+                        self.s.m.select(c, upper, hi, lo)
                     }
                 } else {
                     mine
