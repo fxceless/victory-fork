@@ -6371,9 +6371,15 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                // This spans queue submission and waiting for the GPU; it is
+                // not the CPU time spent recording the host list.
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    commands,
+                    "slow command-list submission"
+                );
                 for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    tracing::warn!("slow list GPU command, {ms:.1} ms: {op}");
                 }
             }
             let _ = (i, started);
