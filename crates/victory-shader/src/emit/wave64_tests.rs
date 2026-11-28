@@ -14,6 +14,290 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// Synthetic tree from `valu_tests::whole_wave_f64_sum_and_cvt_f32_f64` in
+/// fxceless/victory-fork at 9376fd6, without that test's resource setup or store.
+fn f64_wave32_fixture() -> Vec<u32> {
+    let mov = |dst: u8, src: u16| 0x7E00_0200 | (dst as u32) << 17 | src as u32;
+    let v3 = |op: u32, dst: u8, a: u16, b: u16, c: u16| {
+        [
+            0xD400_0000 | op << 16 | dst as u32,
+            a as u32 | (b as u32) << 9 | (c as u32) << 18,
+        ]
+    };
+    let mut w = vec![mov(6, 0), mov(7, 1), 0xBE8C_3DC1];
+    w.extend(v3(0x101, 2, 128, 262, 12));
+    w.extend(v3(0x101, 3, 128, 263, 12));
+    for sel in [14570689u32, 9658386, 2340] {
+        w.extend([mov(4, 0xE9), 2 | sel << 8, mov(5, 0xE9), 3 | sel << 8]);
+        w.extend(v3(0x164, 2, 260, 258, 0));
+    }
+    w.extend([mov(4, 0xFA), 2 | 0xFF09_4000, mov(5, 0xFA), 3 | 0xFF09_4000]);
+    w.extend(v3(0x164, 2, 260, 258, 0));
+    w.extend(v3(0x378, 4, 258, 128, 128));
+    w.extend(v3(0x378, 5, 259, 128, 128));
+    w.extend(v3(0x164, 2, 260, 258, 0));
+    w.extend(v3(0x360, 14, 258, 128, 0));
+    w.extend(v3(0x360, 15, 259, 128, 0));
+    w.extend([0xBE90_030E, 0xBE91_030F, 0xBEFE_030C]);
+    w.push(0x7E00_1E10); // v_cvt_f32_f64 v0, s[16:17]
+    w
+}
+
+/// FP64 tree with distinct lower/upper-half inputs. With partial EXEC, only
+/// lanes 0..15 and 32..47 contribute; the other lanes contain poisoned doubles.
+/// Multiple console waves use the same inputs: this does not test pair isolation.
+fn fp64_program(threads: u32, partial: bool) -> NativeProgram {
+    let v3 = |op: u32, dst: u8, a: u16, b: u16, c: u16| {
+        [
+            0xD400_0000 | op << 16 | dst as u32,
+            a as u32 | (b as u32) << 9 | (c as u32) << 18,
+        ]
+    };
+    let mut w = vec![
+        0x2C0A_0085, // v_lshrrev_b32 v5, 5, v0
+        0x360A_0A81, // v_and_b32 v5, 1, v5: half within each console wave
+        0x7D88_0A81, // v_cmp_gt_u32 vcc, 1, v5
+    ];
+    w.extend(v3(0x101, 6, 2, 0, 106)); // lo: upper half s2, lower s0
+    w.extend(v3(0x101, 7, 3, 1, 106)); // hi: upper half s3, lower s1
+    if partial {
+        w.extend([0x7E0C_0200, 0x7E0E_0201]); // valid terms in both halves = s0:s1
+        w.extend([0x360A_0090, 0x7D88_0A81]); // v5 = t & 16; vcc = 1 > v5
+        // Poison noncontributing lanes from s2:s3, keeping valid inputs elsewhere.
+        w.extend(v3(0x101, 6, 2, 262, 106));
+        w.extend(v3(0x101, 7, 3, 263, 106));
+        w.push(0xBEFE_046A); // s_mov_b64 exec, vcc
+    }
+    let f = f64_wave32_fixture();
+    // Skip the fixture's uniform input setup and replace wave32 save with wave64.
+    w.push(0xBE8C_25C1);
+    w.extend_from_slice(&f[3..f.len() - 4]);
+    // Fixture already read lanes 0 into s14:s15. Join the other console half.
+    w.extend(v3(0x360, 18, 258, 160, 0)); // lane 32 low
+    w.extend(v3(0x360, 19, 259, 160, 0)); // lane 32 high
+    w.extend(v3(0x164, 2, 18, 258, 0));
+    w.extend(v3(0x360, 14, 258, 128, 0));
+    w.extend(v3(0x360, 15, 259, 128, 0));
+    w.extend([0xBE90_030E, 0xBE91_030F, 0xBEFE_040C]);
+    if partial {
+        w.push(0xBEFE_04C1); // all threads inspect the masked reduction
+    }
+    w.extend([
+        0x7E02_1E10, // v_cvt_f32_f64 v1, s[16:17]; preserve thread index v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0: byte offset = 4 * thread
+        0xE070_1000,
+        0x8002_0107, // buffer_store_dword v1, v7, s[8:11], 0 offen
+    ]);
+    native_of(&w, true, threads)
+}
+
+#[test]
+fn fp64_fixture_stores_each_thread_at_its_own_byte_offset() {
+    use crate::gfx10::{Fields, Operand};
+    for partial in [false, true] {
+        let n = fp64_program(128, partial);
+        let p = ir::build(&n.code, true, n.vgprs).expect("FP64 fixture IR");
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        let store = insts
+            .iter()
+            .position(|i| i.name() == "buffer_store_dword")
+            .unwrap();
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            ..
+        } = &insts[store].fields
+        else {
+            panic!("expected MUBUF store");
+        };
+        assert_eq!(*data, Some(Operand::Vector { reg: 1, dwords: 1 }));
+        assert_eq!(*addr, Operand::Vector { reg: 7, dwords: 1 });
+        assert_eq!(*rsrc, Operand::Scalar { code: 8, dwords: 4 });
+        assert_eq!(*soffset, Operand::Const(128));
+        assert_eq!(*offset, 0);
+        assert!(*offen);
+        assert!(!*idxen);
+        assert_eq!(insts[store - 1].name(), "v_lshlrev_b32");
+        assert_eq!(insts[store - 1].machine.words, [0x340E_0082]);
+        // Address must consume the immediately preceding shift, not a stale v7.
+        assert_eq!(
+            insts[store].read(ir::Reg::V(7)),
+            insts[store - 1].write(ir::Reg::V(7))
+        );
+    }
+}
+
+#[test]
+fn fp64_wave64_exchange_and_masked_poison_validate() {
+    for (threads, partial) in [(64, false), (128, false), (64, true), (128, true)] {
+        let n = fp64_program(threads, partial);
+        let p = ir::build(&n.code, true, n.vgprs).expect("FP64 IR");
+        let shader = lowered(&n, &p, &HashSet::new()).expect("FP64 lower");
+        match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            Ok(mut v) => {
+                v.validate(&mut shader.dxil.clone())
+                    .expect("FP64 DXIL validation");
+            }
+            Err(e) => {
+                eprintln!("SKIP FP64 validation threads={threads} partial={partial}: {e}");
+            }
+        }
+    }
+}
+
+/// Select hardware for this test only: the default adapter may be an iGPU without FP64.
+fn fp64_host() -> Option<Host> {
+    use windows::Win32::Graphics::{
+        Direct3D::D3D_FEATURE_LEVEL_12_0,
+        Direct3D12::*,
+        Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND, IDXGIFactory4},
+    };
+    // SAFETY: DXGI/D3D12 out pointers and feature structures have their matching types
+    // and sizes; the selected device remains owned by Host for all later dispatches.
+    unsafe {
+        let factory: IDXGIFactory4 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            Ok(factory) => factory,
+            Err(e) => {
+                eprintln!("SKIP FP64 wave64: cannot enumerate hardware adapters: {e}");
+                return None;
+            }
+        };
+        let mut index = 0;
+        loop {
+            let adapter = match factory.EnumAdapters1(index) {
+                Ok(adapter) => adapter,
+                Err(e) => {
+                    if e.code() != DXGI_ERROR_NOT_FOUND {
+                        eprintln!("FP64 wave64: adapter enumeration failed at {index}: {e}");
+                    }
+                    break;
+                }
+            };
+            index += 1;
+            let desc = match adapter.GetDesc1() {
+                Ok(desc) => desc,
+                Err(e) => {
+                    eprintln!("FP64 wave64: cannot describe adapter {}: {e}", index - 1);
+                    continue;
+                }
+            };
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            if desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c) {
+                eprintln!("FP64 wave64: ignoring software adapter {name}");
+                continue;
+            }
+            let candidate = (|| -> Result<Host, String> {
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .map_err(|e| format!("device creation: {e}"))?;
+                let device = device.ok_or("device creation returned no device")?;
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                };
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL, (&raw mut sm).cast(), size_of_val(&sm) as u32,
+                ).map_err(|e| format!("shader-model query: {e}"))?;
+                if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                    return Err(format!("SM {:#x} is below 6.6", sm.HighestShaderModel.0));
+                }
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32,
+                ).map_err(|e| format!("FP64 capability query: {e}"))?;
+                if !options.DoublePrecisionFloatShaderOps.as_bool() {
+                    return Err("DoublePrecisionFloatShaderOps=false".into());
+                }
+                let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut waves).cast(), size_of_val(&waves) as u32,
+                ).map_err(|e| format!("wave capability query: {e}"))?;
+                if !waves.WaveOps.as_bool() || waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32 {
+                    return Err(format!(
+                        "WaveOps={} lane range={}..{} excludes WaveSize32",
+                        waves.WaveOps.as_bool(), waves.WaveLaneCountMin, waves.WaveLaneCountMax
+                    ));
+                }
+                Ok(Host { device })
+            })();
+            match candidate {
+                Ok(host) => {
+                    eprintln!("FP64 wave64: selected hardware adapter {name} (SM6.6, FP64, WaveSize32)");
+                    return Some(host);
+                }
+                Err(e) => eprintln!("FP64 wave64: adapter {name} unavailable for this test: {e}"),
+            }
+        }
+    }
+    eprintln!("SKIP FP64 wave64: no hardware adapter supports SM6.6, FP64 and WaveSize32");
+    None
+}
+
+#[test]
+fn fp64_wave64_exchange_and_masked_poison_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(host) = fp64_host() else {
+        return;
+    };
+    for (threads, partial) in [(64, false), (128, false), (64, true), (128, true)] {
+        let n = fp64_program(threads, partial);
+        let p = ir::build(&n.code, true, n.vgprs).expect("FP64 IR");
+        let shader = lowered(&n, &p, &HashSet::new()).expect("FP64 lower");
+        let (root, pso) = host.compute_pipeline(&shader).expect("FP64 WaveSize32 PSO");
+        // In the partial case the low dword changes the final f32, so dropping it is observable.
+        let av = 1.0f64 + 2.0f64.powi(-23);
+        let a = av.to_bits();
+        let inputs = if partial {
+            vec![
+                0x7ff0_0000_0000_0000u64, // +infinity
+                0x7ff8_0000_1234_5678,    // positive quiet NaN
+                0xfff0_0000_89ab_cdef,    // negative NaN
+            ]
+        } else {
+            vec![3.0f64.to_bits()]
+        };
+        for b in inputs {
+            let data = [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32];
+            let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => data[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    x => panic!("unexpected root {x:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("FP64 wave64 dispatch");
+            let want = (if partial { 32.0 * av } else { 32.0 * av + 96.0 }) as f32;
+            for t in 0..threads {
+                assert_eq!(
+                    out[0][t as usize],
+                    want.to_bits(),
+                    "threads={threads} partial={partial} poison={b:#x} t={t}"
+                );
+            }
+        }
+        eprintln!("RAN FP64 WaveSize32 hardware threads={threads} partial={partial}");
+    }
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
