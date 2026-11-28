@@ -3345,8 +3345,15 @@ mod tests {
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // Set once the reader has read the page through the lock: the
+        // remapping loop below must not end before that, or a reader the
+        // scheduler has not run yet (the workspace suite runs its tests in
+        // parallel) would be stopped with no read at all and the test would
+        // report a reader that never ran.
+        let reading = std::sync::Arc::new(AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
+            let reading = reading.clone();
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 // (Once at least: the mapping thread may be done before this
@@ -3358,10 +3365,19 @@ mod tests {
                     // is held.
                     assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
                     reads += 1;
+                    reading.store(true, Ordering::Relaxed);
                 }
                 reads
             })
         };
+        // Bounded: a reader that faulted must not leave this thread waiting
+        // for its flag; `join` below reports the panic.
+        let began = std::time::Instant::now();
+        while !reading.load(Ordering::Relaxed)
+            && began.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::hint::spin_loop();
+        }
         for _ in 0..2000 {
             // The same pages at the same address: the view goes and comes
             // back, with the same bytes.
