@@ -350,15 +350,23 @@ fn copy_args(
     let p = c.texture.planes.get(plane as usize)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
+    if slice >= l.slices {
+        return None;
+    }
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let depth_span = depths.saturating_sub(1).checked_mul(depth as usize)?;
+    let row_span = (m.height as usize).saturating_sub(1).checked_mul(row as usize)?;
+    let linear = depth_span.checked_add(row_span)?.checked_add(bytes)?;
+    if linear > isize::MAX as usize {
+        return None;
+    }
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled: usize::try_from(p.offset.checked_add(l.size)?).ok()?,
         linear,
     })
 }
@@ -484,6 +492,13 @@ extern "system" fn tiling(
     if l.thick {
         return E_NOTIMPL;
     }
+    if !count.is_null() && out.is_null() {
+        // SAFETY: checked non-null; the caller passed a subresource tiling
+        // count without a destination array.
+        if unsafe { *count } > 0 {
+            return E_INVALIDARG;
+        }
+    }
     let standard = l.first_tail_mip;
     let tail = standard < c.mips;
     let tail_tiles = match standard {
@@ -492,8 +507,8 @@ extern "system" fn tiling(
         _ => 0,
     };
     let block = l.desc.block;
-    // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // SAFETY: each output is null or room for its value; when `*count > 0`,
+    // `out` has been checked non-null and has room for `*count` entries.
     unsafe {
         if let Some(t) = tiles.as_mut() {
             *t = (l.size / TILE) as u32;
@@ -511,26 +526,31 @@ extern "system" fn tiling(
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+            let wanted = standard
+                .saturating_mul(slices)
+                .saturating_sub(first)
+                .min(*n);
+            if !out.is_null() {
+                for i in 0..wanted {
+                    let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                    let m = &l.mips[mip as usize];
+                    let entry = if tail && slice > 0 {
+                        SubresourceTiling {
+                            width: 0,
+                            height: 0,
+                            depth: 0,
+                            start: 0,
+                        }
+                    } else {
+                        SubresourceTiling {
+                            width: m.pitch / l.block[0],
+                            height: (m.rows / l.block[1]) as u16,
+                            depth: 1,
+                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                        }
+                    };
+                    out.add(i as usize).write(entry);
+                }
             }
             *n = wanted;
         }
@@ -769,6 +789,112 @@ mod tests {
             ),
             E_FAIL
         );
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn tiling_guards_null_subresource_buffer_and_all_tail_textures() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let tiling_fn: Tiling = slot(c, 10);
+
+        // Non-zero count with NULL `out` must fail with E_INVALIDARG instead
+        // of dereferencing NULL, and must leave other outputs untouched.
+        let mut tiles = 0xDEAD_BEEF;
+        let mut n = 4;
+        assert_eq!(
+            tiling_fn(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(tiles, 0xDEAD_BEEF);
+        assert_eq!(n, 4);
+
+        // Zero count with NULL `out` is valid and still populates summary fields.
+        n = 0;
+        let mut packed = PackedMips {
+            standard: 0,
+            packed: 0,
+            tiles: 0,
+            start: 0,
+        };
+        assert_eq!(
+            tiling_fn(
+                c,
+                &mut tiles,
+                &mut packed,
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!((tiles, packed.standard, packed.packed, n), (2, 1, 8, 0));
+        assert_eq!(release(c), 0);
+
+        // All-tail texture (`standard == 0`): zero subresource tilings written,
+        // no divide-by-zero.
+        let small = create(&desc(64, 64, 0, 98, 0x10a));
+        let mut subs: [SubresourceTiling; 2] = std::array::from_fn(|_| SubresourceTiling {
+            width: 9,
+            height: 9,
+            depth: 9,
+            start: 9,
+        });
+        n = 2;
+        assert_eq!(
+            tiling_fn(
+                small,
+                &mut tiles,
+                &mut packed,
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                subs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert_eq!((packed.standard, n, subs[0].width), (0, 0, 9));
+        assert_eq!(release(small), 0);
+    }
+
+    #[test]
+    fn copy_rejects_out_of_range_subresource_and_pitch_overflow() {
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let c = create(&desc(256, 256, 1, 98, 0x10a));
+        let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
+        let mut tiled = [0u8; 64];
+        let mut linear = [0u8; 64];
+        // Only 1 mip * 1 slice exists; subresource 1 is out of range (slice 1).
+        assert_eq!(
+            into(c, tiled.as_mut_ptr(), 0, 1, linear.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            from(c, linear.as_mut_ptr(), 0, 1, 0, tiled.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
+        // Out-of-range subresource is rejected in `copy_args` before slicing.
+        assert!(copy_args(computer(c), 0, 0, 1024, 0).is_some());
+        assert!(copy_args(computer(c), 0, 1, 1024, 0).is_none());
         assert_eq!(release(c), 0);
     }
 
