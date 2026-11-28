@@ -1023,6 +1023,8 @@ pub enum View<'a> {
 #[derive(Clone, Copy)]
 pub enum Stride {
     Raw,
+    /// Raw SRV exposing only the first N dwords of the backing buffer.
+    RawPrefix(u32),
     /// RGBA32F elements.
     Typed,
     /// Structured, elements of this many bytes.
@@ -1424,6 +1426,10 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
+                            Stride::RawPrefix(n) => {
+                                assert!(n as usize <= data.len());
+                                (DXGI_FORMAT_R32_TYPELESS, n as usize, 0, D3D12_BUFFER_SRV_FLAG_RAW)
+                            }
                             Stride::Typed => (
                                 DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 data.len() / 4,

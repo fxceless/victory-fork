@@ -2502,42 +2502,8 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
-    /// `s_buffer_load_dwordx4`, `x8` and `x16` from a raw SRV read the dwords
-    /// the console's range-checked load reads, a call a dword or
-    /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
-    /// call's four dwords lie across the view's end (the dwords out of it
-    /// are 0, the others are read). On the software adapter only: run the
-    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
-    #[test]
     #[cfg(windows)]
-    fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
-        // (first register, dwords) of the three loads, in order.
-        const LOADS: [(u32, u32); 3] = [(16, 8), (24, 4), (32, 16)];
-        let mut words: Vec<u32> = vec![
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the SRV)
-            0xF408_0302,
-            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
-            0xF42C_0404,
-            0x0000_0000, // s_buffer_load_dwordx8 s[16:23], s[8:11], s0
-            0xF428_0604,
-            0xFA00_0008, // s_buffer_load_dwordx4 s[24:27], s[8:11], 0x8
-            0xF430_0804,
-            0x0200_0004, // s_buffer_load_dwordx16 s[32:47], s[8:11], s1, 0x4
-        ];
-        let mut out_dword = 0u32;
-        for (first, n) in LOADS {
-            for k in 0..n {
-                // v_mov_b32 v1, s<first + k>
-                words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | (first + k));
-                // buffer_store_dword v1, s[12:15], offset 4 * out_dword
-                words.push(0x38 << 26 | 0x1C << 18 | (4 * out_dword));
-                words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
-                out_dword += 1;
-            }
-        }
-        words.push(0xBF81_0000); // s_endpgm
+    fn scalar_buffer_shader(words: &[u32]) -> super::HostShader {
         let table = |kind, at| crate::UsedResource {
             kind,
             root: crate::RootType::Table,
@@ -2577,45 +2543,63 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let l = super::lower::lower(&super::lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-        })
-        .unwrap();
-        // The calls that read the SRV: 28 a dword, 7 with four a call.
-        let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
-        let mut dxil = l.dxil;
+        let program = crate::spill::build(&native).unwrap();
+        let st = crate::structure::structure(&program).unwrap();
+        let res = crate::resource::track(&program, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&program, &native).unwrap();
+        let header = crate::dxbc::build(&[]);
+        let container = crate::Container::parse(&header).unwrap();
+        let mut shader = super::emit(&container, &native, &program, &st, &io, &res).unwrap();
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut dxil).unwrap();
+            v.validate(&mut shader.dxil).unwrap();
         }
+        shader
+    }
+
+    /// `s_buffer_load_dwordx4`, `x8` and `x16` from a raw SRV read the dwords
+    /// the console's range-checked load reads, a call a dword or
+    /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
+    /// call's four dwords lie across the view's end (the dwords out of it
+    /// are 0, the others are read). On the software adapter only: run the
+    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
+    #[test]
+    #[cfg(windows)]
+    fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
+        // (first register, dwords) of the three loads, in order.
+        const LOADS: [(u32, u32); 3] = [(16, 8), (24, 4), (32, 16)];
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the SRV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF42C_0404,
+            0x0000_0000, // s_buffer_load_dwordx8 s[16:23], s[8:11], s0
+            0xF428_0604,
+            0xFA00_0008, // s_buffer_load_dwordx4 s[24:27], s[8:11], 0x8
+            0xF430_0804,
+            0x0200_0004, // s_buffer_load_dwordx16 s[32:47], s[8:11], s1, 0x4
+        ];
+        let mut out_dword = 0u32;
+        for (first, n) in LOADS {
+            for k in 0..n {
+                // v_mov_b32 v1, s<first + k>
+                words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | (first + k));
+                // buffer_store_dword v1, s[12:15], offset 4 * out_dword
+                words.push(0x38 << 26 | 0x1C << 18 | (4 * out_dword));
+                words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+                out_dword += 1;
+            }
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let cs = scalar_buffer_shader(&words);
+        let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
         let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(host) = super::host::Host::new(true) else {
             eprintln!("no software adapter; the dispatch is skipped");
             return;
-        };
-        let cs = super::HostShader {
-            stage: super::HwStage::Cs,
-            dxil,
-            user_data: l.user_data,
-            samplers: Vec::new(),
-            static_samplers: Vec::new(),
-            root_cbvs: l.root_cbvs,
-            root_srvs: l.root_srvs,
-            root_uavs: l.root_uavs,
-            root_indexed_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2649,6 +2633,103 @@ mod tests {
             }
             eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
             assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+        }
+    }
+
+    /// Read at byte 328 with either three or four results consumed. The same
+    /// backing bytes are visible at 344 bytes and out of view at 336 or 340.
+    #[cfg(windows)]
+    #[test]
+    fn scalar_buffer_load_at_328_respects_the_raw_view_end() {
+        use super::host::{Dispatch, Host, Root, Stride, View};
+
+        // The shader optimizer caches its environment on first use. Give each
+        // setting a fresh process, including when run with the whole test suite.
+        const CHILD: &str = "VICTORY_TEST_SCALAR_BUFFER_VIEW_END";
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mode) = std::env::var(CHILD) else {
+            for (opt, mode) in [("63", "scalar"), ("127", "grouped")] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                    .env(CHILD, mode)
+                    .env("VICTORY_SHADER_OPT", opt)
+                    .env("VICTORY_SHADER_CENSUS", "1")
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(output.status.success() && stdout.contains("1 passed"), "opt={opt}: {stdout}");
+            }
+            return;
+        };
+
+        const TAIL: [u32; 4] = [0x3f81_2345, 0x4081_2345, 0x4123_4567, 0x4bad_f00d];
+        const DEAD_MARKER: u32 = 0x5a17_cafe;
+        let mut data = [0u32; 96];
+        data[82..86].copy_from_slice(&TAIL);
+        let opt = shader_opt();
+        let adapters: &[(&str, bool)] = match std::env::var("VICTORY_WARP").as_deref() {
+            Ok("1") => &[("WARP", true)],
+            Ok("0") => &[("hardware", false)],
+            _ => &[("WARP", true), ("hardware", false)],
+        };
+        let mut hosts = Vec::new();
+        for &(name, warp) in adapters {
+            match Host::new(warp) {
+                Ok(host) => hosts.push((name, host)),
+                Err(err) => eprintln!("skipping {name}: {err}"),
+            }
+        }
+        assert!(
+            !hosts.is_empty() || adapters.iter().all(|&(_, warp)| !warp),
+            "no SM 6.6 device available for the requested adapters {adapters:?}"
+        );
+        for live in [3, 4] {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (SRV)
+                0xF408_0302, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32 (UAV)
+                0xF428_0604, 0xFA00_0148, // s_buffer_load_dwordx4 s[24:27], s[8:11], 328
+            ];
+            for lane in 0..4 {
+                if lane < live {
+                    words.push(0x7E02_0200 | (24 + lane)); // v_mov_b32 v1, s<24 + lane>
+                } else {
+                    words.extend([0x7E02_02FF, DEAD_MARKER]); // leave s27 unused
+                }
+                words.extend([0xE070_0000 | (lane * 4), 0x8003_0100]); // buffer_store_dword
+            }
+            words.push(0xBF81_0000); // s_endpgm
+
+            let cs = scalar_buffer_shader(&words);
+            let counts = super::census::take(&cs.dxil).unwrap().counts;
+            let loads = super::census::KINDS.iter().position(|&k| k == "buffer_load").unwrap();
+            let expected_loads = if mode == "grouped" { 1 } else { live };
+            assert_eq!(counts[loads], expected_loads, "opt={opt} live={live}");
+            for (name, host) in &hosts {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                for elements in [84, 85, 86] {
+                    let out = host
+                        .dispatch(&root, &pso, &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![0; cs.user_data_dwords().max(1) as usize]))],
+                            views: &[
+                                View::Buffer { data: &data, stride: Stride::RawPrefix(elements) },
+                                View::RawUav(4),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        })
+                        .unwrap();
+                    let mut expected = TAIL;
+                    expected[(elements - 82) as usize..].fill(0);
+                    if live == 3 {
+                        expected[3] = DEAD_MARKER;
+                    }
+                    let bytes = elements * 4;
+                    eprintln!("{name} opt={opt} live={live} view={bytes}: {:08x?}", out[0]);
+                    assert_eq!(out[0], expected, "{name} opt={opt} live={live} view={bytes}");
+                }
+            }
         }
     }
 
