@@ -708,6 +708,16 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
+        // Matching packed pitches make the visible rows of a depth slice one
+        // contiguous copy. Keep depth slices separate: either side can pad them.
+        if linear && m.pitch == m.width && row_pitch == bytes {
+            let slice_bytes = bytes * m.height as usize;
+            for z in 0..depth {
+                let offset = u64::from(first + z) * self.slice_size + m.offset;
+                copy_run::<DETILE>(src, dst, offset as usize, z as usize * depth_pitch, slice_bytes);
+            }
+            return Ok(());
+        }
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
@@ -1076,6 +1086,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn linear_volume_copies_preserve_mips_and_slice_padding() {
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 4,
+            ..desc(128, 16, 3, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        let mip = &l.mips[1];
+        let bytes = (mip.width * 4) as usize;
+        for pitch in [bytes, bytes + 7] {
+            let stride = pitch * mip.height as usize + 13;
+            let len = stride + (mip.height as usize - 1) * pitch + bytes;
+            let input: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut tiled = vec![0xfe; l.size as usize];
+            let mut want_tiled = tiled.clone();
+            let mut output = vec![0xff; len];
+            let mut want_output = output.clone();
+            for z in 0..mip.depth {
+                for y in 0..mip.height {
+                    let at = l.offset(1, 0, y, z).unwrap() as usize;
+                    let row = z as usize * stride + y as usize * pitch;
+                    want_tiled[at..at + bytes].copy_from_slice(&input[row..row + bytes]);
+                    want_output[row..row + bytes].copy_from_slice(&input[row..row + bytes]);
+                }
+            }
+            l.tile(&mut tiled, 1, 0, &input, pitch, stride).unwrap();
+            assert_eq!(tiled, want_tiled);
+            l.detile(&tiled, 1, 0, &mut output, pitch, stride).unwrap();
+            assert_eq!(output, want_output);
         }
     }
 
