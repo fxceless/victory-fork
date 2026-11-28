@@ -103,6 +103,109 @@ fn most() -> u64 {
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Persistent alias view mapped above 1 TiB (`TITLE_MEMORY_CEILING`) for
+/// `OpenExistingHeapFromAddress1`, keeping the title's `< 1 TiB` view free to
+/// unmap without `ERROR_INVALID_PARAMETER` (87). Dropped only after the
+/// `ID3D12Heap` and `ID3D12Resource` opened on it.
+pub(crate) struct AliasView(*mut u8);
+
+// SAFETY: the alias view's pages are read/written coherently across threads.
+unsafe impl Send for AliasView {}
+// SAFETY: as above.
+unsafe impl Sync for AliasView {}
+
+impl Drop for AliasView {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: owned alias view mapped via `MapViewOfFile3`.
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0.cast() },
+                0,
+            );
+        }
+    }
+}
+
+const TITLE_MEMORY_CEILING: usize = 1 << 40;
+
+fn alias_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_ALIAS").is_some_and(|v| v == "1"))
+}
+
+fn map_alias_above_title_memory(section: usize, offset: u64, bytes: usize) -> Option<AliasView> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+        MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, MemExtendedParameterAddressRequirements,
+        PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree, MEM_RELEASE,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if bytes < K64 || !bytes.is_multiple_of(K64) || !offset.is_multiple_of(K64 as u64) {
+        return None;
+    }
+    let mut info = SYSTEM_INFO::default();
+    // SAFETY: `GetSystemInfo` writes only into `info`.
+    unsafe { GetSystemInfo(&mut info) };
+    let highest = (info.lpMaximumApplicationAddress as usize).saturating_sub(K64);
+    if highest <= TITLE_MEMORY_CEILING {
+        return None;
+    }
+    let mut req = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: TITLE_MEMORY_CEILING as *mut c_void,
+        HighestEndingAddress: highest as *mut c_void,
+        Alignment: K64,
+    };
+    let mut param = MEM_EXTENDED_PARAMETER::default();
+    param.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    param.Anonymous2.Pointer = (&raw mut req).cast();
+    // SAFETY: `req` outlives the `VirtualAlloc2` call.
+    let placeholder = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            bytes,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut param,
+            1,
+        )
+    };
+    if placeholder.is_null() {
+        return None;
+    }
+    // SAFETY: `placeholder` is a valid placeholder of `bytes` in this process.
+    let view = unsafe {
+        MapViewOfFile3(
+            section as HANDLE,
+            GetCurrentProcess(),
+            placeholder,
+            offset,
+            bytes,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let at = view.Value as usize;
+    if at != placeholder as usize {
+        // SAFETY: mapping failed so `placeholder` was not replaced.
+        unsafe { VirtualFree(placeholder, 0, MEM_RELEASE) };
+        return None;
+    }
+    if at < TITLE_MEMORY_CEILING {
+        drop(AliasView(at as *mut u8));
+        return None;
+    }
+    Some(AliasView(at as *mut u8))
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
@@ -111,6 +214,31 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// Optional `>= 1 TiB` alias view backing `heap` for section-backed memory.
+    pub(crate) alias: Option<AliasView>,
+}
+
+/// Opens a `>= 1 TiB` alias view of `(section, section_offset)` for `[start,
+/// start + len)` and places a buffer on it, leaving the title's `< 1 TiB`
+/// view free to unmap without `ERROR_INVALID_PARAMETER` (87).
+pub(crate) fn place_alias(
+    device: &ID3D12Device,
+    section: usize,
+    section_offset: u64,
+    start: u64,
+    len: u64,
+) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bias = start - at;
+    let aligned_offset = section_offset.checked_sub(bias).ok_or(None)?;
+    let end = start.checked_add(len.max(1)).ok_or(None)?;
+    let bytes = (end.checked_next_multiple_of(K64 as u64).ok_or(None)? - at) as usize;
+    let alias = map_alias_above_title_memory(section, aligned_offset, bytes).ok_or(None)?;
+    let heap = open(device, From::Part(alias.0 as usize, bytes)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes as u64).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, bias, alias: Some(alias) })
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -127,7 +255,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, alias: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -138,16 +266,25 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    let cov = cover(start as usize, len as usize);
+    let alias_run = match cov {
+        Cover::None => None,
+        Cover::Run(section, offset) if alias_enabled() => Some((section, offset)),
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let res = match alias_run {
+        Some((section, offset)) => place_alias(&host.device, section, offset, start, len),
+        None => place_part(&host.device, start, len),
+    };
+    match res {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -1520,6 +1657,70 @@ pub(crate) mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Vacuity-controlled test of View A (< 1 TiB) vs View B (>= 1 TiB) alias
+    /// isolation: opening `OpenExistingHeapFromAddress1` on View B locks View B
+    /// (`VirtualProtect(ViewB, PAGE_READONLY)` fails with error 87) while
+    /// `UnmapViewOfFile2(ViewA)` succeeds, and WARP reads View A's bytes
+    /// through View B's placed buffer.
+    #[test]
+    fn warp_alias_view_above_1tib_isolates_heap_lock_from_title_view() {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READONLY, PAGE_READWRITE, UnmapViewOfFile2, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let Some(device) = warp() else { return };
+        unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * K64) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view_a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * K64);
+            assert!(!view_a.Value.is_null());
+
+            // Write via View A before opening the alias heap on View B.
+            let view_a_ptr = view_a.Value.cast::<u8>();
+            fill(view_a_ptr, K64, 0x33);
+
+            let placed = place_alias(&device, section as usize, 0, view_a.Value as u64, K64 as u64)
+                .expect("alias heap on >= 1 TiB View B");
+            let view_b_ptr = placed.alias.as_ref().expect("alias view").0;
+            assert!(
+                view_b_ptr as usize >= TITLE_MEMORY_CEILING,
+                "alias view must live >= 1 TiB, got {view_b_ptr:p}"
+            );
+
+            // Vacuity control: View B is genuinely locked by the D3D12 heap.
+            let mut old = 0u32;
+            let prot_ok = VirtualProtect(view_b_ptr.cast(), K64, PAGE_READONLY, &mut old);
+            assert_eq!(prot_ok, 0, "View B must be locked by OpenExistingHeapFromAddress1");
+            assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+            // GPU reads the bytes written through View A.
+            let mut rig = Rig::new(&device).unwrap();
+            let got = rig.fetch(&placed.buffer, placed.bias, K64).unwrap();
+            assert!(same(view_a_ptr, &got), "GPU must see View A's bytes via View B heap");
+
+            // Title unmaps View A without error 87 while View B's heap is still live.
+            let unmap_ok = UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: view_a.Value },
+                0,
+            );
+            assert_ne!(unmap_ok, 0, "UnmapViewOfFile2(ViewA) must succeed while View B holds the heap");
+
+            drop(placed);
+            CloseHandle(section);
         }
     }
 }

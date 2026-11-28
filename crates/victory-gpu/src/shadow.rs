@@ -108,6 +108,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Optional `>= 1 TiB` alias view kept alive past `place` (`heap`).
+    alias: Option<crate::inplace::AliasView>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3236,6 +3238,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.alias = placed.alias;
         shadow
     }
 
@@ -3311,6 +3314,7 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            alias: None,
         }
     }
 
