@@ -425,6 +425,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Its place among the builder's pipelines, in creation order
+    /// (`VICTORY_BVH_SKIP`, diagnostics).
+    #[cfg(windows)]
+    builder_index: usize,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -518,9 +522,45 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// `VICTORY_BVH_SKIP=3,10-12`: the builder pipelines (by creation order,
+/// logged as "ray-tracing structure builder pipeline") whose dispatches are
+/// dropped. Bisects which stage of the builder leaves the title with bad
+/// data; the other stages still run, so this is not a way to run the builder.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skip_indices(value: &str) -> Vec<std::ops::RangeInclusive<usize>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (a, b) = part.split_once('-').unwrap_or((part, part));
+            match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                (Ok(a), Ok(b)) if a <= b => Some(a..=b),
+                _ => {
+                    tracing::warn!(part, "VICTORY_BVH_SKIP expects indices or ranges like 3,10-12");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_builder_index(p: &Pipeline) -> Option<usize> {
+    static RANGES: OnceLock<Vec<std::ops::RangeInclusive<usize>>> = OnceLock::new();
+    if !p.builder {
+        return None;
+    }
+    let ranges = RANGES.get_or_init(|| parse_skip_indices(&std::env::var("VICTORY_BVH_SKIP").unwrap_or_default()));
+    ranges.iter().any(|r| r.contains(&p.builder_index)).then_some(p.builder_index)
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && {
+        let p = pipeline(this);
+        skipped_shader(p).is_some() || skipped_builder_index(p).is_some()
+    }
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -533,6 +573,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| skipped_builder_index(p).map(|i| format!("skipped builder pipeline {i}")))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -586,11 +627,21 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    #[cfg(windows)]
+    let mut builder_index = usize::MAX;
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        builder_index = b.pipelines.len();
         b.pipelines.push(host.clone());
         b.whole = false;
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            index = builder_index,
+            shaders = ?shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(),
+            "ray-tracing structure builder pipeline"
+        );
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -599,6 +650,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        builder_index,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -813,6 +866,16 @@ mod tests {
         assert_eq!(
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
+        );
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn skip_indices_take_numbers_and_ranges() {
+        assert!(super::parse_skip_indices(" , ").is_empty());
+        assert_eq!(
+            super::parse_skip_indices("3, 10-12, 5-2, x, 7"),
+            [3..=3, 10..=12, 7..=7]
         );
     }
 
