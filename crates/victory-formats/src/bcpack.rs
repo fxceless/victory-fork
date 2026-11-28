@@ -1179,6 +1179,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn rotation_fields_only_affect_modes_four_and_five() {
+        for mode in 0..8u16 {
+            for bits in 0..4u16 {
+                let ctrl = mode | (bits << 3);
+                let expected = if matches!(mode, 4 | 5) { bits as usize } else { 0 };
+                assert_eq!(rotation(ctrl), expected, "mode {mode}, control bits {bits}");
+                if !matches!(mode, 4 | 5) {
+                    assert_eq!(bc7_precision(ctrl), bc7_precision(mode));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode_six_control_bits_cannot_reorder_packed_channels() {
+        let mut ep = Bc7Ep { ctrl: 6 | (1 << 6), ..Default::default() };
+        ep.rows[0] = [0x1200, 0x3400, 0x5600, 0x7800, 0x9a00, 0xbc00, 0xde00, 0xf000];
+        let ix = Bc7Ix { bits: [4, 4], ..Default::default() };
+        let mut expected = [0u8; 16];
+        bc7_pack(&ep, &ix, bc7_precision(ep.ctrl), &mut expected);
+        for bits in 1..4u16 {
+            ep.ctrl = 6 | (1 << 6) | (bits << 3);
+            let mut actual = [0u8; 16];
+            bc7_pack(&ep, &ix, bc7_precision(ep.ctrl), &mut actual);
+            assert_eq!(actual, expected, "mode 6 control bits {bits} changed channel packing");
+        }
+    }
+
     /// Tables we made: uniform models, identity ranks, a BC7 code per mode,
     /// empty dictionaries.
     fn tables() -> Vec<u8> {

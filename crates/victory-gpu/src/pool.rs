@@ -43,7 +43,7 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares(memory, crate::host::keep_freed() && !pressure, crate::residency::small_host());
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -56,18 +56,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if crate::residency::small_host() {
+            2
         } else {
-            limit
+            limit.min(STAGING_KEPT)
         };
         pool.reclaim(tick, staging_limit, true);
     }
 }
 
-fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
-    }
+fn spares(memory: Option<[u64; 4]>, keep: bool, small: bool) -> usize {
+    crate::budget::texture_spares(memory, keep, small).min(SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -744,10 +743,10 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
+        assert_eq!(spares(Some([24 << 30, 12 << 30, 0, 0]), true, false), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true, false), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false, false), SPARE);
+        assert_eq!(spares(None, true, false), SPARE);
     }
 
     #[test]

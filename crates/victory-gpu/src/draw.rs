@@ -3194,8 +3194,9 @@ impl State {
             None => (span, per_frame),
         };
         // Apply the shared frame ceiling after early-pass and catch-up budgets.
-        // A bake samples its inputs immediately and cannot retry that draw.
-        let bytes_at_most = if required || asked.is_some() {
+        // An explicit byte ceiling does not disable pressure admission. A bake
+        // samples its inputs immediately and cannot retry that draw.
+        let bytes_at_most = if required {
             bytes_at_most
         } else {
             crate::residency::prefetch_limit(

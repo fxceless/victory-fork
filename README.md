@@ -1,5 +1,15 @@
 # VIctory fork
 
+Experimental branch: 16 GiB RAM / 8 GiB VRAM safeguards, generic Series S
+launcher and native title upscaling controls. See [the source comparison, fixes
+and validation status](docs/local-low-memory.md). Full Rust build and gameplay
+qualification are pending.
+
+[Performance targets and stutter measurements](docs/performance-targets.md) cover
+the requested 90/120/60/30 FPS goals. These are unverified targets, not achieved
+results. **No game files are provided; someone please test this fork** following
+[the testing request](TESTING_REQUEST.md).
+
 **As of 27 November 2026 this repository is based on
 [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) by
 [trustno1-coder](https://github.com/trustno1-coder).** Its tree at commit

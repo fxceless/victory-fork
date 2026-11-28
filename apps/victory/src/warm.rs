@@ -26,7 +26,7 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, strict: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -40,9 +40,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
+        if let Some(key) = completed_key(line, &fingerprint) {
             done.insert(key);
         }
     }
@@ -54,7 +52,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            (again || !done.contains(key)) && (strict || !bad.contains(key)) && (!used || early.contains(key))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
@@ -93,18 +91,23 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
-                            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+                            if there {
+                                let _ = writeln!(lock(&done_out), "ready-v2 {fingerprint} {}", keys[n]);
+                            } else {
+                                let _ = writeln!(lock(&bad_out), "{} no host pipeline", keys[n]);
+                            }
                         });
                         rest = &rest[made.min(rest.len())..];
-                        match (ended, rest.split_first()) {
-                            (Some(why), Some((&n, after))) => {
+                        if let Some(why) = ended {
+                            lock(&state).2 += 1;
+                            if let Some((&n, after)) = rest.split_first() {
                                 // The one it was at.
                                 println!("pipeline {n} {}: {why}", keys[n]);
                                 let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
-                                lock(&state).2 += 1;
                                 rest = after;
+                            } else {
+                                println!("pipeline warm-up process: {why}");
                             }
-                            _ => break,
                         }
                     }
                 }
@@ -115,7 +118,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} failed/incomplete processes); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
         times.len(),
         began.elapsed().as_secs_f64(),
         at(0.5),
@@ -124,7 +127,32 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    anyhow::ensure!(
+        !strict || (refused == 0 && crashed == 0),
+        "strict pipeline warm-up failed: {refused} refused pipelines, {crashed} failed/incomplete processes; see {}",
+        bad_file.display()
+    );
     Ok(())
+}
+
+/// Only success records written after host-pipeline creation was verified are
+/// reusable. The older format could mark refused pipelines as completed.
+fn completed_key<'a>(line: &'a str, fingerprint: &str) -> Option<&'a str> {
+    let mut words = line.split_whitespace();
+    let (version, of, key) = (words.next()?, words.next()?, words.next()?);
+    (version == "ready-v2" && of == fingerprint && words.next().is_none()).then_some(key)
+}
+
+fn completion(line: &str, expected: usize) -> Option<(f64, bool)> {
+    let mut words = line.split_whitespace();
+    if words.next()? != "made" || words.next()?.parse::<usize>().ok()? != expected { return None; }
+    let ms = words.next()?.parse::<f64>().ok()?;
+    let there = match words.next()? { "1" => true, "0" => false, _ => return None };
+    (ms.is_finite() && ms >= 0.0 && words.next().is_none()).then_some((ms, there))
+}
+
+fn successful_process(success: bool, made: usize, expected: usize) -> bool {
+    success && made == expected
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -145,8 +173,15 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
             .creation_flags(IDLE_PRIORITY_CLASS)
             .spawn()
     });
-    let Ok(mut process) = spawned else { return (these.len(), None) };
-    let Some(out) = process.stdout.take() else { return (these.len(), None) };
+    let mut process = match spawned {
+        Ok(process) => process,
+        Err(error) => return (0, Some(format!("could not start warm-up process: {error}"))),
+    };
+    let Some(out) = process.stdout.take() else {
+        let _ = process.kill();
+        let _ = process.wait();
+        return (0, Some("warm-up process has no completion stream".into()));
+    };
     let process = Mutex::new(process);
     let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
     let hung = AtomicBool::new(false);
@@ -164,23 +199,23 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
         });
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             *lock(&heard) = Instant::now();
-            let mut words = line.split(' ');
-            if words.next() == Some("made")
-                && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
-                && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
+            if let Some(&n) = these.get(made)
+                && let Some((ms, there)) = completion(&line, n)
             {
                 made += 1;
-                each(n, ms, there == "1");
+                each(n, ms, there);
             }
         }
         over.store(true, Ordering::Relaxed);
     });
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());
-    if well {
-        return (these.len(), None);
+    if successful_process(well, made, these.len()) {
+        return (made, None);
     }
-    let why = if hung.load(Ordering::Relaxed) {
+    let why = if well {
+        format!("incomplete completion stream: {made}/{} pipelines reported", these.len())
+    } else if hung.load(Ordering::Relaxed) {
         format!("hung for {} s", LONGEST.as_secs())
     } else {
         status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
@@ -207,4 +242,33 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_verified_success_records_for_this_fingerprint_are_reused() {
+        assert_eq!(completed_key("ready-v2 driver-a pipeline", "driver-a"), Some("pipeline"));
+        assert_eq!(completed_key("driver-a pipeline", "driver-a"), None);
+        assert_eq!(completed_key("ready-v2 driver-b pipeline", "driver-a"), None);
+        assert_eq!(completed_key("ready-v2 driver-a pipeline extra", "driver-a"), None);
+    }
+
+    #[test]
+    fn completion_requires_the_expected_pipeline_and_valid_status() {
+        assert_eq!(completion("made 7 1.25 1", 7), Some((1.25, true)));
+        assert_eq!(completion("made 7 1.25 0", 7), Some((1.25, false)));
+        for line in ["made 8 1.25 1", "made 7 NaN 1", "made 7 -1 1", "made 7 1.25 2", "made 7 1.25 1 extra"] {
+            assert_eq!(completion(line, 7), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn zero_exit_without_all_completions_is_not_success() {
+        assert!(successful_process(true, 2, 2));
+        assert!(!successful_process(true, 1, 2));
+        assert!(!successful_process(false, 2, 2));
+    }
 }

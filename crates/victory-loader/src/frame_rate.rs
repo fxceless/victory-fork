@@ -175,6 +175,11 @@ pub enum Patched {
     Failed(&'static str),
 }
 
+/// A timing override is safe to start only when all required timing sites changed.
+pub fn complete(results: &[Patched], expected: usize) -> bool {
+    expected > 0 && results.len() == expected && results.iter().all(|r| matches!(r, Patched::Done))
+}
+
 /// Makes each site of `sites` in the image of `size` bytes at `base` load
 /// `rate`. What became of each, said in the log too.
 ///
@@ -208,8 +213,12 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
                         return Patched::Failed("Windows would not make it writable");
                     }
                     std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, len);
-                    VirtualProtect(at as *const _, len, old, &mut old);
-                    FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
+                    if VirtualProtect(at as *const _, len, old, &mut old) == 0 {
+                        return Patched::Failed("Windows would not restore code protection");
+                    }
+                    if FlushInstructionCache(GetCurrentProcess(), at as *const _, len) == 0 {
+                        return Patched::Failed("Windows would not flush the instruction cache");
+                    }
                 }
                 Patched::Done
             })();
@@ -227,6 +236,15 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_overrides_require_every_site_including_simulation() {
+        assert!(complete(&[Patched::Done, Patched::Done, Patched::Done], 3));
+        assert!(!complete(&[Patched::Done, Patched::Done, Patched::Differs], 3));
+        assert!(!complete(&[Patched::Done, Patched::Failed("test"), Patched::Done], 3));
+        assert!(!complete(&[Patched::Done], 3));
+        assert!(!complete(&[], 0));
+    }
 
     #[test]
     fn intervals_and_rates() {

@@ -1780,55 +1780,27 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
-/// Unconditional host-texture floor for a given local VRAM budget (`None` when
-/// the adapter does not report one): up to 2 GiB, capped at a quarter of the
-/// reported budget so 4–6 GiB cards do not bypass the budget check early.
-#[cfg(any(windows, test))]
-fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
-    const MAX_FLOOR: u64 = 2 << 30;
-    match vram_budget {
-        Some(budget) => MAX_FLOOR.min(budget / 4),
-        None => MAX_FLOOR,
-    }
-}
-
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
+/// shaders that pick textures by index (`draw.rs` `heap_textures`), while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
+/// sets an additional limit on those copies' bytes). Past the budget the system moves the card's memory into the PC's,
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim().parse::<u64>().ok().map(|mb| mb.saturating_mul(1 << 20))
     });
-    // (With the tiles of the copies made level by level, whose own bytes
-    // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
-    }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
-    match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    let filled = KINDS[1].load(Relaxed).saturating_add(crate::tiles::given_total());
+    let under_budget = memory.map(|[budget, used, ..]| {
+        crate::budget::texture_usage(
+            used, crate::pool::texture_room(), crate::shadow::card_room_kept(), targets_room_kept(),
+        ) < room_line(budget)
+    });
+    crate::budget::texture_room(filled, limit, under_budget)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2268,9 +2240,9 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
+            let used = crate::budget::texture_usage(
+                used, crate::pool::texture_room(), crate::shadow::card_room_kept(), targets_room_kept(),
+            );
             crate::host::vram_keep_below(budget, used, room_line(budget))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4796,18 +4768,6 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
-    }
-
-    #[test]
-    fn texture_floor_scales_with_vram_budget() {
-        const GIB: u64 = 1 << 30;
-        assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
     }
 
     /// The texture queue's line: the budget less 768 MiB or 5 %, never under

@@ -10,6 +10,10 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [string]$Runner,
+    [switch]$Warm,
+    [ValidateRange(1, 64)][int]$WarmJobs = 2,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -26,13 +30,28 @@ if ($Safe) {
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
-if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
+$victory = if ($Runner) { $Runner } else { Join-Path $PSScriptRoot "..\target\$Build\victory.exe" }
+if (-not (Test-Path -LiteralPath $victory -PathType Leaf)) { throw "No $victory. Build it first (README.md), or specify -Runner." }
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "No $Exe." }
+$victory = (Resolve-Path -LiteralPath $victory).Path
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
-Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
-foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
-$Exe = (Resolve-Path $Exe).Path
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+$previous = @{}
+Get-ChildItem Env:VICTORY_* | ForEach-Object { $previous[$_.Name] = $_.Value }
+try {
+    Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+    foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+    Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+    try {
+        if ($Warm) {
+            & $victory warm --used --strict --jobs $WarmJobs
+            if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up exited with code $LASTEXITCODE; game was not started." }
+        }
+        & $victory run $Exe --console $Console --execute
+        if ($LASTEXITCODE -ne 0) { throw "VIctory exited with code $LASTEXITCODE." }
+    } finally { Pop-Location }
+} finally {
+    Get-ChildItem Env:VICTORY_* | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+    foreach ($key in $previous.Keys) { Set-Item "Env:$key" $previous[$key] }
+}

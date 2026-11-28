@@ -56,6 +56,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    let _frame_report = if execute { crate::frame_report::start()? } else { None };
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
@@ -262,6 +263,11 @@ pub fn run(
                 // SAFETY: the image stays mapped and nothing of it has run yet.
                 let done = unsafe { apply(image.base(), size, rate, &SITES) };
                 let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                anyhow::ensure!(
+                    victory_loader::frame_rate::complete(&done, SITES.len()),
+                    "refusing the requested frame-rate override: {patched}/{} timing sites patched; a partial override can change simulation speed. Use a supported title build or remove VICTORY_FRAME_INTERVAL_MS and VICTORY_TITLE_FPS to keep stock timing",
+                    SITES.len()
+                );
                 println!(
                     "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
                     SITES.len(),
