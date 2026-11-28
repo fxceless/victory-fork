@@ -221,12 +221,17 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let background = parent.is_null() && background();
+    let style = if background { style & !wm::WS_VISIBLE } else { style };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if background {
+        to_background(hwnd);
+    }
     hook(hwnd);
     hwnd
 }
@@ -247,14 +252,51 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let background = parent.is_null() && background();
+    let style = if background { style & !wm::WS_VISIBLE } else { style };
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if background {
+        to_background(hwnd);
+    }
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_WINDOW_BACKGROUND=1`: the title's top-level window opens
+/// without taking the foreground, behind the other windows and just right
+/// of the desktop, so a run does not interrupt the person at the PC (it
+/// still renders and presents; scripted keys work without focus).
+fn background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_BACKGROUND").is_some_and(|v| v == "1"))
+}
+
+/// Shows `hwnd` (made without `WS_VISIBLE`) at the bottom of the z order,
+/// past the right edge of the virtual desktop, without activating it.
+fn to_background(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: plain queries and a placement of a window of ours.
+    unsafe {
+        let x = wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) + wm::GetSystemMetrics(wm::SM_CXVIRTUALSCREEN) + 64;
+        let y = wm::GetSystemMetrics(wm::SM_YVIRTUALSCREEN);
+        wm::SetWindowPos(
+            hwnd,
+            wm::HWND_BOTTOM,
+            x,
+            y,
+            0,
+            0,
+            wm::SWP_NOSIZE | wm::SWP_NOACTIVATE | wm::SWP_SHOWWINDOW,
+        );
+    }
+    tracing::info!("title window opened in the background (VICTORY_WINDOW_BACKGROUND=1)");
 }
 
 /// A console title sizes its window to its render target (

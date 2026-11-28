@@ -11081,11 +11081,14 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        // `VICTORY_WINDOW_BACKGROUND=1`: shown without taking the foreground,
+        // behind the other windows, past the desktop's right edge.
+        let background = std::env::var_os("VICTORY_WINDOW_BACKGROUND").is_some_and(|v| v == "1");
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            if background { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW | WS_VISIBLE },
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             rect.right - rect.left,
@@ -11094,7 +11097,24 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        if background {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, HWND_BOTTOM, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+            };
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_BOTTOM),
+                x,
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        Ok(hwnd)
     }
 }
 
