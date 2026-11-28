@@ -1608,12 +1608,17 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Bytes per element and typed integer format bits of a buffer view, decoded
-/// in a single pass over the view descriptor; `(None, 0)` if not a buffer view.
+/// Bytes per buffer element and integer format bits. Stencil-plane SRVs
+/// have no buffer stride, but their gathers return unsigned integer texels.
 fn view_stride_and_kind(view: &View) -> (Option<u32>, u32) {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
     let Some((stride, raw, format)) = view_elements(view) else {
-        return (None, 0);
+        let format = match view {
+            View::Shader(_, Some(d)) if matches!(d[1], 4 | 5) => d[0],
+            View::Placed(false, resource, d) if resource[0] == 3 && matches!(d[1], 4 | 5) => d[0],
+            _ => 0,
+        };
+        return (None, if matches!(crate::resource::pc_format(format), 22 | 47) { VIEW_INTEGER } else { 0 });
     };
     let bytes = if stride > 0 {
         stride
