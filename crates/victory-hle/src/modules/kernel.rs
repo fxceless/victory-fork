@@ -241,6 +241,18 @@ pub extern "C" fn exit(code: i32) -> ! {
     host::exit(code)
 }
 
+/// The title's `ExitProcess`: Windows tells every loaded DLL the process is
+/// ending before it goes; title images are mapped by us (prepared copies
+/// with no entry point and no TLS callbacks), so the OS loader tells them
+/// nothing and only our notices can. The CRT's atexit functions do not run,
+/// as Windows does not run them for `ExitProcess`.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title calls ExitProcess");
+    #[cfg(windows)]
+    victory_loader::exit_notices();
+    host::exit_process(code)
+}
+
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
@@ -463,6 +475,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
+            hle_export!(ExitProcess),
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
@@ -489,7 +502,7 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::{ExitProcess, TerminateProcess};
 
     unsafe extern "C" {
         #[link_name = "exit"]
@@ -561,6 +574,11 @@ mod host {
     pub(super) fn exit(code: i32) -> ! {
         // SAFETY: see above.
         unsafe { crt_exit(code) }
+    }
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        // SAFETY: see above; ends this process.
+        unsafe { ExitProcess(code) }
     }
 
     pub(super) fn abort() -> ! {
@@ -658,6 +676,10 @@ mod host {
 
     pub(super) fn exit(code: i32) -> ! {
         std::process::exit(code)
+    }
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        std::process::exit(code as i32)
     }
 
     pub(super) fn abort() -> ! {
