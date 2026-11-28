@@ -70,6 +70,9 @@ mod popwatch;
 mod primitive;
 pub mod query;
 pub mod queue;
+// Non-Windows builds only account for cached shader containers; no host sweep runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ram_trim;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]

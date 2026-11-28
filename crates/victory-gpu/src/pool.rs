@@ -355,6 +355,9 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// When the last piece was returned (or the block was made). Used only
+    /// once the block is wholly free, after all returned pieces rest.
+    idle_since: u64,
 }
 
 struct Pool<B> {
@@ -502,8 +505,17 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] =
-            Some(Block { memory, free: Ranges::new(BLOCK), room: BLOCK, no_fit: None, used_to: 0, made, since: crate::host::now_ms() });
+        let since = crate::host::now_ms();
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            room: BLOCK,
+            no_fit: None,
+            used_to: 0,
+            made,
+            since,
+            idle_since: since,
+        });
         self.no_fit = None;
         i
     }
@@ -528,7 +540,10 @@ impl<B: Clone> Pool<B> {
                 block.free.give(piece.start, piece.len);
                 block.room += piece.len;
                 block.no_fit = None;
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) {
+                    block.idle_since = ready - REST;
+                    any = true;
+                }
             }
             self.no_fit = None;
         }
@@ -547,6 +562,32 @@ impl<B: Clone> Pool<B> {
                 }
             }
         }
+    }
+
+    /// Takes whole cold blocks only. A block with a live or resting piece
+    /// is not wholly free and cannot be reclaimed here.
+    fn take_cold_blocks(&mut self, warm: usize, idle_ms: u64, now: u64) -> Vec<B> {
+        let mut empty = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if let Some(block) = block
+                && block.free.whole(BLOCK)
+            {
+                empty.push((block.idle_since, i));
+            }
+        }
+        let excess = empty.len().saturating_sub(warm);
+        empty.sort_unstable();
+        let mut freed = Vec::new();
+        for (since, i) in empty.into_iter().take(excess) {
+            if now.saturating_sub(since) < idle_ms {
+                break;
+            }
+            if let Some(block) = self.blocks[i].take() {
+                freed.push(block.memory);
+                self.given += 1;
+            }
+        }
+        freed
     }
 
     fn blocks(&self) -> usize {
@@ -580,6 +621,24 @@ pub(crate) fn texture_room() -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+}
+
+/// Trims only the system-memory upload pool, leaving texture VRAM budgeting
+/// and the wait/growth gate to `room` and `texture`.
+pub(crate) fn trim_staging_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let warm_blocks = if policy.panic_memory {
+        0
+    } else {
+        (policy.texture_spare_warm_bytes / BLOCK) as usize
+    };
+    let freed = {
+        let Ok(mut pool) = STAGING.try_lock() else { return };
+        let idle_ms = if policy.panic_memory { 0 } else { policy.pool_idle_ms };
+        pool.take_cold_blocks(warm_blocks, idle_ms, now)
+    };
+    let bytes = freed.len() as u64 * BLOCK;
+    drop(freed);
+    crate::ram_trim::note_pool_trimmed(bytes);
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -1024,6 +1083,30 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn spare_trim_reclaims_only_cold_staging_blocks() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let now = 21_000;
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, now, || Some(0)).unwrap();
+        pool.give(resting, now);
+        let oldest = pool.add(1, 0);
+        let older = pool.add(2, 0);
+        let warm = pool.add(3, 0);
+        pool.blocks[oldest].as_mut().unwrap().idle_since = 1_000;
+        pool.blocks[older].as_mut().unwrap().idle_since = 2_000;
+        pool.blocks[warm].as_mut().unwrap().idle_since = 20_000;
+
+        assert_eq!(pool.take_cold_blocks(1, 10_000, now), vec![1, 2]);
+        assert_eq!(pool.blocks(), 2);
+        assert!(pool.blocks[warm].is_some());
+        assert_eq!(pool.resting.len(), 1);
+        assert!(pool.take_cold_blocks(0, 10_000, now).is_empty());
+        // Even panic policy cannot take the block with the resting piece.
+        assert_eq!(pool.take_cold_blocks(0, 0, now), vec![3]);
+        pool.reclaim(now + REST, STAGING_KEPT, false);
+        assert_eq!(pool.take_cold_blocks(0, 0, now + REST), vec![0]);
     }
 
     #[test]

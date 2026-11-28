@@ -68,7 +68,7 @@ static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && s.with_container(|bytes| bytes.windows(name.len()).any(|w| w == name)))
 }
 
 /// Shader hashes whose pipelines are left out in every build

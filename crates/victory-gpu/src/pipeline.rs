@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -54,18 +56,76 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// Guest shader container bytes: raw while hot, zlib-compressed once cold.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Clone)]
+enum ContainerBlob {
+    Raw(Arc<[u8]>),
+    #[cfg(windows)]
+    Compressed { packed: Arc<[u8]>, orig_len: usize },
+}
+
+#[cfg(windows)]
+fn compress_container(raw: &[u8]) -> Option<Arc<[u8]>> {
+    if raw.len() < 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (packed, rc) = zlib_rs::compress_slice(&mut buf, raw, zlib_rs::DeflateConfig::new(1));
+    if rc != zlib_rs::ReturnCode::Ok || packed.len() + 256 >= raw.len() {
+        return None;
+    }
+    Some(Arc::from(packed))
+}
+
+#[cfg(windows)]
+fn decompress_container(packed: &[u8], orig_len: usize) -> Vec<u8> {
+    if orig_len == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; orig_len];
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    match state.decompress(packed, &mut out, zlib_rs::InflateFlush::Finish) {
+        Ok(zlib_rs::Status::StreamEnd) if state.total_out() as usize == orig_len => out,
+        _ => Vec::new(),
+    }
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    #[cfg(windows)]
+    container_len: usize,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    container: Mutex<ContainerBlob>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    builder_spilled: OnceLock<bool>,
+    #[cfg(windows)]
+    building_dxil: std::sync::atomic::AtomicU32,
+    #[cfg(windows)]
+    last_dxil_ms: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(windows, test))]
+impl Shader {
+    fn with_container<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        let blob = self.container.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match blob {
+            ContainerBlob::Raw(bytes) => f(&bytes),
+            #[cfg(windows)]
+            ContainerBlob::Compressed { packed, orig_len } => {
+                f(&decompress_container(&packed, orig_len))
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Shader {
@@ -77,8 +137,8 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
-/// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// For the memory lines: containers and retained bytes, translations and
+/// retained DXIL bytes. Translation metadata remains cached.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -109,21 +169,33 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            use std::sync::atomic::Ordering::Relaxed;
+            KEPT[1].fetch_add(bytes.len() as u64, Relaxed);
+            let counters = &crate::ram_trim::COUNTERS;
+            counters.shader_container_orig_bytes.fetch_add(bytes.len() as u64, Relaxed);
+            counters.shader_container_retained_bytes.fetch_add(bytes.len() as u64, Relaxed);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                #[cfg(windows)]
+                container_len: bytes.len(),
+                container: Mutex::new(ContainerBlob::Raw(Arc::from(bytes))),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                builder_spilled: OnceLock::new(),
+                #[cfg(windows)]
+                building_dxil: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(windows)]
+                last_dxil_ms: std::sync::atomic::AtomicU64::new(0),
             })
         })
         .clone()
 }
 
-/// A translated shader and the console resources its code reads.
+/// A translated shader and the guest resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
@@ -142,30 +214,157 @@ pub(crate) struct Translated {
     /// Whether it is one of the title's vehicle paint shaders with decals,
     /// once asked (`crate::livery::reads_decals`, the livery probe).
     pub(crate) livery: std::sync::atomic::AtomicU8,
+    /// Bytecode is only needed while building host PSOs.
+    dxil: Mutex<Option<Arc<[u8]>>>,
+}
+
+#[cfg(windows)]
+pub(crate) struct DxilPin<'a>(&'a Shader);
+
+#[cfg(windows)]
+impl Drop for DxilPin<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if self.0.building_dxil.fetch_sub(1, AcqRel) == 1 {
+            let policy = crate::ram_trim::TrimPolicy::cached();
+            if policy.shader_dxil_idle_ms == 0 {
+                self.0.release_dxil();
+            }
+            if policy.shader_container_idle_ms == 0 {
+                self.0.compress_container_if_ready();
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// Pins DXIL bytecode in RAM while a PSO creation call is using it.
+    pub(crate) fn pin_dxil(&self) -> DxilPin<'_> {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        self.building_dxil.fetch_add(1, AcqRel);
+        self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+        DxilPin(self)
+    }
+
+    /// Returns translated DXIL bytecode, reloading/re-translating transparently
+    /// from the guest container / disk cache if previously dropped.
+    pub(crate) fn dxil(&self) -> Option<std::sync::Arc<[u8]>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = self.translated()?;
+        self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+        {
+            let guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bytes) = guard.as_ref() {
+                return Some(bytes.clone());
+            }
+        }
+        let reloaded = self.with_container(|bytes| crate::shader_cache::host_shader(bytes).ok())?;
+        let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(reloaded.dxil);
+        let bytes_len = arc.len() as u64;
+        let mut guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.as_ref() {
+            return Some(existing.clone());
+        }
+        *guard = Some(arc.clone());
+        KEPT[3].fetch_add(bytes_len, Relaxed);
+        crate::ram_trim::COUNTERS
+            .shader_dxil_reloaded_bytes
+            .fetch_add(bytes_len, Relaxed);
+        Some(arc)
+    }
+
+    /// Drops retained post-PSO DXIL bytecode if no build currently pins it.
+    pub(crate) fn release_dxil(&self) -> u64 {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let Some(Some(t)) = self.translated.get() else {
+            return 0;
+        };
+        let mut guard = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let Some(dropped) = guard.take() else {
+            return 0;
+        };
+        let len = dropped.len() as u64;
+        drop(dropped);
+        KEPT[3].fetch_sub(len, Relaxed);
+        crate::ram_trim::COUNTERS
+            .shader_dxil_dropped_bytes
+            .fetch_add(len, Relaxed);
+        len
+    }
+
+    fn compress_container_if_ready(&self) -> u64 {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if self.translated.get().is_none() || self.building_dxil.load(Acquire) > 0 {
+            return 0;
+        }
+        let raw = {
+            let Ok(guard) = self.container.try_lock() else {
+                return 0;
+            };
+            let ContainerBlob::Raw(raw) = &*guard else {
+                return 0;
+            };
+            Arc::clone(raw)
+        };
+        let Some(packed) = compress_container(&raw) else {
+            return 0;
+        };
+        let Ok(mut guard) = self.container.try_lock() else {
+            return 0;
+        };
+        if self.building_dxil.load(Acquire) > 0
+            || !matches!(&*guard, ContainerBlob::Raw(current) if Arc::ptr_eq(current, &raw))
+        {
+            return 0;
+        }
+        let orig_len = raw.len();
+        let saved = (orig_len - packed.len()) as u64;
+        *guard = ContainerBlob::Compressed { packed, orig_len };
+        KEPT[1].fetch_sub(saved, Relaxed);
+        crate::ram_trim::COUNTERS.shader_container_retained_bytes.fetch_sub(saved, Relaxed);
+        saved
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
+        use std::sync::atomic::Ordering::Relaxed;
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
-                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
-                    let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                let done = self.with_container(|bytes| {
+                    let mut done = translate(bytes);
+                    // Save the original container and translated bytecode by hash.
+                    if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let stem = format!("{}.{}", self.hash, self.stage);
+                        let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), bytes);
+                        if let Ok(t) = &mut done
+                            && let Some(dxil) = t.dxil.get_mut().unwrap_or_else(|e| e.into_inner())
+                        {
+                            let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &**dxil);
+                        }
                     }
-                }
+                    if done.is_err() && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join(format!("{}.cdxil", self.hash)), bytes);
+                    }
+                    done
+                });
                 if let Ok(t) = &done {
-                    KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let dxil = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+                    let len = dxil.as_ref().map_or(0, |d| d.len() as u64);
+                    self.last_dxil_ms.store(crate::host::now_ms(), Relaxed);
+                    KEPT[2].fetch_add(1, Relaxed);
+                    KEPT[3].fetch_add(len, Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -190,12 +389,14 @@ impl Shader {
 
 #[cfg(windows)]
 impl Shader {
-    /// The console programs of the container; `None` if they are not known.
+    /// The guest programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
-        let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
-        victory_shader::native_programs(part.data).ok()
+        self.with_container(|bytes| {
+            let c = Container::parse(bytes).ok()?;
+            let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+            victory_shader::native_programs(part.data).ok()
+        })
     }
 }
 
@@ -209,7 +410,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let mut host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -227,7 +428,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .map(|p| p.used)
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let dxil = Mutex::new(Some(Arc::from(std::mem::take(&mut host.dxil))));
     Ok(Translated {
+        dxil,
         host,
         threads,
         used,
@@ -239,9 +442,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
-/// The compute pipelines of the console's ray-tracing structure builder
-/// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
-/// user-data table) run **all or none**. Its stages feed each other
+/// The guest ray-tracing structure builder's compute pipelines (identified
+/// by their spilled user-data tables) run **all or none**. Its stages feed each other
 /// through memory: a stage that runs on what a dropped stage never wrote
 /// computes its store offsets from garbage. The structures lie in plain
 /// title memory, between the title's own objects, and a root view has no
@@ -284,17 +486,21 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
     if shader.stage != "compute" {
         return false;
     }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    *shader.builder_spilled.get_or_init(|| {
+        shader.with_container(|bytes| {
+            use victory_shader::{Container, FourCC};
+            let Ok(c) = Container::parse(bytes) else {
+                return false;
+            };
+            c.part(FourCC::DXIL)
+                .and_then(|part| victory_shader::native_programs(part.data).ok())
+                .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+        })
+    })
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -448,7 +654,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
     }
 }
 
@@ -784,6 +990,32 @@ pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// Releases cold post-PSO shader DXIL blobs and zlib-compresses idle guest
+/// containers (`SHADERS`), keeping full hash/container reloadability on demand.
+#[cfg(windows)]
+pub(crate) fn trim_shaders_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let list: Vec<Arc<Shader>> = {
+        let guard = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_ref() else {
+            return;
+        };
+        map.values().cloned().collect()
+    };
+    for shader in list {
+        if shader.translated.get().is_none() || shader.building_dxil.load(Acquire) > 0 {
+            continue;
+        }
+        let idle = now.saturating_sub(shader.last_dxil_ms.load(Relaxed));
+        if policy.panic_memory || idle >= policy.shader_dxil_idle_ms {
+            shader.release_dxil();
+        }
+        if policy.panic_memory || idle >= policy.shader_container_idle_ms {
+            shader.compress_container_if_ready();
+        }
+    }
+}
+
 /// The pipeline library's part of the report when the host device is
 /// removed (`library::removal_note`).
 #[cfg(windows)]
@@ -823,7 +1055,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| s.with_container(|bytes| (s.stage, bytes.to_vec())))
             .collect()
     }
 
@@ -921,5 +1153,203 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ram_trim_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn minimal_stage_container(slot_offset: usize, extra_padding: usize) -> Vec<u8> {
+        // Minimal guest `DXIL` part carrying one valid `s_endpgm` native program at `slot_offset`.
+        const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        const SLOT_CS: usize = 0x60;
+        const RECORD_SIZE: usize = 0x54;
+        const STAGE_DATA: usize = 0x14c + 8 * (4 + 10 * 10 * 4);
+        let code = 0xbf81_0000u32.to_le_bytes(); // s_endpgm
+        let mut payload = 6u64.to_le_bytes().to_vec();
+        payload.resize(SLOT_CS + 8, 0);
+        for at in [0x08usize, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, SLOT_CS] {
+            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
+        }
+        let record = payload.len() as u64;
+        payload[slot_offset..slot_offset + 8].copy_from_slice(&record.to_le_bytes());
+        let code_at = record + RECORD_SIZE as u64 + STAGE_DATA as u64;
+        payload.extend_from_slice(&code_at.to_le_bytes());
+        payload.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        payload.resize(record as usize + 0x50, 0);
+        payload.extend_from_slice(&(1u32).to_le_bytes()); // 1 VGPR
+        let mut stage_data = vec![0u8; STAGE_DATA];
+        if slot_offset == SLOT_CS {
+            // CS thread group (1, 1, 1) at `STAGE_DATA + 0x28`.
+            for (i, v) in [1u32, 1, 1].into_iter().enumerate() {
+                stage_data[0x28 + i * 4..0x28 + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        payload.extend_from_slice(&stage_data);
+        payload.extend_from_slice(&code);
+
+        let mut fssm = b"FSSM".to_vec();
+        fssm.extend_from_slice(&0x101u32.to_le_bytes());
+        fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        fssm.extend_from_slice(&payload);
+
+        let mut buf = vec![0u8; zlib_rs::compress_bound(fssm.len())];
+        let (stream, rc) =
+            zlib_rs::compress_slice(&mut buf, &fssm, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+        let mut xbch = b"XBCH".to_vec();
+        xbch.extend_from_slice(&3u32.to_le_bytes());
+        xbch.extend_from_slice(&(stream.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(stream);
+
+        let pad = vec![0x42u8; extra_padding];
+        let blobs: Vec<(u32, &[u8])> = if extra_padding > 0 {
+            vec![(0x0a, b"xbop"), (0x0d, &xbch), (0x12, &pad)]
+        } else {
+            vec![(0x0a, b"xbop"), (0x0d, &xbch)]
+        };
+        let mut dxil_part = vec![0u8; 0x18];
+        dxil_part.extend_from_slice(b"XDAT");
+        dxil_part.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        dxil_part.extend_from_slice(&0x24u32.to_le_bytes());
+        let mut off = dxil_part.len() + 12 * blobs.len();
+        for &(kind, blob) in &blobs {
+            for w in [kind, off as u32, blob.len() as u32] {
+                dxil_part.extend_from_slice(&w.to_le_bytes());
+            }
+            off += blob.len();
+        }
+        for (_, blob) in blobs {
+            dxil_part.extend_from_slice(blob);
+        }
+        let dxbc_parts = [(victory_shader::FourCC::DXIL, dxil_part.as_slice())];
+        let table = 32 + 4 * dxbc_parts.len();
+        let total = table + dxbc_parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(dxbc_parts.len() as u32).to_le_bytes());
+        let mut offset = table;
+        for (_, d) in &dxbc_parts {
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + d.len();
+        }
+        for (fourcc, d) in dxbc_parts {
+            out.extend_from_slice(&fourcc.0);
+            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+            out.extend_from_slice(d);
+        }
+        out
+    }
+
+    #[test]
+    fn real_shader_drops_dxil_post_pso_compresses_and_reloads_on_demand() {
+        let orig = minimal_stage_container(0x60, 64 << 10);
+        assert!(orig.len() > (64 << 10));
+        let shader = super::shader("compute", &orig);
+
+        shader.translated().expect("minimal CS translates");
+        assert!(shader.programs().is_some());
+        assert!(!super::of_builder(std::slice::from_ref(&shader)));
+
+        let dxil_first = shader.dxil().expect("DXIL available");
+        let dxil_len = dxil_first.len() as u64;
+        assert!(dxil_len > 0);
+        drop(dxil_first);
+
+        // Compress explicitly before dropping a pin: under panic pressure the
+        // last pin would otherwise compress the container itself.
+        let saved = shader.compress_container_if_ready();
+        assert!(saved > (60 << 10), "expected >60 KiB saved, got {saved}");
+        shader.with_container(|decoded| assert_eq!(decoded, orig.as_slice()));
+
+        // Pinning DXIL during PSO creation prevents release.
+        let pin = shader.pin_dxil();
+        assert_eq!(shader.release_dxil(), 0, "pinned DXIL must stay in RAM");
+        drop(pin);
+        // An aggressive policy may have released the blob as the pin dropped.
+        let original_dxil = shader.dxil().expect("DXIL available for explicit trim").to_vec();
+
+        let kept_before = KEPT[3].load(Relaxed);
+        let dropped_before = crate::ram_trim::COUNTERS
+            .shader_dxil_dropped_bytes
+            .load(Relaxed);
+        assert_eq!(shader.release_dxil(), dxil_len);
+        assert!(KEPT[3].load(Relaxed) <= kept_before.saturating_sub(dxil_len));
+        assert!(
+            crate::ram_trim::COUNTERS
+                .shader_dxil_dropped_bytes
+                .load(Relaxed)
+                >= dropped_before + dxil_len
+        );
+
+        // A second PSO later requesting DXIL transparently reloads identical bytes.
+        let reloaded_before = crate::ram_trim::COUNTERS
+            .shader_dxil_reloaded_bytes
+            .load(Relaxed);
+        let dxil_again = shader.dxil().expect("DXIL reloads after drop + compression");
+        assert_eq!(&*dxil_again, original_dxil.as_slice());
+        assert!(
+            crate::ram_trim::COUNTERS
+                .shader_dxil_reloaded_bytes
+                .load(Relaxed)
+                >= reloaded_before + dxil_len
+        );
+        drop(dxil_again);
+        let _ = shader.release_dxil();
+    }
+
+    #[test]
+    fn graphics_shader_compresses_and_reloads_dxil_without_builder_classification() {
+        let orig = minimal_stage_container(0x30, 64 << 10);
+        let shader = super::shader("pixel", &orig);
+
+        // Translation is enough; graphics shaders never need the builder classification.
+        let translated = shader.translated().expect("minimal PS translates");
+        assert_eq!(translated.livery.load(Relaxed), 0);
+        assert!(!crate::livery::reads_decals(&translated.used, &translated.livery));
+        assert!(shader.builder_spilled.get().is_none());
+
+        let dxil_len = shader.dxil().expect("PS DXIL available").len() as u64;
+        assert!(dxil_len > 0);
+        assert_eq!(shader.release_dxil(), dxil_len);
+
+        let saved = shader.compress_container_if_ready();
+        assert!(saved > (60 << 10), "graphics shader container must compress (saved={saved})");
+        let dxil_reloaded = shader.dxil().expect("PS DXIL reloads from compressed container");
+        assert_eq!(dxil_reloaded.len() as u64, dxil_len);
+        assert_eq!(shader.translated().unwrap().livery.load(Relaxed), 1);
+        drop(dxil_reloaded);
+        let _ = shader.release_dxil();
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 device (hardware or WARP)"]
+    fn host_compute_pso_rebuilds_after_shader_trim() {
+        use crate::ram_trim::{GIB, TrimPolicy};
+
+        crate::host::host().expect("a D3D12 device is required for this test");
+        let bytes = minimal_stage_container(0x60, 96 << 10);
+        let shader = super::shader("compute", &bytes);
+        let stages = std::slice::from_ref(&shader);
+        drop(host::HostPipeline::new(stages, None).expect("first compute PSO"));
+        let translated = shader.translated().expect("compute shader metadata");
+
+        let policy = TrimPolicy::for_host(true, 16 * GIB, GIB, GIB);
+        trim_shaders_with(&policy, crate::host::now_ms());
+        assert!(translated.dxil.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(matches!(
+            &*shader.container.lock().unwrap_or_else(|e| e.into_inner()),
+            ContainerBlob::Compressed { .. }
+        ));
+        let reloaded_before = crate::ram_trim::COUNTERS.shader_dxil_reloaded_bytes.load(Relaxed);
+        drop(host::HostPipeline::new(stages, None).expect("compute PSO after trim"));
+        assert!(crate::ram_trim::COUNTERS.shader_dxil_reloaded_bytes.load(Relaxed) > reloaded_before);
     }
 }
