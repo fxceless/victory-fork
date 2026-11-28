@@ -214,10 +214,18 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     let w = word(0)?;
     let (encoding, opcode, len) = if w >> 31 == 0 {
         let src0 = w & 0x1FF;
+        let vop1_opcode = (w >> 9) & 0xFF;
+        // VOP1 opcodes that take no source: the 9-bit field is a shader hash,
+        // not a source operand (v_nop, v_pipeflush, v_clrexcp).
+        let vop1_no_src = matches!(vop1_opcode, 0x00 | 0x1B | 0x41);
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
-        let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
+        let extra = if vop1_no_src {
+            0
+        } else {
+            usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA))
+        };
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => (Encoding::Vop1, vop1_opcode, 1 + extra),
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -518,5 +526,34 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn vop1_without_operands_has_no_extension_word() {
+        // v_nop (0x000), v_pipeflush (0x01B), v_clrexcp (0x041): the 9-bit field
+        // is a shader hash, not a source operand. It must not consume an extra
+        // dword even when the hash looks like a literal (0xFF), SDWA (0xF9/0xFA),
+        // DPP16 (0xE9) or DPP8 (0xEA).
+        let s_endpgm = 0xBF81_0000;
+        // Encode: VOP1 = top bits 0x3F, opcode in bits 16:9, src0 in bits 8:0.
+        // v_nop (opcode 0x00) with hash 0xFF: 0x3F << 25 | 0x00 << 9 | 0xFF = 0x7E00_00FF
+        // v_pipeflush (opcode 0x1B) with hash 0xE9: 0x3F << 25 | 0x1B << 9 | 0xE9 = 0x7E00_36E9
+        // v_clrexcp (opcode 0x41) with hash 0xFA: 0x3F << 25 | 0x41 << 9 | 0xFA = 0x7E00_82FA
+        let code = bytes(&[
+            0x7E00_00FF, // v_nop hash 0xFF
+            0x7E00_36E9, // v_pipeflush hash 0xE9 (DPP16)
+            0x7E00_82FA, // v_clrexcp hash 0xFA (SDWA)
+            s_endpgm,
+        ]);
+        let decoded = decode(&code).unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[0].name(), Some("v_nop"));
+        assert_eq!(decoded[0].words.len(), 1);
+        assert_eq!(decoded[1].name(), Some("v_pipeflush"));
+        assert_eq!(decoded[1].words.len(), 1);
+        assert_eq!(decoded[2].name(), Some("v_clrexcp"));
+        assert_eq!(decoded[2].words.len(), 1);
+        assert_eq!(decoded[3].name(), Some("s_endpgm"));
+        assert_eq!(decoded[3].offset, 12); // next instruction still at offset 12 (3 * 4)
     }
 }
