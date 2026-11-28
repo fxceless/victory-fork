@@ -1,0 +1,89 @@
+name: Build App (Windows Host)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip-debug-build:
+        type: boolean
+        default: false
+      skip-diag-build:
+        type: boolean
+        default: false
+
+env: 
+  CARGO_TERM_COLOR: always
+
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static -C target-feature=+avx2"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare Build
+    runs-on: ubuntu-slim
+    permissions: {}
+    outputs:
+      build_profiles: ${{ steps.set-build-profile-matrix.outputs.BUILD_PROFILES }}
+    steps:
+      - id: set-build-profile-matrix
+        run: |
+          BUILD_PROFILES="[]"
+          BUILD_PROFILES=$(jq -c '. + ["release"]' <<< "$BUILD_PROFILES")
+          if [[ "${{ inputs.skip-debug-build }}" == "false" ]]; then
+            BUILD_PROFILES=$(jq -c '. + ["debug"]' <<< "$BUILD_PROFILES")
+          fi
+          if [[ "${{ inputs.skip-diag-build }}" == "false" ]]; then
+            BUILD_PROFILES=$(jq -c '. + ["diag"]' <<< "$BUILD_PROFILES")
+          fi
+          jq 'if length == 0 then error("array is empty") else . end' <<< "$BUILD_PROFILES"
+          echo "BUILD_PROFILES=$BUILD_PROFILES" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build App
+    runs-on: windows-latest
+    needs: prepare
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+        profile: ${{ fromJSON(needs.prepare.outputs.build_profiles) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          build-warnings: warn
+          target: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo build --locked --release --target ${{ matrix.target }} -p victory
+          elif [ "${{ matrix.profile }}" = "diag" ]; then
+            cargo build --locked --profile diag --target ${{ matrix.target }} -p victory --features diagnostics
+          elif [ "${{ matrix.profile }}" = "debug" ]; then
+            cargo build --locked --target ${{ matrix.target }} -p victory
+          else
+            echo "Unknown build profile! ${{ matrix.profile }}"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # 7.0.2
+        with:
+          name: victory-${{ matrix.profile }}-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/victory.exe
+            target/${{ matrix.target }}/diag/victory.exe
+            target/${{ matrix.target }}/debug/victory.exe
+            victory.example.toml
+          compression-level: 9
+          if-no-files-found: error
