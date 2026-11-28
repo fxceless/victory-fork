@@ -1369,6 +1369,88 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
+/// SOP1 `op sdst, ssrc0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
+#[test]
+fn scalar_64_bit_operations_match_the_rdna2_definitions() {
+    // The pair s[0:1] and s[2:3] as 64-bit operands (and s2 as a count), the
+    // result in s[6:7], read back as the low and then the high dword.
+    #[allow(clippy::type_complexity)]
+    let operations: &[(&str, u32, fn(u64, u64) -> u64)] = &[
+        ("s_and_b64", sop2(0x0f, 6, 0, 2), |a, b| a & b),
+        ("s_or_b64", sop2(0x11, 6, 0, 2), |a, b| a | b),
+        ("s_xor_b64", sop2(0x13, 6, 0, 2), |a, b| a ^ b),
+        ("s_andn2_b64", sop2(0x15, 6, 0, 2), |a, b| a & !b),
+        ("s_orn2_b64", sop2(0x17, 6, 0, 2), |a, b| a | !b),
+        ("s_nand_b64", sop2(0x19, 6, 0, 2), |a, b| !(a & b)),
+        ("s_nor_b64", sop2(0x1b, 6, 0, 2), |a, b| !(a | b)),
+        ("s_xnor_b64", sop2(0x1d, 6, 0, 2), |a, b| !(a ^ b)),
+        // The shift count is the low six bits of the second operand's low dword.
+        ("s_lshl_b64", sop2(0x1f, 6, 0, 2), |a, b| a << (b & 63)),
+        ("s_lshr_b64", sop2(0x21, 6, 0, 2), |a, b| a >> (b & 63)),
+        ("s_ashr_i64", sop2(0x23, 6, 0, 2), |a, b| {
+            ((a as i64) >> (b & 63)) as u64
+        }),
+        ("s_not_b64", sop1(0x08, 6, 0), |a, _| !a),
+        ("s_brev_b64", sop1(0x0c, 6, 0), |a, _| a.reverse_bits()),
+        // Counts and finds: one dword in s6 (-1 for none), the high one unused.
+        ("s_bcnt1_i32_b64", sop1(0x10, 6, 0), |a, _| u64::from(a.count_ones())),
+        ("s_ff1_i32_b64", sop1(0x14, 6, 0), |a, _| {
+            if a == 0 {
+                0xffff_ffff
+            } else {
+                u64::from(a.trailing_zeros())
+            }
+        }),
+    ];
+    let halves = [0u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x1234_5678];
+    let mut cases = Vec::new();
+    for &a_lo in &halves {
+        for &a_hi in &halves {
+            for &(b_lo, b_hi) in &[
+                (0u32, 0u32),
+                (1, 0),
+                (33, 7),
+                (63, 0xffff_ffff),
+                (0xffff_ffc1, 0x8000_0000),
+            ] {
+                cases.push([a_lo, a_hi, b_lo, b_hi]);
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for &(name, word, reference) in operations {
+        let low = build_valu_cs(&[word, vop1(0x001, 0, sgpr(6))]);
+        let high = build_valu_cs(&[word, vop1(0x001, 0, sgpr(7))]);
+        // The counts and finds write one dword.
+        let one_dword = name.contains("_i32_b64");
+        for (half, shader) in [("low", &low), ("high", &high)] {
+            if one_dword && half == "high" {
+                continue;
+            }
+            run_cases(shader, &cases, |backend, _, inp, got| {
+                let a = u64::from(inp[1]) << 32 | u64::from(inp[0]);
+                let b = u64::from(inp[3]) << 32 | u64::from(inp[2]);
+                let want = reference(a, b);
+                let want = if half == "low" {
+                    want as u32
+                } else {
+                    (want >> 32) as u32
+                };
+                if got != want && failures.len() < 40 {
+                    failures.push(format!(
+                        "{backend}: {name}({a:#x}, {b:#x}) {half} dword = {got:#x}, want {want:#x}"
+                    ));
+                }
+            });
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn f16_omod_applies_before_clamp() {
     // VOP3 v_add_f16 (0x132 = 0x100 + VOP2 0x32): v0 = (v1 + v2) * omod [clamp]

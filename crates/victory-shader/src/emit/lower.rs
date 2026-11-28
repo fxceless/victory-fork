@@ -6655,6 +6655,17 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_brev_b64" => {
+                    // Bit i of the pair goes to bit 63 - i: each half reversed,
+                    // the halves swapped.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ra = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let rb = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
