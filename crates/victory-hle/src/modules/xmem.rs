@@ -954,6 +954,9 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 /// whole pages: the title packs several small textures into one page and
 /// fills each with a request of its own.
 pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
     let Some(end) = offset.checked_add(len) else {
         return Vec::new();
     };
@@ -980,7 +983,9 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for (at, bytes) in pieces {
         match runs.last_mut() {
-            Some((start, n)) if *start + *n == at => *n += bytes,
+            Some((start, n)) if at <= start.saturating_add(*n) => {
+                *n = start.saturating_add(*n).max(at.saturating_add(bytes)) - *start;
+            }
             _ => runs.push((at, bytes)),
         }
     }
@@ -3767,5 +3772,38 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn shown_at_handles_empty_len_and_duplicate_or_overlapping_pages() {
+        let pages = allocate(1);
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        // Map the same physical page at two adjacent virtual pages.
+        let dup = [pages[0], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(at, 2, dup.as_ptr()), at);
+        let base = at as usize;
+
+        // Zero-length requests never emit a spurious empty run, even unaligned.
+        assert!(shown_at(&dup, 0, 0).is_empty());
+        assert!(shown_at(&dup, 0x4000, 0).is_empty());
+
+        // Duplicate physical pages in `pages` coalesce into one clean run.
+        assert_eq!(shown_at(&dup, 0, 2 * PAGE), vec![(base, 2 * PAGE)]);
+
+        // Partial overlapping slices on the same physical page coalesce cleanly.
+        assert_eq!(
+            shown_at(&dup, 0x1000, PAGE + 0x2000),
+            vec![(base, 2 * PAGE)]
+        );
+
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }
