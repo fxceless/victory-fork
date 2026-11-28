@@ -15,6 +15,10 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// The queue test draws and dispatches go through, made by the first:
+    /// making one each time costs tens of milliseconds on a hardware adapter.
+    #[cfg(test)]
+    queue: std::cell::OnceCell<ID3D12CommandQueue>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -119,7 +123,11 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                #[cfg(test)]
+                queue: std::cell::OnceCell::new(),
+            })
         }
     }
 
@@ -662,12 +670,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // are kept alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1043,6 +1046,22 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// The direct queue test work goes through (made on first use).
+    fn queue(&self) -> Result<&ID3D12CommandQueue, String> {
+        if let Some(q) = self.queue.get() {
+            return Ok(q);
+        }
+        // SAFETY: a D3D12 call with a description that outlives it.
+        let q: ID3D12CommandQueue = unsafe {
+            self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }
+        .map_err(err)?;
+        Ok(self.queue.get_or_init(|| q))
+    }
+
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
     pub fn dispatch(
@@ -1055,12 +1074,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
