@@ -5643,6 +5643,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
+        #[allow(
+            clippy::collapsible_match,
+            reason = "diagnostics builds note every target first"
+        )]
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);

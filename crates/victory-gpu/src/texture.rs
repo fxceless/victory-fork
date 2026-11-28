@@ -594,8 +594,11 @@ pub(crate) fn host_written(resource: This) {
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, HostWritten>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+/// Bytes, description words 4, 6, 7 and 8, and the host resource.
+type HostWritten = (u64, u32, u32, u32, u32, usize);
 
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host

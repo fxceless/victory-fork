@@ -345,8 +345,8 @@ fn unspill(
         read.push(from);
     }
     let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
-    for reg in 0..256 {
-        let Some(last) = other[reg] else { continue };
+    for (reg, &last) in other.iter().enumerate() {
+        let Some(last) = last else { continue };
         let of = |p: &Option<(bool, u8, u8, u32)>| p.filter(|p| usize::from(p.1) == reg);
         let first = parks.iter().position(|p| of(p).is_some_and(|p| p.0));
         let late = first.is_some_and(|first| {
@@ -471,9 +471,9 @@ fn unspill(
             }
         } else {
             let mut of: HashMap<(u8, u32), usize> = HashMap::new();
-            for i in 0..list.len() {
+            for (i, first) in first.iter_mut().enumerate() {
                 if let Some(s) = slot(i) {
-                    first[i] = *of.entry(s).or_insert(i);
+                    *first = *of.entry(s).or_insert(i);
                 }
             }
         }
@@ -490,7 +490,9 @@ fn unspill(
     };
     // The stores that move as pairs (lower, upper) and every store's code;
     // none if the spare codes do not suffice.
-    let plan = |split: bool| -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<u8>)> {
+    // (Per instruction its store, the pairs, every store's code.)
+    type Plan = (Vec<usize>, Vec<(usize, usize)>, Vec<u8>);
+    let plan = |split: bool| -> Option<Plan> {
         let (mut of, stores) = stores_of(split);
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         for (n, &(reg, lane)) in stores.iter().enumerate() {
@@ -585,7 +587,9 @@ fn unspill(
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
-    let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
+    // Per instruction: a move (wide, dst, src) in its place, or none (a nop).
+    type Move = (bool, u8, u8);
+    let mut edits: Vec<(usize, Option<Move>)> = Vec::new();
     for i in 0..list.len() {
         let Some((save, _, code, _)) = parks[i] else {
             continue;
@@ -933,11 +937,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool, loops_kept: bool) -> Option
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for b in 0..n {
-        let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+    for (b, block) in p.blocks.iter().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if !block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
         if ends(taken) || skipped(b, taken, not_taken).is_some() {

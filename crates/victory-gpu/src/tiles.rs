@@ -147,11 +147,15 @@ impl Heap {
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
+/// Tiles taken from the pool: the heap, its place in the pool and the runs
+/// (first tile, tiles).
+type Taken = (ID3D12Heap, usize, Vec<(u32, u32)>);
+
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
 /// heap is made when no heap has that many free.
-fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+fn take(device: &ID3D12Device, count: u32) -> Option<Taken> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
