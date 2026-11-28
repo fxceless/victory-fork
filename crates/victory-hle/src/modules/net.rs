@@ -181,7 +181,12 @@ fn resolvable(name: Option<String>) -> bool {
         Some(name)
             if !(name.is_empty()
                 || name.eq_ignore_ascii_case("localhost")
-                || name.parse::<IpAddr>().is_ok()) =>
+                || name
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(&name)
+                    .parse::<IpAddr>()
+                    .is_ok()) =>
         {
             once("network name lookup blocked", name);
             wsa_error(WSAHOST_NOT_FOUND);
@@ -517,12 +522,15 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     let host_bind = host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32);
     match socket_addr(name, len) {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
-        Some(a) if a.ip().is_unspecified() => {
+        Some(a) if a.ip().to_canonical().is_unspecified() => {
             once("network bind narrowed to loopback", a.to_string());
             // SAFETY: `socket_addr` checked `len` readable bytes.
             let mut local = unsafe { std::slice::from_raw_parts(name, len as usize) }.to_vec();
             match a {
                 SocketAddr::V4(_) => local[4..8].copy_from_slice(&[127, 0, 0, 1]),
+                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+                    local[20..24].copy_from_slice(&[127, 0, 0, 1]);
+                }
                 SocketAddr::V6(_) => local[23] = 1,
             }
             host_bind(s, local.as_ptr(), len)
@@ -899,6 +907,14 @@ mod tests {
         a
     }
 
+    fn v6(ip: [u8; 16], port: u16) -> [u8; 28] {
+        let mut a = [0u8; 28];
+        a[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[8..24].copy_from_slice(&ip);
+        a
+    }
+
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
@@ -1118,5 +1134,65 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn bind_ipv4_mapped_unspecified_narrows_to_loopback() {
+        // Ensure Winsock is initialized.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let setsockopt = host!(
+            "ws2_32.dll",
+            "setsockopt": extern "system" fn(Socket, i32, i32, *const u8, i32) -> i32
+        );
+        let getsockname = host!(
+            "ws2_32.dll",
+            "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32
+        );
+
+        struct Guard(Socket, extern "system" fn(Socket) -> i32);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                (self.1)(self.0);
+            }
+        }
+
+        let s = socket(i32::from(AF_INET6), 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+        let _guard = Guard(s, close);
+
+        const IPPROTO_IPV6: i32 = 41;
+        const IPV6_V6ONLY: i32 = 27;
+        let v6only = 0i32;
+        assert_eq!(
+            setsockopt(
+                s,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                (&raw const v6only).cast(),
+                4
+            ),
+            0
+        );
+
+        let mapped_any = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0];
+        let sa = v6(mapped_any, 0);
+        assert_eq!(bind(s, sa.as_ptr(), 28), 0);
+
+        let mut out = [0u8; 28];
+        let mut out_len = 28i32;
+        assert_eq!(getsockname(s, out.as_mut_ptr(), &mut out_len), 0);
+        let bound = socket_addr(out.as_ptr(), out_len).unwrap();
+        assert_eq!(
+            bound.ip(),
+            IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1))
+        );
+        assert_ne!(bound.port(), 0);
+    }
+
+    #[test]
+    fn resolvable_accepts_bracketed_ipv6_loopback() {
+        assert!(resolvable(Some("[::1]".into())));
     }
 }
