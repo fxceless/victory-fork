@@ -698,7 +698,7 @@ impl Rig {
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
-    fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+    pub(crate) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
             self.allocator.Reset()?;
@@ -716,7 +716,7 @@ impl Rig {
         }
     }
 
-    fn committed(&self, kind: D3D12_HEAP_TYPE, size: u64, state: D3D12_RESOURCE_STATES) -> windows::core::Result<ID3D12Resource> {
+    pub(crate) fn committed(&self, kind: D3D12_HEAP_TYPE, size: u64, state: D3D12_RESOURCE_STATES) -> windows::core::Result<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation.
