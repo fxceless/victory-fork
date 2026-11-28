@@ -22,7 +22,15 @@ impl Source<'_> {
     /// The container bytes; `None` if a packed record is corrupt.
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
+            Source::Raw { data, .. } => {
+                // Nothing past the container's own end: what follows belongs to
+                // whatever comes next in the file, and the runtime reads a
+                // container at its declared length, so the hash in a run's log
+                // (`hash=` in first bind, shader does not translate) is of those
+                // bytes, not of the slice the file was found in.
+                let size = Container::parse(data).ok()?.size();
+                Some(Cow::Borrowed(&data[..size]))
+            }
             Source::Packed(r) => r.unpack().map(Cow::Owned),
         }
     }
@@ -252,4 +260,55 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One part of four bytes, no DXIL: enough for `sources` to find.
+    fn container() -> Vec<u8> {
+        let mut bytes = b"DXBC".to_vec();
+        bytes.extend([0; 16]); // digest
+        bytes.extend(1u16.to_le_bytes()); // version
+        bytes.extend(0u16.to_le_bytes());
+        let total = 0x20 + 4 + 8 + 4; // header, part table, part header, data
+        bytes.extend((total as u32).to_le_bytes());
+        bytes.extend(1u32.to_le_bytes()); // one part
+        bytes.extend(((0x20 + 4) as u32).to_le_bytes()); // the part at its end
+        bytes.extend(b"HASH");
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend([9; 4]);
+        bytes
+    }
+
+    #[test]
+    fn a_container_and_its_copy_with_a_tail_hash_the_same() {
+        let standalone = container();
+        let mut file = standalone.clone();
+        file.extend_from_slice(b"harmless tail");
+        // The file holds one container; the standalone scan finds it alone.
+        let [only] = &sources(&file)[..] else {
+            panic!("{} containers", sources(&file).len())
+        };
+        let bytes = &standalone[..];
+        assert_eq!(only.bytes().as_deref(), Some(bytes));
+    }
+
+    /// A container whose declared length runs past its last part (padding
+    /// inside): the source is the declared length, which the next parse
+    /// reads back.
+    #[test]
+    fn a_container_with_room_after_its_last_part_keeps_it() {
+        let mut bytes = container();
+        let padded = 0x20 + 4 + 8 + 4 + 8; // the same, plus 8 bytes of room
+        bytes[0x18..0x1C].copy_from_slice(&(padded as u32).to_le_bytes());
+        bytes.resize(padded, 0);
+        let mut file = bytes.clone();
+        file.extend_from_slice(b"tail");
+        let [only] = &sources(&file)[..] else {
+            panic!("{} containers", sources(&file).len())
+        };
+        assert_eq!(only.bytes().as_deref().map(<[u8]>::len), Some(padded));
+    }
 }
