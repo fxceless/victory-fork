@@ -313,7 +313,11 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair || name.contains("cmpst") || name.contains("mskor") {
+                } else if pair
+                    || name.contains("cmpst")
+                    || name.contains("mskor")
+                    || name.contains("wrap")
+                {
                     2
                 } else {
                     1
@@ -402,7 +406,8 @@ impl Instruction {
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
-                    Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
+                    Encoding::Global => (!name.contains("addtid"))
+                        .then(|| vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.
                     _ => (saddr == NULL).then(|| vector(w1 & 0xFF, 1)),
                 };
@@ -826,5 +831,58 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
     } else {
         whole + 2 * derivs + packed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx10::decode;
+    use crate::ir::{self, Reg};
+
+    #[test]
+    fn ds_wrap_rtn_decodes_both_data_operands_and_global_addtid_has_no_vaddr() {
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        // ds_wrap_rtn_b32 v3, v0, v1, v2
+        let ds_wrap = [0xD8D0_0000u32, 0x0302_0100, S_ENDPGM];
+        let bytes: Vec<u8> = ds_wrap.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let insts = decode(&bytes).unwrap();
+        assert_eq!(insts[0].name(), Some("ds_wrap_rtn_b32"));
+        match insts[0].fields(false) {
+            Fields::Ds { dst, addr, data, .. } => {
+                assert_eq!(dst, Some(Operand::Vector { reg: 3, dwords: 1 }));
+                assert_eq!(addr, Some(Operand::Vector { reg: 0, dwords: 1 }));
+                assert_eq!(
+                    data,
+                    vec![
+                        Operand::Vector { reg: 1, dwords: 1 },
+                        Operand::Vector { reg: 2, dwords: 1 },
+                    ]
+                );
+            }
+            other => panic!("expected Fields::Ds, got {other:?}"),
+        }
+        let p = ir::build(&bytes, false, 16).unwrap();
+        assert!(p.blocks[0].insts[0].read(Reg::V(1)).is_some());
+        assert!(p.blocks[0].insts[0].read(Reg::V(2)).is_some());
+
+        // global_load_dword_addtid v3, s[4:5] and global_store_dword_addtid v2, s[4:5]
+        let addtid = [
+            0xDC58_8000u32,
+            0x0304_0000, // global_load_dword_addtid v3, s[4:5]
+            0xDC5C_8000,
+            0x0004_0200, // global_store_dword_addtid v2, s[4:5]
+            S_ENDPGM,
+        ];
+        let bytes: Vec<u8> = addtid.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let insts = decode(&bytes).unwrap();
+        assert_eq!(insts[0].name(), Some("global_load_dword_addtid"));
+        assert_eq!(insts[1].name(), Some("global_store_dword_addtid"));
+        assert!(matches!(insts[0].fields(false), Fields::Flat { addr: None, .. }));
+        assert!(matches!(insts[1].fields(false), Fields::Flat { addr: None, .. }));
+        let p = ir::build(&bytes, false, 16).unwrap();
+        // Neither instruction fabricates a read of v0.
+        assert!(p.blocks[0].insts[0].read(Reg::V(0)).is_none());
+        assert!(p.blocks[0].insts[1].read(Reg::V(0)).is_none());
     }
 }

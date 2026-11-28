@@ -187,7 +187,11 @@ impl Validator {
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
-            get_status(result, &mut status);
+            let hr = get_status(result, &mut status);
+            if hr < 0 {
+                release(result);
+                return Err(format!("GetStatus failed: {hr:#x}"));
+            }
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
@@ -196,7 +200,7 @@ impl Validator {
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
-                    let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
+                    let bytes = blob_bytes(ptr(errors), len(errors));
                     text = String::from_utf8_lossy(bytes)
                         .trim_end_matches('\0')
                         .trim()
@@ -213,9 +217,40 @@ impl Validator {
     }
 }
 
+/// Safely borrows `IDxcBlob` bytes without passing a null pointer to
+/// `slice::from_raw_parts` when the blob is empty.
+///
+/// # Safety
+/// If `p` is non-null and `n > 0`, `p` must be valid for reads of `n` bytes
+/// for the lifetime `'a`.
+unsafe fn blob_bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
+    if p.is_null() || n == 0 {
+        &[]
+    } else {
+        // SAFETY: forwarded from the caller.
+        unsafe { std::slice::from_raw_parts(p, n) }
+    }
+}
+
 impl Drop for Validator {
     fn drop(&mut self) {
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blob_bytes;
+
+    #[test]
+    fn blob_bytes_handles_null_or_empty_without_ub() {
+        // SAFETY: null pointer with zero or non-zero length returns an empty slice.
+        assert_eq!(unsafe { blob_bytes(std::ptr::null(), 0) }, &[]);
+        assert_eq!(unsafe { blob_bytes(std::ptr::null(), 16) }, &[]);
+        let data = b"error\0";
+        // SAFETY: `data` is readable for `data.len()` bytes.
+        assert_eq!(unsafe { blob_bytes(data.as_ptr(), 0) }, &[]);
+        assert_eq!(unsafe { blob_bytes(data.as_ptr(), data.len()) }, data);
     }
 }
