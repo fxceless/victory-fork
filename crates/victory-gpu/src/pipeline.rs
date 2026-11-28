@@ -791,6 +791,13 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// For crash reports (`victory_loader::note_on_crash`): the pipeline the
+/// faulting thread was making, e.g. when a driver's compiler faults.
+#[cfg(windows)]
+pub fn crash_note() -> String {
+    library::crash_note()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]

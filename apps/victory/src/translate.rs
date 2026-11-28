@@ -152,6 +152,69 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `VICTORY_TRANSLATE_SKIP_FILE=<file>[;<file>...]`: container hashes, one
+/// per line, left out as with `VICTORY_TRANSLATE_SKIP` (with
+/// `VICTORY_TRANSLATE_DONE_FILE`, a `--pipelines` run a driver's compiler
+/// ended goes on where it stopped).
+fn skipped_by_file(hash: &str) -> bool {
+    static SET: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP_FILE")
+            .unwrap_or_default()
+            .split(';')
+            .filter(|f| !f.is_empty())
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .map(|l| l.trim().to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .contains(hash)
+}
+
+/// `VICTORY_TRANSLATE_DONE_FILE=<file>`: a container's hash is appended
+/// when everything is done with it (dropped at any return; not when the
+/// process ends inside it).
+struct DoneMark<'a>(&'a str);
+
+impl Drop for DoneMark<'_> {
+    fn drop(&mut self) {
+        use std::io::Write;
+        static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+        let file = FILE.get_or_init(|| {
+            let path = std::env::var_os("VICTORY_TRANSLATE_DONE_FILE")?;
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(f))
+        });
+        if let Some(f) = file {
+            let _ = writeln!(lock(f), "{}", self.0);
+        }
+    }
+}
+
+thread_local! {
+    /// The program whose host pipeline this thread is making (`--pipelines`).
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// For crash reports, on the faulting thread: the program whose pipeline
+/// the driver was compiling.
+fn making_note() -> String {
+    MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .ok()
+        .filter(|m| !m.is_empty())
+        .map(|m| format!("making the host pipeline of {m}"))
+        .unwrap_or_default()
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -263,6 +326,9 @@ pub fn run(
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+        // A fault in the driver's compiler names the program it was given.
+        victory_loader::report_crashes();
+        victory_loader::note_on_crash(making_note);
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -482,6 +548,22 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // `VICTORY_TRANSLATE_SKIP=<hash prefix>,...`: those containers left out
+    // (e.g. the ones a driver's compiler faults on, to check the rest with
+    // `--pipelines`).
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if skip.iter().any(|s| hash.starts_with(s.as_str())) || skipped_by_file(&hash) {
+        return;
+    }
+    let _done = DoneMark(&hash);
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -709,12 +791,14 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        MAKING.with(|m| *m.borrow_mut() = label());
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
+        MAKING.with(|m| m.borrow_mut().clear());
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;

@@ -24,7 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{GetCurrentThreadId, GetCurrentThreadStackLimits};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -80,6 +80,29 @@ fn append_to_log(text: &str) {
     if let Ok(mut f) = opened {
         let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
     }
+}
+
+/// What other crates add to a crash report ([`note_on_crash`]).
+static NOTES: std::sync::Mutex<Vec<fn() -> String>> = std::sync::Mutex::new(Vec::new());
+
+/// Adds `note` to every crash report. It runs on the faulting thread, so it
+/// can say what that thread was doing (e.g. the pipeline a driver was
+/// compiling when it faulted); an empty string adds nothing. It must not
+/// block: the faulting thread may hold any lock.
+pub fn note_on_crash(note: fn() -> String) {
+    NOTES.lock().unwrap_or_else(|e| e.into_inner()).push(note);
+}
+
+/// The notes' lines; nothing if another thread is adding a note.
+fn notes() -> Vec<String> {
+    let Ok(notes) = NOTES.try_lock() else {
+        return Vec::new();
+    };
+    notes
+        .iter()
+        .map(|note| note())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// The title's last lines of debug output, kept for crash reports.
@@ -616,6 +639,14 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    // (Not `std::thread::current()`: it panics on a thread whose locals are
+    // gone, and this runs on any thread.)
+    // SAFETY: a plain query.
+    let thread = unsafe { GetCurrentThreadId() };
+    line(format!("  thread {thread}"));
+    for note in notes() {
+        line(format!("  {note}"));
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }

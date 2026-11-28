@@ -22,6 +22,12 @@ extern "system" fn create_device(
     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    // A crash in the driver's shader compiler names the pipeline it was given.
+    #[cfg(windows)]
+    {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| victory_loader::note_on_crash(victory_gpu::pipeline::crash_note));
+    }
     device::create(adapter, parameters, iid, out)
 }
 

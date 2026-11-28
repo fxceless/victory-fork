@@ -400,6 +400,28 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// `VICTORY_NO_HOST_PIPELINE=<shader hash>,...` (the 16 hex digits of
+/// "first bind"): a pipeline with one of these shaders gets no host
+/// pipeline, so its draws and dispatches are left out, as for a shader
+/// that does not translate. For shaders a host driver's compiler cannot
+/// take: on an RX 9070 XT (drivers 32.0.32015.16001 and 32.0.32029.2010)
+/// `amdxc64.dll` reads a null pointer while compiling two of the title's
+/// tree-animation compute programs (with every clean-up pass off too) and
+/// ends the process; `victory translate --pipelines` names such a shader
+/// in its crash report.
+fn no_host_pipeline(shaders: &[Arc<Shader>]) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        std::env::var("VICTORY_NO_HOST_PIPELINE")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !hashes.is_empty() && shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -418,6 +440,9 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        if no_host_pipeline(shaders) {
+            return refuse("one of its shaders is on VICTORY_NO_HOST_PIPELINE", shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

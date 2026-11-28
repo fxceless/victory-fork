@@ -311,6 +311,30 @@ pub(crate) fn label(text: String) {
     LABEL.with(|l| *l.borrow_mut() = text);
 }
 
+/// For a crash report, run on the faulting thread: the library call it is
+/// in (a driver compile is `make`) and its pipeline's shaders, else the
+/// pipeline it last named. Never blocks: the faulting thread may hold the
+/// list or be naming a pipeline.
+pub(crate) fn crash_note() -> String {
+    let thread = crate::host::thread_id();
+    if let Ok(calls) = CALLS.try_lock() {
+        let here: Vec<String> = calls
+            .iter()
+            .filter(|c| c.0 == thread)
+            .map(|c| format!("pipeline library call on this thread: {} {}", c.1, c.2))
+            .collect();
+        if !here.is_empty() {
+            return here.join("; ");
+        }
+    }
+    LABEL
+        .try_with(|l| l.try_borrow().map(|l| l.clone()).unwrap_or_default())
+        .ok()
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("the pipeline this thread last named (no library call running): {l}"))
+        .unwrap_or_default()
+}
+
 /// A library call of this thread, listed in [`CALLS`] until dropped.
 struct Call(u32, u64);
 
