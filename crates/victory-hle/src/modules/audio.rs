@@ -369,6 +369,111 @@ impl Xma {
 /// Written only when the context arrays are allocated or released.
 static XMA: RwLock<Xma> = RwLock::new(Xma::EMPTY);
 
+fn trace_audio_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_TRACE_AUDIO").ok().as_deref() == Some("1"))
+}
+
+#[derive(Default)]
+struct AudioLogVoice {
+    sub: u64,
+    bytes: usize,
+    hash: u64,
+    recent: VecDeque<u128>,
+}
+
+// t: Unix epoch milliseconds (UTC); rd/wr: output ring blocks.
+// sub counts input submissions (XMA enables), not read-advance commands.
+// bytes/hash describe the selected compressed input at submission; hash=0 if unavailable.
+// pending: valid compressed input bytes remaining (partial bytes rounded up);
+// queue: number of valid input buffers, not ACP commands or decoded PCM.
+// These are context snapshots, not playback counters. ACP completions are immediate.
+// Non-XMA commands use the ACP handle as voice and their known command payload.
+fn trace_audio(event: &str, key: usize, context: Option<Context>,
+    input: Option<(usize, u64)>, command: u32) {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LOG: Mutex<(BTreeMap<usize, AudioLogVoice>, u64, u128)> =
+        Mutex::new((BTreeMap::new(), 0, 0));
+    let mut log = lock(&LOG);
+    let t = START.get_or_init(Instant::now).elapsed().as_millis();
+    if t.saturating_sub(log.2) >= 5000 {
+        if log.1 != 0 { tracing::info!("audio: {} lines dropped", log.1); }
+        log.1 = 0;
+        log.2 = t;
+    }
+    let v = log.0.entry(key).or_default();
+    if let Some((bytes, hash)) = input {
+        v.sub = v.sub.saturating_add(1);
+        (v.bytes, v.hash) = (bytes, hash);
+    }
+    while v.recent.front().is_some_and(|at| t.saturating_sub(*at) >= 1000) {
+        v.recent.pop_front();
+    }
+    if v.recent.len() >= 4 {
+        log.1 = log.1.saturating_add(1);
+        return;
+    }
+    v.recent.push_back(t);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis();
+    let (pending, queue) = context.map_or((0, 0), |c| {
+        let valid = c.field(0, 20, 2);
+        let current = c.field(4, 31, 1) as usize;
+        let read_bits = c.field(2, 0, 26) as usize;
+        let pending = (0..2).filter(|i| valid & (1 << i) != 0).map(|i| {
+            let bits = c.field(i, 0, 12) as usize * xma::PACKET_BYTES * 8;
+            bits.saturating_sub(if i == current { read_bits } else { 0 }).div_ceil(8)
+        }).sum::<usize>();
+        (pending, valid.count_ones())
+    });
+    let (rd, wr) = context.map_or((0, 0), |c| (c.field(9, 0, 5), c.field(0, 27, 5)));
+    tracing::info!("audio: t={t} event={event} voice={key} sub={} bytes={} pending={pending} queue={queue} rd={rd} wr={wr} hash={:016x} done=immediate cmd={command}", v.sub, v.bytes, v.hash);
+}
+
+fn audio_hash(data: &[u8]) -> u64 {
+    data.iter().take(64).fold(0xcbf29ce484222325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+}
+
+fn trace_audio_command(this: *mut Acp, command: u32, word: impl Fn(usize) -> Option<u32>, event: &str) {
+    let event = if event == "submit" && matches!(command, DISABLE_XMA | DISABLE_XMAS | ADVANCE_XMA_READ) { "command" } else { event };
+    let x = xma();
+    let indices: Vec<u32> = match command {
+        ENABLE_XMA | DISABLE_XMA | ADVANCE_XMA_READ => vec![word(0).unwrap_or(u32::MAX)],
+        ENABLE_XMAS | DISABLE_XMAS => (0..x.voices.len() as u32)
+            .filter(|i| word(*i as usize / 32).unwrap_or(0) & (1 << (*i % 32)) != 0).collect(),
+        _ => vec![u32::MAX],
+    };
+    for index in indices {
+        let context = x.context(index);
+        let _slot = x.voices.get(index as usize).map(lock);
+        let input = if event == "submit" && matches!(command, ENABLE_XMA | ENABLE_XMAS) {
+            context.map(|c| {
+                let current = c.field(4, 31, 1) as usize;
+                let current = if c.field(0, 20, 2) & (1 << current) == 0 { 1 - current } else { current };
+                let bytes = c.field(current, 0, 12) as usize * xma::PACKET_BYTES;
+                let apu = c.get(5 + current) & !0x7ff;
+                let heap = lock(&HEAP);
+                let hash = (|| {
+                    let (&base, &host) = heap.by_apu.range(..=apu).next_back()?;
+                    let block = heap.blocks.get(&host)?;
+                    let offset = (apu - base) as usize;
+                    if offset.checked_add(bytes.min(64))? > block.size { return None; }
+                    // SAFETY: checked heap range; the heap lock prevents freeing during this read.
+                    let data = unsafe { std::slice::from_raw_parts((host + offset) as *const u8, bytes.min(64)) };
+                    Some(audio_hash(data))
+                })().unwrap_or(0);
+                (bytes, hash)
+            })
+        } else if event == "submit" && index == u32::MAX {
+            let bytes = match command { REGISTER_MESSAGES | UNREGISTER_MESSAGES => 4, LOAD_FLOWGRAPH => 8, _ => 0 };
+            let data: Vec<u8> = (0..bytes / 4).flat_map(|i| word(i).unwrap_or(0).to_le_bytes()).collect();
+            Some((bytes, audio_hash(&data)))
+        } else { None };
+        let key = if index == u32::MAX { this as usize } else { index as usize };
+        trace_audio(event, key, context, input, command);
+    }
+}
+
 fn xma() -> RwLockReadGuard<'static, Xma> {
     XMA.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -501,6 +606,9 @@ impl Xma {
                 (self.context(index), &mut *lock(&self.voices[index as usize]))
             {
                 pump(context, voice);
+                if trace_audio_enabled() {
+                    trace_audio("process", index as usize, Some(context), None, 0);
+                }
                 active += 1;
             }
         }
@@ -862,6 +970,9 @@ extern "system" fn submit(
         // SAFETY: the command's data starts with these u32 fields.
         (!data.is_null()).then(|| unsafe { data.cast::<u32>().add(at).read_unaligned() })
     };
+    if trace_audio_enabled() {
+        trace_audio_command(this, command, word, "submit");
+    }
     match command {
         REGISTER_MESSAGES => state.mask |= word(0).unwrap_or(0),
         UNREGISTER_MESSAGES => state.mask &= !word(0).unwrap_or(0),
@@ -887,6 +998,9 @@ extern "system" fn submit(
     {
         // SAFETY: a u32 in a heap block, which the title reads as volatile.
         unsafe { word.cast::<u32>().write_volatile(1) };
+    }
+    if trace_audio_enabled() {
+        trace_audio_command(this, command, word, "complete");
     }
     S_OK
 }
@@ -1426,5 +1540,35 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+}
+
+#[cfg(test)]
+mod audio_hash_tests {
+    use super::audio_hash;
+
+    #[test]
+    fn fnv1a_reference_vectors() {
+        // FNV-1a, 64-bit offset basis and prime: the published vectors.
+        assert_eq!(audio_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(audio_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(audio_hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn only_the_first_sixty_four_bytes_are_read() {
+        let mut a = vec![0u8; 64];
+        let mut b = vec![0u8; 64];
+        a.extend_from_slice(b"tail");
+        b.extend_from_slice(b"different tail");
+        assert_eq!(audio_hash(&a), audio_hash(&b));
+    }
+
+    #[test]
+    fn a_difference_inside_the_window_changes_the_hash() {
+        let a = vec![1u8; 64];
+        let mut b = a.clone();
+        b[63] = 2;
+        assert_ne!(audio_hash(&a), audio_hash(&b));
     }
 }
