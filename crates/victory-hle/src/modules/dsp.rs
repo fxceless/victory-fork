@@ -19,6 +19,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -48,19 +49,22 @@ pub struct StreamDesc {
     ir: *const f32,
 }
 
-/// The status block a stream's owner polls.
+/// The status block a stream's owner polls concurrently from title threads.
 #[repr(C)]
 pub struct Status {
-    submitted: u32,
-    completed: u32,
-    reserved: u32,
-    result: HRESULT,
+    submitted: AtomicU32,
+    completed: AtomicU32,
+    reserved: AtomicU32,
+    result: AtomicI32,
 }
+const _: () = assert!(size_of::<Status>() == 16);
+const _: () = assert!(align_of::<Status>() == 4);
 
 pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    submit: Mutex<()>,
     status: Box<Status>,
 }
 
@@ -168,11 +172,12 @@ pub extern "system" fn XDspActivate(
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        submit: Mutex::new(()),
         status: Box::new(Status {
-            submitted: 0,
-            completed: 0,
-            reserved: 0,
-            result: S_OK,
+            submitted: AtomicU32::new(0),
+            completed: AtomicU32::new(0),
+            reserved: AtomicU32::new(0),
+            result: AtomicI32::new(S_OK),
         }),
     });
     // SAFETY: checked non-null.
@@ -204,21 +209,22 @@ pub extern "system" fn XDspSubmitCommand(
     if stream.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a stream from `XDspActivate`, the title's command.
-    let (stream, command) = unsafe { (&mut *stream, &*command) };
+    // SAFETY: a stream from `XDspActivate`, the title's command. Shared
+    // references avoid `&mut` aliasing UB against title threads polling
+    // `stream.status` concurrently.
+    let (stream, command) = unsafe { (&*stream, &*command) };
     if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
+        let samples = (stream.frames as usize).saturating_mul(stream.channels as usize);
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
     }
-    let status = &mut *stream.status;
-    let next = status.submitted.wrapping_add(1);
-    // SAFETY: the status block is read by title code on other threads.
-    unsafe {
-        std::ptr::write_volatile(&mut status.submitted, next);
-        std::ptr::write_volatile(&mut status.result, S_OK);
-        std::ptr::write_volatile(&mut status.completed, next);
-    }
+    let _guard = stream.submit.lock().unwrap_or_else(|e| e.into_inner());
+    let next = stream.status.submitted.load(Ordering::Relaxed).wrapping_add(1);
+    stream.status.submitted.store(next, Ordering::Relaxed);
+    stream.status.result.store(S_OK, Ordering::Relaxed);
+    // Release pairs with title threads polling `completed`, publishing both
+    // the zeroed output buffer and `result` before the new ticket is visible.
+    stream.status.completed.store(next, Ordering::Release);
     if !ticket.is_null() {
         // SAFETY: optional out parameter.
         unsafe { ticket.write(next) };
@@ -282,7 +288,12 @@ mod tests {
         let mut ticket = 0;
         assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
         // SAFETY: the stream's status block.
-        let (completed, result) = unsafe { ((*status).completed, (*status).result) };
+        let (completed, result) = unsafe {
+            (
+                (*status).completed.load(Ordering::Acquire),
+                (*status).result.load(Ordering::Relaxed),
+            )
+        };
         assert_eq!((completed, result), (ticket, S_OK));
         assert!(output.iter().all(|&s| s == 0.0));
         assert_eq!(XDspDeactivate(stream), S_OK);
@@ -308,6 +319,104 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn concurrent_submissions_and_polling_are_monotonic_and_atomic() {
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                0x80,
+                2,
+                &mut dsp
+            ),
+            S_OK
+        );
+        let ir = vec![0f32; 0x400];
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x200,
+            channels: 1,
+            ir_floats: 0x400,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+
+        let stream_addr = stream as usize;
+        let status_addr = status as usize;
+        let total = 4u32 * 64;
+
+        let poller = std::thread::spawn(move || {
+            let st = status_addr as *const Status;
+            let mut last = 0u32;
+            loop {
+                // SAFETY: `status` stays live until after `poller.join()`.
+                let (done, res) = unsafe {
+                    (
+                        (*st).completed.load(Ordering::Acquire),
+                        (*st).result.load(Ordering::Relaxed),
+                    )
+                };
+                assert!(done >= last, "completed regressed: {done} < {last}");
+                assert_eq!(res, S_OK);
+                last = done;
+                if done == total {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        let submitters: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let s = stream_addr as *mut Stream;
+                    let input = vec![0.25f32; 0x200];
+                    let mut tickets = Vec::with_capacity(64);
+                    for _ in 0..64 {
+                        let mut output = vec![1.0f32; 0x200];
+                        let cmd = Command {
+                            gains: [1.0, 1.0],
+                            input: input.as_ptr(),
+                            output: output.as_mut_ptr(),
+                            reserved: 0,
+                        };
+                        let mut t = 0u32;
+                        assert_eq!(XDspSubmitCommand(s, &cmd, &mut t), S_OK);
+                        assert!(output.iter().all(|&v| v == 0.0));
+                        tickets.push(t);
+                    }
+                    tickets
+                })
+            })
+            .collect();
+
+        let mut all_tickets = Vec::with_capacity(total as usize);
+        for h in submitters {
+            all_tickets.extend(h.join().unwrap());
+        }
+        poller.join().unwrap();
+
+        all_tickets.sort_unstable();
+        let expected: Vec<u32> = (1..=total).collect();
+        assert_eq!(all_tickets, expected);
+        // SAFETY: `status` is still alive before deactivation.
+        let (submitted, completed) = unsafe {
+            (
+                (*status).submitted.load(Ordering::Acquire),
+                (*status).completed.load(Ordering::Acquire),
+            )
+        };
+        assert_eq!((submitted, completed), (total, total));
+
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
