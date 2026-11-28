@@ -14444,4 +14444,49 @@ mod tests {
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
+
+    #[test]
+    fn permlane16_sets_console_lanes_and_lowers_cleanly() {
+        // VOP3: v_permlane16_b32 (0x377) and v_permlanex16_b32 (0x378) v1, v0, 0, 0
+        for opcode in [0x377u32, 0x378u32] {
+            let w0 = 0xD400_0000 | (opcode << 16) | 1;
+            let w1 = 256 | (0x80 << 9) | (0x80 << 18);
+            let words = [w0, w1, S_ENDPGM];
+            for wave64 in [false, true] {
+                let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64,
+                    vgprs: 8,
+                    layout: vec![],
+                    used: vec![],
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: 0,
+                        threads: [8, 8, 1],
+                    }),
+                    code,
+                };
+                let p = ir::build(&native.code, wave64, 8).unwrap();
+                let st = structure::structure(&p).unwrap();
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                let io = io::raise(&p, &native).unwrap();
+                let lowered = lower(&Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: vec![],
+                    outputs: vec![],
+                    prims: vec![],
+                    mesh_stride: 0,
+                })
+                .expect("permlane16/x16 compute shader must lower with console_lanes");
+                assert!(
+                    !lowered.dxil.is_empty(),
+                    "opcode {opcode:#x} wave64={wave64}"
+                );
+            }
+        }
+    }
 }
