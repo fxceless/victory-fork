@@ -289,21 +289,45 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: every pass except wide loads (`831`).
 /// - `0`: none (the module as the lowering made it).
-/// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
-///   and identities, 4 one instruction for one value, 8 what a branch taken
-///   says about its condition, 16 one read for one place within a block,
-///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
-///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+/// - a number (decimal or `0x` hex): 1 dead code, 2 constant and algebraic
+///   folds, 4 reuse of equivalent instructions, 8 facts from branches,
+///   16 private store forwarding, shared load reuse and overwritten store
+///   removal, 32 first-lane reads without checking which half participates
+///   when all lanes are active, 64 wide loads (up to four dwords per call),
+///   256 pure loop-invariant code motion, 512 adjacent and bounded
+///   read-after-read barrier elimination. `895` enables all of these.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(all(test, windows))]
+    if let Some(passes) = TEST_SHADER_OPT.get() {
+        return passes & bitcode::opt::ALL;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Overrides the optimization mask for a test on this thread, restoring
+/// the previous mask even if the test panics.
+#[cfg(all(test, windows))]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.set(self.0);
+        }
+    }
+
+    let _reset = Reset(TEST_SHADER_OPT.replace(Some(passes)));
+    f()
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -386,16 +410,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// `VICTORY_SHADER_OPT`'s value; the default pass set when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parse_set(value, bitcode::opt::DEFAULT, bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1205,6 +1223,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -1333,12 +1352,15 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(all, 895, "all supported flags");
+        assert_eq!(usual, 831, "wide loads remain opt-in");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), 127, "legacy masks keep their meaning");
+        assert_eq!(parse_shader_opt(Some("128")), 0, "fast math remains disabled");
+        assert_eq!(parse_shader_opt(Some("895")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
@@ -1354,6 +1376,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1998,6 +2021,7 @@ mod tests {
     }
 
     /// A pixel program of `words` with no user data.
+    #[cfg(windows)]
     fn emit_native(words: &[u32], input_addr: u32) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Ps,
@@ -2232,10 +2256,10 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let _ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
-                v.validate(&mut ms.dxil.clone())
+                v.validate(&mut _ms.dxil.clone())
                     .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             }
         }
@@ -2700,6 +2724,9 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
