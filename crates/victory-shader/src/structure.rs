@@ -849,6 +849,62 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        // `active` promises that every lane outside `cond[b]` has bit 0 in the mask,
+        // so `waveActiveBallot` in block `b` equals the console's mask. Even if EXEC
+        // was temporarily widened inside `b` (e.g. `s_or_saveexec -1`), lanes not
+        // reaching `b` do not participate in `b`'s ballot.
+        let mut active_outside = HashSet::new();
+        for (&(lo, _), &m) in &self.masks {
+            if self.active.contains(&lo)
+                && let Some(&(b, _)) = self.defs.get(&lo)
+                && !self.b.implies(m, cond[b])
+            {
+                active_outside.insert(lo);
+            }
+        }
+        self.active.retain(|lo| !active_outside.contains(lo));
+        // `wave_any[b]` promises that a wave-wide `waveAnyTrue`/`waveAllTrue` over
+        // the lanes reaching `b` (`cond[b]`) matches the console's wave-wide branch.
+        // Drop it if a lane outside `cond[b]` can decide the branch.
+        for (b, slot) in self.wave_any.iter_mut().enumerate() {
+            let Some(any) = *slot else { continue };
+            if cond[b] == Bool::FALSE {
+                continue;
+            }
+            let Some(w) = self.when[b] else { continue };
+            let uniform = self
+                .b
+                .support(w)
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(_)));
+            if uniform {
+                continue;
+            }
+            let set_bit = if any { w } else { self.b.not(w) };
+            if !self.b.implies(set_bit, cond[b]) {
+                *slot = None;
+            }
+        }
+        // `scc_some` is lowered via `waveAnyTrue` in the defining block `b`, so
+        // only masks guaranteed 0 outside `cond[b]` (or uniform across all lanes)
+        // match hardware SCC.
+        let scc_some = self
+            .scc_lane
+            .iter()
+            .filter(|&(&scc, &m)| {
+                !self.scc_every.contains(&scc)
+                    && (self
+                        .defs
+                        .get(&scc)
+                        .is_none_or(|&(b, _)| self.b.implies(m, cond[b]))
+                        || self
+                            .b
+                            .support(m)
+                            .iter()
+                            .all(|a| matches!(a, Atom::Uniform(_))))
+            })
+            .map(|(&scc, &m)| (scc, m))
+            .collect();
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -861,12 +917,7 @@ impl<'a> Lanes<'a> {
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
-            scc_some: self
-                .scc_lane
-                .iter()
-                .filter(|(scc, _)| !self.scc_every.contains(scc))
-                .map(|(&scc, &m)| (scc, m))
-                .collect(),
+            scc_some,
             phi_masks,
             bools: self.b,
             exits,
@@ -1344,11 +1395,10 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    vcc
                 } else {
-                    self.b.not(any)
+                    self.b.not(vcc)
                 }
             }
             n => {
@@ -1886,5 +1936,73 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn scc_some_and_active_require_mask_zero_outside_block_reach() {
+        // Inside a divergent branch (`v_cmp_eq_u32` + `s_and_saveexec_b32` + `s_cbranch_execz`):
+        // - `s_not_b32 s2, exec_lo` sets bits in lanes outside `cond[b]`, so its SCC must NOT
+        //   be exported in `scc_some` (waveAnyTrue in `b` would miss those lanes) and `s2` is
+        //   not in `active`; a branch on that SCC must also clear `wave_any[b]`.
+        // - `s_cmp_lg_u32 exec_lo, -1` likewise has set bits outside `cond[b]`, so its SCC must
+        //   NOT be exported in `scc_some`.
+        // - `s_and_b32 s3, exec_lo, vcc_lo` implies `cond[b]`, so its SCC IS exported in
+        //   `scc_some` and `s3` IS in `active`.
+        // - `s_or_saveexec_b32 s5, -1` widens EXEC to all lanes inside `b`, so its written EXEC
+        //   must NOT be in `active`.
+        let p = build(
+            &[
+                0x7D84_0080, // 0: v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE84_3C6A, // 4: s_and_saveexec_b32 s4, vcc_lo
+                0xBF88_0005, // 8: s_cbranch_execz -> 32
+                0x8703_6A7E, // 12: s_and_b32 s3, exec_lo, vcc_lo (active-only)
+                0xBF07_C17E, // 16: s_cmp_lg_u32 exec_lo, -1 (1 outside cond[b])
+                0xBE82_077E, // 20: s_not_b32 s2, exec_lo (1 outside cond[b])
+                0xBF85_0001, // 24: s_cbranch_scc1 -> 32
+                0xBE85_3DC1, // 28: s_or_saveexec_b32 s5, -1 (widens EXEC inside divergent b)
+                0xBEFE_0304, // 32: s_mov_b32 exec_lo, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let b_div = p.blocks.iter().position(|b| b.offset == 12).unwrap();
+        let b_widen = p.blocks.iter().position(|b| b.offset == 28).unwrap();
+        let and_inst = &p.blocks[b_div].insts[0];
+        let cmp_inst = &p.blocks[b_div].insts[1];
+        let not_inst = &p.blocks[b_div].insts[2];
+        let widen_inst = &p.blocks[b_widen].insts[0];
+        assert_eq!(and_inst.name(), "s_and_b32");
+        assert_eq!(cmp_inst.name(), "s_cmp_lg_u32");
+        assert_eq!(not_inst.name(), "s_not_b32");
+        assert_eq!(widen_inst.name(), "s_or_saveexec_b32");
+
+        // Active-only `s_and_b32` stays in `scc_some` and `active`.
+        assert!(s.scc_some.contains_key(&and_inst.write(Reg::Scc).unwrap()));
+        assert!(s.active.contains(&and_inst.write(Reg::S(3)).unwrap()));
+
+        // Non-active-only `s_cmp_lg_u32` and `s_not_b32` are excluded from `scc_some`,
+        // `s_not_b32` dst is not in `active`, and the branch on its SCC clears `wave_any`.
+        assert!(!s.scc_some.contains_key(&cmp_inst.write(Reg::Scc).unwrap()));
+        assert!(!s.scc_some.contains_key(&not_inst.write(Reg::Scc).unwrap()));
+        assert!(!s.active.contains(&not_inst.write(Reg::S(2)).unwrap()));
+        assert_eq!(s.wave_any[b_div], None);
+
+        // Widened EXEC inside a divergent block is not in `active`.
+        assert!(!s.active.contains(&widen_inst.write(Reg::S(EXEC)).unwrap()));
+
+        // At top-level (`cond[0] == TRUE`), every lane runs block 0 so `s_not_b32` SCC IS valid.
+        let top = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE82_076A, // s_not_b32 s2, vcc_lo
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let st_top = structure(&top).unwrap();
+        let top_not = &top.blocks[0].insts[1];
+        assert_eq!(top_not.name(), "s_not_b32");
+        assert!(st_top.scc_some.contains_key(&top_not.write(Reg::Scc).unwrap()));
     }
 }
