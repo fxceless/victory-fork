@@ -2701,8 +2701,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Two records of 32,768 x 32 groups: half the budget each, exactly,
+        // so the two spend all of it whether or not a record that does not
+        // fit takes the rest (`rest`, off by default).
+        let Some((big, big_ptr)) = host.shared_buffer(2 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2713,8 +2715,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            for i in 0..2 {
+                let words = [32768u32, 32, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2728,7 +2730,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 2)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -2744,8 +2746,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // The small record comes after the big ones spent the budget:
-            // it runs empty, in every round alike (none carries over).
+            // The two half-budget records spend all of it in either mode:
+            // the small record that follows runs only when the next
+            // submission starts empty, every round alike.
             assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
         }
         // A recording with only the small record: the budget is empty
@@ -3157,7 +3160,14 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        for take_rest in [false, true] {
+            batch_charges_every_execution(&mut warp, take_rest);
+        }
+    }
+
+    fn batch_charges_every_execution(warp: &mut WarpHarness, take_rest: bool) {
+        let source = batch::SOURCE.replace("REST ?", if take_rest { "true ?" } else { "false ?" });
+        let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
@@ -3197,7 +3207,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let cost = (1 << 26) * times;
+            let expected = if cost > BUDGET && !take_rest { 0 } else { BUDGET.min(cost * records as u32) };
+            assert_eq!(spent, expected, "REST={take_rest}, {times} times {records}");
         }
     }
 
