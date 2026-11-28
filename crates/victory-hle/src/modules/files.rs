@@ -135,10 +135,39 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
             _ => parts.push(part),
         }
     }
-    for part in parts {
-        out.push(backslash);
-        out.extend_from_slice(part);
+    if parts.is_empty() {
+        if out.last() == Some(&u16::from(b':')) {
+            out.push(backslash);
+        }
+    } else {
+        for part in parts {
+            out.push(backslash);
+            out.extend_from_slice(part);
+        }
     }
+    out
+}
+
+/// Rewrites `tail` (after `X:`) against a mounted host `root` (and optional
+/// `\\?\` `prefix`), returning a NUL-terminated UTF-16 path.
+fn rewrite(root: &[u16], prefix: &[u16], tail: &[u16]) -> Vec<u16> {
+    if !prefix.is_empty() || root.starts_with(&VERBATIM) || root.len() + tail.len() >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return out;
+    }
+    let mut out = root.to_vec();
+    let root_has_sep = root.last().is_some_and(|c| SEPARATORS.contains(c));
+    let tail_has_sep = tail.first().is_some_and(|c| SEPARATORS.contains(c));
+    match (root_has_sep, tail_has_sep) {
+        (true, true) => out.extend_from_slice(&tail[1..]),
+        (false, false) => {
+            out.push(b'\\'.into());
+            out.extend_from_slice(tail);
+        }
+        _ => out.extend_from_slice(tail),
+    }
+    out.push(0);
     out
 }
 
@@ -160,27 +189,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
-        let mut out = verbatim(root, tail);
-        out.push(0);
-        return Some(out);
-    }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
-        }
-    }));
-    out.push(0);
-    Some(out)
+    Some(rewrite(root, prefix, tail))
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
@@ -1016,5 +1025,38 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn rewrite_handles_drive_roots_unc_roots_and_verbatim_paths() {
+        let u16s = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let show = |root: &str, prefix: &str, tail: &str| {
+            let out = rewrite(&u16s(root), &u16s(prefix), &u16s(tail));
+            assert_eq!(out.last(), Some(&0));
+            String::from_utf16_lossy(&out[..out.len() - 1])
+        };
+
+        // Drive root host folder: no double backslashes in normal or verbatim form.
+        assert_eq!(show(r"D:\", "", r"\data\a.bin"), r"D:\data\a.bin");
+        assert_eq!(show(r"D:\", "", "a.bin"), r"D:\a.bin");
+        assert_eq!(show(r"D:\", "", ""), r"D:\");
+        assert_eq!(show(r"D:\", r"\\?\", r"\data\a.bin"), r"\\?\D:\data\a.bin");
+        // Verbatim drive root must keep its trailing backslash (not bare volume `\\?\D:`).
+        assert_eq!(show(r"D:\", r"\\?\", r"\"), r"\\?\D:\");
+        assert_eq!(show(r"D:\", r"\\?\", ""), r"\\?\D:\");
+        assert_eq!(show(r"D:\", r"\\?\", r"\sub\.."), r"\\?\D:\");
+
+        // UNC host root with verbatim prefix becomes `\\?\UNC\...` (never `\\?\\\...`).
+        assert_eq!(
+            show(r"\\server\share", r"\\?\", r"\a/b.bin"),
+            r"\\?\UNC\server\share\a\b.bin"
+        );
+
+        // Already-verbatim host root must not duplicate `\\?\` and normalizes `/`.
+        assert_eq!(
+            show(r"\\?\C:\game", r"\\?\", r"\a/b.bin"),
+            r"\\?\C:\game\a\b.bin"
+        );
+        assert_eq!(show(r"\\?\C:\game", "", r"/a/b.bin"), r"\\?\C:\game\a\b.bin");
     }
 }
