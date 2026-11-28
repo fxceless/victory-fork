@@ -340,14 +340,15 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let file = entry.file_name();
+            let Some(blob) = file.to_str().and_then(decode) else {
+                continue;
+            };
+            blobs.push((blob, std::fs::read(entry.path()).ok()?));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -1210,6 +1211,93 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_legacy_blob_leaves_old_layout_for_retry() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        std::fs::write(old.join("Header"), b"header").unwrap();
+        std::fs::write(old.join("Data.new"), b"half").unwrap();
+        std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("Header"))
+            .unwrap();
+        assert!(std::fs::read(old.join("Header")).is_err());
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(old.exists(), "legacy directory must remain for retry");
+        assert!(old.join("Data").exists());
+        assert!(old.join("Header").exists());
+        assert!(
+            current_named(&c.dir, "Player").unwrap().is_none(),
+            "partial migration must not commit"
+        );
+
+        drop(lock);
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(!old.exists());
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("Data".into(), b"data".to_vec()),
+                ("Header".into(), b"header".to_vec()),
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[test]
+    fn unreadable_legacy_blob_entry_blocks_migration_without_display() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(old.join("Header")).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        std::fs::write(old.join("unrelated.tmp"), b"ignored").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(old.exists(), "legacy directory must remain for retry");
+        assert!(
+            current_named(&c.dir, "Player").unwrap().is_none(),
+            "partial migration must not commit"
+        );
+
+        std::fs::remove_dir(old.join("Header")).unwrap();
+        std::fs::write(old.join("Header"), b"header").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(!old.exists());
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("Data".into(), b"data".to_vec()),
+                ("Header".into(), b"header".to_vec()),
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!((v.number, v.display.as_str()), (1, ""));
     }
 
     /// An empty configuration id names none. As a folder name it would be
