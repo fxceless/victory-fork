@@ -340,15 +340,17 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
-        blobs.sort();
+        let blobs = match legacy_blobs(old) {
+            Ok(blobs) => blobs,
+            Err(e) => {
+                tracing::warn!(
+                    container = name,
+                    error = %e,
+                    "game save of the old layout not moved; it is kept and tried again later"
+                );
+                return None;
+            }
+        };
         let sources: Vec<_> = blobs
             .iter()
             .map(|(n, d)| (n.as_str(), Source::Data(d)))
@@ -358,6 +360,23 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     std::fs::remove_dir_all(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
+}
+
+/// Every blob of a container in the old layout, sorted by name. Files whose
+/// names are not encoded blob names are skipped; any other failure (a
+/// folder entry or a blob that cannot be read) is an error, so a migration
+/// never commits a container with a blob missing and then deletes it (#242).
+fn legacy_blobs(old: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut blobs = Vec::new();
+    for entry in std::fs::read_dir(old)? {
+        let entry = entry?;
+        let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+            continue;
+        };
+        blobs.push((blob, std::fs::read(entry.path())?));
+    }
+    blobs.sort();
+    Ok(blobs)
 }
 
 fn used_bytes(root: &Path) -> u64 {
@@ -1210,6 +1229,46 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// A blob of the old layout that cannot be read (here held open with
+    /// no sharing, as a backup or scanning tool might) stops the
+    /// migration: nothing is committed and the old folder stays whole, and
+    /// a later open moves every blob over (#242). It used to commit the
+    /// other blob alone and delete the folder.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_old_blob_keeps_the_old_layout() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        std::fs::write(old.join("Header"), b"header").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("Header"))
+            .unwrap();
+        assert!(std::fs::read(old.join("Header")).is_err());
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(old.join("Data").exists() && old.join("Header").exists());
+        assert!(current_named(&c.dir, "Player").unwrap().is_none());
+
+        drop(held);
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        assert_eq!(
+            read(&p.container("Player"), None).unwrap(),
+            [
+                ("Data".into(), b"data".to_vec()),
+                ("Header".into(), b"header".to_vec())
+            ]
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
