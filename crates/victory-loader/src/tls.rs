@@ -36,6 +36,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     let index_at = unsafe {
         ((base + tls.directory_rva as usize + TLS64_ADDRESS_OF_INDEX) as *const usize).read()
     } as *mut u32;
+    if index_at.is_null() {
+        bail!("TLS AddressOfIndex is null");
+    }
     // SAFETY: as above.
     let index = unsafe { index_at.read() };
     if index == 0 {
@@ -48,8 +51,16 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         .iter()
         .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
     {
-        let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue;
+        }
+        let end = (section.rva as usize)
+            .checked_add(len)
+            .filter(|&e| e <= info.size_of_image as usize)
+            .ok_or_else(|| anyhow::anyhow!("executable section runs past image bounds"))?;
+        let _ = end;
+        let start = base + section.rva as usize;
         let mut old = 0;
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
@@ -60,12 +71,13 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         }
         // SAFETY: writable now, and no title code runs yet.
         let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
-        patched += patch(code, start, thunks);
+        let result = patch(code, start, thunks);
         // SAFETY: restoring the protection we changed; flushing our own code.
         unsafe {
             VirtualProtect(start as _, len, old, &mut old);
             FlushInstructionCache(GetCurrentProcess(), start as _, len);
         }
+        patched += result?;
     }
     // SAFETY: see `index_at`; `.data` is writable.
     unsafe { index_at.write(0) };
@@ -74,8 +86,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
 }
 
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
-/// `call thunks[r]; nop4`. `thunks` must be within 2 GiB of `code`.
-fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
+/// `call thunks[r]; nop4`. Fails without modifying the instruction if any
+/// thunk target falls outside signed 32-bit relative reach.
+fn patch(code: &mut [u8], at: usize, thunks: usize) -> Result<usize> {
     let mut count = 0;
     let mut i = 0;
     while i + LOAD_LEN <= code.len() {
@@ -92,9 +105,19 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
             && c[4..] == [0x25, 0x58, 0, 0, 0]
             && reg != 4
         {
-            let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
+            let target = thunks
+                .checked_add(reg * THUNK_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("TLS thunk address overflow"))?;
+            let next_rip = at
+                .checked_add(i + 5)
+                .ok_or_else(|| anyhow::anyhow!("TLS call site address overflow"))?;
+            let rel = i32::try_from(target as i128 - next_rip as i128).map_err(|_| {
+                anyhow::anyhow!(
+                    "TLS thunk {target:#x} out of rel32 reach from {next_rip:#x}"
+                )
+            })?;
             code[i] = 0xE8;
-            code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+            code[i + 1..i + 5].copy_from_slice(&rel.to_le_bytes());
             code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
             count += 1;
             i += LOAD_LEN;
@@ -102,7 +125,7 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
             i += 1;
         }
     }
-    count
+    Ok(count)
 }
 
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
@@ -135,25 +158,55 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: flushing our own newly written thunk page.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), block as _, 4096) };
     Ok(block as usize)
+}
+
+/// Candidate non-null 64 KiB-aligned allocation hints below and above `[base, base + size)`.
+fn near_hints(base: usize, size: usize, k: usize) -> [Option<usize>; 2] {
+    const GRANULE: usize = 0x1_0000;
+    let below = (k + 1)
+        .checked_mul(GRANULE)
+        .and_then(|d| base.checked_sub(d))
+        // Never pass 0 (`NULL`) to `VirtualAlloc`, which lets Windows pick any
+        // 48-bit address outside rel32 reach.
+        .filter(|&addr| addr >= GRANULE);
+    let above = base
+        .checked_add(size)
+        .and_then(|end| end.checked_next_multiple_of(GRANULE))
+        .and_then(|start| k.checked_mul(GRANULE).and_then(|d| start.checked_add(d)))
+        .filter(|&addr| addr >= GRANULE);
+    [below, above]
+}
+
+/// True if every thunk in `[page, page + 16 * THUNK_SIZE)` lies within signed
+/// 32-bit relative call reach of every byte in `[base, base + size)`.
+fn in_rel32_reach(base: usize, size: usize, page: usize) -> bool {
+    let Some(img_end) = base.checked_add(size) else {
+        return false;
+    };
+    let Some(thunk_last) = page.checked_add(15 * THUNK_SIZE) else {
+        return false;
+    };
+    let min_rel = page as i128 - img_end as i128;
+    let max_rel = thunk_last as i128 - base as i128;
+    i32::try_from(min_rel).is_ok() && i32::try_from(max_rel).is_ok()
 }
 
 /// One writable page within `rel32` reach of `[base, base + size)`. Leaked:
 /// title code calls into it for the life of the process.
 fn near(base: usize, size: usize) -> Result<*mut u8> {
-    const GRANULE: usize = 0x1_0000;
     // The search spans 1 GiB each side, so every call site stays in reach.
     if size >= 1 << 30 {
         bail!("image too large for TLS thunks within rel32 reach");
     }
-    let above = (base + size).next_multiple_of(GRANULE);
     for k in 0..(1usize << 14) {
-        for hint in [
-            base.checked_sub((k + 1) * GRANULE),
-            Some(above + k * GRANULE),
-        ] {
-            let Some(hint) = hint else { continue };
-            // SAFETY: a fresh allocation at a free address, or null.
+        for hint in near_hints(base, size, k).into_iter().flatten() {
+            if !in_rel32_reach(base, size, hint) {
+                continue;
+            }
+            // SAFETY: a fresh allocation at a non-null free address, or null.
             let p = unsafe {
                 VirtualAlloc(
                     hint as *const c_void,
@@ -205,7 +258,7 @@ mod tests {
             // SAFETY: the page is ours and writable.
             let bytes = unsafe { std::slice::from_raw_parts_mut(page, code.len()) };
             bytes.copy_from_slice(&code);
-            assert_eq!(patch(bytes, page as usize, thunks), 1);
+            assert_eq!(patch(bytes, page as usize, thunks).unwrap(), 1);
             let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
             unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
@@ -215,5 +268,21 @@ mod tests {
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn near_hints_never_emit_null_and_patch_rejects_out_of_rel32_range() {
+        // When `base == (k + 1) * 0x10000`, `below` must be None (never 0/NULL).
+        assert_eq!(near_hints(0x1_0000, 0x1000, 0), [None, Some(0x2_0000)]);
+        assert_eq!(near_hints(0x2_0000, 0x1000, 1), [None, Some(0x4_0000)]);
+        assert!(!in_rel32_reach(0x1_0000_0000, 0x1000, 0x3_0000_0000));
+        assert!(in_rel32_reach(0x1_0000_0000, 0x1000, 0x1_0001_0000));
+
+        // `patch()` must return an error and leave code untouched if thunks
+        // are more than 2 GiB away instead of silently truncating `rel as i32`.
+        let orig = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0];
+        let mut buf = orig;
+        assert!(patch(&mut buf, 0x1_0000_0000, 0x3_0000_0000).is_err());
+        assert_eq!(buf, orig);
     }
 }
