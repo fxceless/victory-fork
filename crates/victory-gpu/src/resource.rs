@@ -1463,6 +1463,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`alias_of`]): a reference the caller holds
+/// while it uses the texture, which the title cannot drop meanwhile.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1491,8 +1511,13 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+///
+/// The texture is pinned under the table's lock and returned as a [`Held`]
+/// handle: the caller copies from it after the lock is given back, and the
+/// title (or one of its recording threads) may drop its own last reference
+/// in between.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1518,6 +1543,19 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
+    // Pinned here, under the table's lock and before anything of the source
+    // is read: `Resource::drop` removes the entry from `TARGETS_AT` under
+    // this same lock before the texture is freed, and `add_ref_alive` takes
+    // a reference only while the last one has not gone (it reports that it
+    // has otherwise). From here only this reference keeps the texture alive,
+    // so the descriptions read below and the caller's alias copy are on a
+    // live texture: the title (or a recording thread) may drop its own last
+    // reference meanwhile. `Held` gives the reference back with
+    // `release_boxed`, as a title release would.
+    if !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    let held = Held(other);
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1553,7 +1591,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if !same {
+        return None;
+    }
+    Some(held)
 }
 
 /// Says (once per kind of pair, at most 64 lines) that the texture the
@@ -3636,6 +3677,49 @@ mod tests {
         for r in [committed, placed, at, heap] {
             slot::<Release>(r, 0x10)(r);
         }
+    }
+
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy (or a recording thread may), and the copy still needs it.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        if crate::host::host().is_some() {
+            assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
+        }
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        resource_release(view);
     }
 
     #[test]
