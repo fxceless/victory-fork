@@ -1228,6 +1228,10 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
+        if !host.mesh_shaders() {
+            eprintln!("no host shader model 6.6 support; skipped");
+            return;
+        }
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
             return;
