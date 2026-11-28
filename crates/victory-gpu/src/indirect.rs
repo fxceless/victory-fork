@@ -2465,6 +2465,18 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
+        // The two groups of 64 records charge the budget one after the other
+        // in whichever order the card (or WARP, on several threads) runs them,
+        // and each takes its records in lane order: the two draws that fit are
+        // the first two real ones of the group that charged first, records 1
+        // and 2 of the first group or 64 and 65 of the second.
+        let kept_at: Vec<usize> = (0..RECORDS as usize)
+            .filter(|&i| out_words[i * 6] == (1 << 22) && out_words[i * 6 + 1] == 16)
+            .collect();
+        assert!(
+            kept_at == [1, 2] || kept_at == [64, 65],
+            "the first two real draws of the group that charged first fit the budget, not {kept_at:?}"
+        );
         let mut kept = 0usize;
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
