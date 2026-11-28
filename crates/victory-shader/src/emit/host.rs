@@ -62,6 +62,25 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+#[cfg(test)]
+fn wait_for_readback(dev: &ID3D12Device, fence: &ID3D12Fence) -> Result<(), String> {
+    // SAFETY: both interfaces are live for the duration of the wait.
+    unsafe {
+        while fence.GetCompletedValue() < 1 {
+            if let Err(e) = dev.GetDeviceRemovedReason() {
+                return Err(format!("device removed: {}", err(e)));
+            }
+            std::thread::yield_now();
+        }
+        // Removal returns UINT64_MAX and can bypass the loop entirely.
+        // Check the device before the caller maps any readback resources.
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        Ok(())
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -1523,12 +1542,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_readback(dev, &fence)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -1554,6 +1568,70 @@ impl Host {
             }
             drop(keep);
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shader_readback_wait_rejects_a_removed_device() {
+        // D3D12 devices are shared per adapter within a process. Remove only
+        // a child's WARP device, never a device another test may still use.
+        const CHILD: &str = "VICTORY_TEST_REMOVED_READBACK";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{stderr}"
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
+        // SAFETY: the adapter/device are local COM objects with valid out
+        // pointers. No hardware adapter or command list is removed.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let Ok(remover) = dev.cast::<ID3D12Device5>() else {
+                eprintln!("WARP has no ID3D12Device5; device-removal regression skipped");
+                return;
+            };
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let completed: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&completed, 1).unwrap();
+            wait_for_readback(&dev, &completed).unwrap();
+            assert_eq!(completed.GetCompletedValue(), 1);
+
+            let pending: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            assert_eq!(pending.GetCompletedValue(), 0);
+            remover.RemoveDevice();
+            assert!(dev.GetDeviceRemovedReason().is_err());
+            assert_eq!(pending.GetCompletedValue(), u64::MAX);
+            let failure = wait_for_readback(&dev, &pending).expect_err("removed is not completed");
+            assert!(failure.starts_with("device removed:"), "{failure}");
+            eprintln!("WARP: completed fence accepted; removal sentinel rejected before readback");
         }
     }
 }
