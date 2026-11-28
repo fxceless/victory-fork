@@ -94,7 +94,7 @@ enum Command {
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
         /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
-        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        /// `VICTORY_VIEW_LIMIT` to override the detected host capabilities.
         #[arg(long)]
         warm: Option<PathBuf>,
     },
@@ -252,6 +252,10 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
+            #[cfg(windows)]
+            if warm.is_some() {
+                victory_hle::modules::d3d12x::prepare_shader_warmup();
+            }
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
