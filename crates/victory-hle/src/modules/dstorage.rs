@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -181,6 +181,23 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
+/// The 2020 `DSTORAGE_QUEUE_DESC` returned inside [`QueueInfo`].
+#[repr(C)]
+struct QueueDesc2020 {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+
+/// `DSTORAGE_QUEUE_INFO` populated by `IDStorageQueueX::Query`.
+#[repr(C)]
+struct QueueInfo {
+    desc: QueueDesc2020,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+
 /// The queue's description: as in 2020 (source type, capacity, priority,
 /// name), plus a field the title sets to 1.
 #[repr(C)]
@@ -202,7 +219,15 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let name = text(desc.name);
+    let owned_name = if desc.name.is_null() {
+        None
+    } else {
+        // SAFETY: a NUL-terminated name from the title.
+        Some(unsafe { CStr::from_ptr(desc.name) }.to_owned())
+    };
+    let name = owned_name
+        .as_ref()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
@@ -223,7 +248,16 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                id,
+                source_type: desc.source_type,
+                capacity: desc.capacity,
+                priority: desc.priority,
+                name: owned_name,
+            },
+        ),
     )
 }
 
@@ -513,9 +547,13 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler and creation metadata for `Query`.
 struct Queue {
     id: u64,
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: Option<CString>,
 }
 
 impl Drop for Queue {
@@ -1365,12 +1403,73 @@ extern "system" fn submit(this: QueueRef) {
     scheduler.work.notify_all();
 }
 
+/// Drops unsubmitted and queued-not-yet-started reads matching
+/// `(tag & mask) == value`. Per DirectStorage's contract, cancelled reads
+/// do not count as failures in status arrays or error records.
+extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        return;
+    };
+    let matches = |req: &Request| (req.tag & mask) == value;
+    let before = lane.unsubmitted.len() + lane.reads.len();
+    lane.unsubmitted
+        .retain(|cmd| !matches!(cmd, Command::Read(req) if matches(req)));
+    lane.reads.retain(|(_, req)| !matches(req));
+    if lane.unsubmitted.len() + lane.reads.len() != before {
+        lane.flush();
+        scheduler.finished.notify_all();
+    }
+}
+
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
+}
+
+/// Reports the queue's creation description, remaining empty slots, and
+/// requests remaining until auto-submit.
+extern "system" fn query(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let q = &unsafe { &*this }.state;
+    let (empty, until_auto) = scheduler()
+        .and_then(|s| {
+            let lanes = s.lock();
+            let lane = lanes.lanes.get(&q.id).filter(|l| !l.closed)?;
+            let usable = lane.capacity.saturating_sub(1);
+            let empty = usable
+                .saturating_sub(lane.entries())
+                .min(usize::from(u16::MAX)) as u16;
+            let threshold = (lane.capacity / 2).max(1);
+            let until_auto = threshold
+                .saturating_sub(lane.unsubmitted.len())
+                .min(usize::from(u16::MAX)) as u16;
+            Some((empty, until_auto))
+        })
+        .unwrap_or((0, 0));
+    let out = QueueInfo {
+        desc: QueueDesc2020 {
+            source_type: q.source_type,
+            capacity: q.capacity,
+            priority: q.priority,
+            name: q.name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+        },
+        empty_slot_count: empty,
+        request_count_until_auto_submit: until_auto,
+    };
+    // SAFETY: checked non-null; the title passes room for `QueueInfo`.
+    unsafe { info.write(out) };
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1746,12 +1845,12 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     enqueue_request as *const (), // 0x18
     enqueue_status as *const (),  // 0x20
     missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    submit as *const (),                   // 0x30
+    cancel_requests_with_tag as *const (), // 0x38 (2020: cancel by tag)
+    close as *const (),                    // 0x40
+    missing::<9> as *const (),             // 0x48 (2020: error event)
+    missing::<10> as *const (),            // 0x50 (2020: error record)
+    query as *const (),                    // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -2551,5 +2650,157 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn queue_info_layout_and_counts_track_enqueued_and_closed_state() {
+        assert_eq!(size_of::<QueueDesc2020>(), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueInfo, empty_slot_count), 0x18);
+        assert_eq!(
+            std::mem::offset_of!(QueueInfo, request_count_until_auto_submit),
+            0x1a
+        );
+        assert_eq!(size_of::<QueueInfo>(), 0x20);
+
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 0x80,
+            priority: 1,
+            name: c"query-test".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+
+        let query_fn: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        // Null output is tolerated.
+        query_fn(queue, std::ptr::null_mut());
+
+        let mut info = QueueInfo {
+            desc: QueueDesc2020 {
+                source_type: 0,
+                capacity: 0,
+                priority: 0,
+                name: std::ptr::null(),
+            },
+            empty_slot_count: 0,
+            request_count_until_auto_submit: 0,
+        };
+        query_fn(queue, &mut info);
+        assert_eq!(info.desc.source_type, 1);
+        assert_eq!(info.desc.capacity, 0x80);
+        assert_eq!(info.desc.priority, 1);
+        assert!(!info.desc.name.is_null());
+        // SAFETY: `desc.name` points to our owned `CString` on the queue.
+        assert_eq!(unsafe { CStr::from_ptr(info.desc.name) }, c"query-test");
+        assert_eq!(info.empty_slot_count, 0x7f);
+        assert_eq!(info.request_count_until_auto_submit, 0x40);
+
+        let src = [1u8, 2, 3, 4];
+        let mut dst = [0u8; 4];
+        let r = request(
+            MEMORY_SOURCE,
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            src.as_ptr().cast(),
+            0,
+            src.len(),
+        );
+        enqueue(queue, &r);
+        enqueue(queue, &r);
+        enqueue(queue, &r);
+        query_fn(queue, &mut info);
+        assert_eq!(info.empty_slot_count, 0x7c);
+        assert_eq!(info.request_count_until_auto_submit, 0x3d);
+
+        let array = status_array(1);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+
+        query_fn(queue, &mut info);
+        assert_eq!(info.empty_slot_count, 0x7f);
+        assert_eq!(info.request_count_until_auto_submit, 0x40);
+
+        void(queue, 0x40);
+        query_fn(queue, &mut info);
+        assert_eq!(info.desc.capacity, 0x80);
+        assert_eq!(info.empty_slot_count, 0);
+        assert_eq!(info.request_count_until_auto_submit, 0);
+    }
+
+    #[test]
+    fn cancel_requests_with_tag_drops_matching_reads_without_error() {
+        let queue = new_queue(1);
+        let array = status_array(1);
+        let cancel: extern "system" fn(*mut c_void, u64, u64) = call(queue, 0x38);
+        let query_fn: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+
+        let src_a = [0x11u8; 16];
+        let src_b = [0x22u8; 16];
+        let mut dst_a = [0xAAu8; 16];
+        let mut dst_b = [0xBBu8; 16];
+
+        let mut req_a = request(
+            MEMORY_SOURCE,
+            dst_a.as_mut_ptr().cast(),
+            dst_a.len(),
+            src_a.as_ptr().cast(),
+            0,
+            src_a.len(),
+        );
+        req_a.tag = 0x0101;
+        let mut req_b = request(
+            MEMORY_SOURCE,
+            dst_b.as_mut_ptr().cast(),
+            dst_b.len(),
+            src_b.as_ptr().cast(),
+            0,
+            src_b.len(),
+        );
+        req_b.tag = 0x0201;
+        // Invalid source pointer: would fail with E_INVALIDARG if executed.
+        let mut req_c = request(
+            MEMORY_SOURCE,
+            dst_a.as_mut_ptr().cast(),
+            dst_a.len(),
+            std::ptr::null(),
+            0,
+            dst_a.len(),
+        );
+        req_c.tag = 0x0102;
+
+        enqueue(queue, &req_a);
+        enqueue(queue, &req_b);
+        enqueue(queue, &req_c);
+
+        // Cancel everything whose high byte is 0x01 (req_a and req_c).
+        cancel(queue, 0xFF00, 0x0100);
+
+        let mut info = QueueInfo {
+            desc: QueueDesc2020 {
+                source_type: 0,
+                capacity: 0,
+                priority: 0,
+                name: std::ptr::null(),
+            },
+            empty_slot_count: 0,
+            request_count_until_auto_submit: 0,
+        };
+        query_fn(queue, &mut info);
+        assert_eq!(info.empty_slot_count, 0x7e);
+        assert_eq!(info.request_count_until_auto_submit, 0x3f);
+
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(dst_a, [0xAAu8; 16], "cancelled read must not write");
+        assert_eq!(dst_b, src_b, "unmatched read must complete");
+
+        // Cancelling on a closed queue is a no-op.
+        void(queue, 0x40);
+        cancel(queue, 0xFFFF, 0x0100);
     }
 }
