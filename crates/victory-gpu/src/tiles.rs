@@ -549,23 +549,25 @@ impl Tiled {
             let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
             let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
             let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
+            {
+                // Leaf lock order: `Tiled::given` before `QUEUE_SUBMIT`.
+                let _queue = crate::host::queue_lock();
+                // SAFETY: a live reserved texture and heap; one region of
+                // `tiles` tiles and three arrays of `runs.len()` entries.
+                unsafe {
+                    queue.UpdateTileMappings(
+                        texture,
+                        1,
+                        Some(&raw const at),
+                        Some(&raw const size),
+                        &heap,
+                        runs.len() as u32,
+                        Some(flags.as_ptr()),
+                        Some(starts.as_ptr()),
+                        Some(counts.as_ptr()),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);

@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -75,6 +75,10 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Breaks ties in the coarse access clock for card-copy LRU.
+    access_tick: AtomicU64,
+    /// Latest main-queue fence using the card-side resource.
+    last_fence: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -132,8 +136,14 @@ struct Card {
     /// The copy itself, set once it is in an `Arc` ([`carded`]): put on
     /// [`TOUCHED`] when `touched` is set.
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
-    /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
+    /// The buffers' bytes (rounded up to 64 KiB for registered buffers).
     size: u64,
+    /// A UAV may have changed bytes on the card without a declared range.
+    gpu_written: AtomicBool,
+    /// Whether this card side takes room in the local-memory budget.
+    local: bool,
+    /// Test copies are not counted in the live byte totals.
+    counted: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -261,8 +271,303 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// Threshold separating small card buffers (`< 1 MiB`) from large hot card
+/// buffers (`>= 1 MiB`) for size-tiered headroom reservation and demotion.
+pub(crate) const LARGE_CARD_MIN: u64 = 1 << 20;
+
+/// Maximum default headroom reserved inside `VICTORY_CARD_BUFFERS_MB` for
+/// `>= 1 MiB` buffers when `VICTORY_CARD_BUFFERS_MIN_KB < 1024`.
+const DEFAULT_LARGE_RESERVE_MAX: u64 = 256 << 20;
+
+/// Maximum DXGI video-memory percentage at which new `< 1 MiB` card buffers
+/// are admitted, preserving headroom on 8-12 GB cards.
+const DXGI_SMALL_ADMIT_PCT: u64 = 85;
+
+/// Default DXGI video-memory pressure percentage above which cold,
+/// fence-completed small card buffers are demoted back to host RAM.
+const DEFAULT_DXGI_PRESSURE_PCT: u64 = 88;
+
+/// Maximum bytes read back from the GPU in a single demotion batch.
+const DEMOTE_BATCH_MAX_BYTES: u64 = 16 << 20;
+
+/// Maximum bounded readback batches attempted when making room for a single
+/// `>= 1 MiB` buffer (at most `4 * 16 MiB = 64 MiB`).
+const DEMOTE_MAX_PASSES: usize = 4;
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Two-sided fallback copies in system memory (`VICTORY_CARD_ALL`).
+static SHARED_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Card bytes surrendered by DXGI-pressure demotion. Do not count them
+/// as reserved again in the texture queue or the texture-block gate
+/// (`resource::room` and `resource::block_room`). RT reserves are separate.
+static CARD_PRESSURE_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics counters for card-buffer tiering and demotion:
+/// - `[0]`: `card_demoted_count`
+/// - `[1]`: `card_demoted_bytes`
+/// - `[2]`: `card_reserved_large_rejects`
+pub(crate) static CARD_TIER_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Snapshot of card-buffer tiering & demotion diagnostic counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CardTierStats {
+    pub(crate) card_demoted_count: u64,
+    pub(crate) card_demoted_bytes: u64,
+    pub(crate) card_reserved_large_rejects: u64,
+}
+
+/// Returns cumulative card-buffer tiering and demotion counters.
+pub(crate) fn card_tier_stats() -> CardTierStats {
+    CardTierStats {
+        card_demoted_count: CARD_TIER_STATS[0].load(Ordering::Relaxed),
+        card_demoted_bytes: CARD_TIER_STATS[1].load(Ordering::Relaxed),
+        card_reserved_large_rejects: CARD_TIER_STATS[2].load(Ordering::Relaxed),
+    }
+}
+
+/// Admission outcome for a title buffer requesting card-memory placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardAdmit {
+    Admitted,
+    /// Small `< 1 MiB` buffer rejected to preserve reserved headroom for
+    /// `>= 1 MiB` buffers (`card_reserved_large_rejects`).
+    ReservedForLarge,
+    /// Total `VICTORY_CARD_BUFFERS_MB` cap reached.
+    CapFull,
+    /// DXGI local video-memory budget threshold exceeded.
+    DxgiPressure,
+    /// Size outside `[least, 1 GiB)` or cap is zero.
+    OutOfRange,
+}
+
+/// Atomic accounting state for card-resident title buffers, splitting total
+/// bytes from `< 1 MiB` small-buffer bytes so small-buffer floods cannot
+/// starve `>= 1 MiB` buffers.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CardBudget {
+    pub(crate) total_bytes: u64,
+    pub(crate) small_bytes: u64,
+}
+
+impl CardBudget {
+    /// Checks admission policy for a title buffer of `size` bytes and, if
+    /// admitted, accounts its bytes immediately.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_admit(
+        &mut self,
+        size: u64,
+        least: u64,
+        most: u64,
+        reserve: u64,
+        video_memory: Option<[u64; 4]>,
+        card_room_kept: bool,
+        pressure_pct: u64,
+    ) -> CardAdmit {
+        if most == 0 || size < least || size >= (1 << 30) {
+            return CardAdmit::OutOfRange;
+        }
+        let is_small = size < LARGE_CARD_MIN;
+        if let Some([budget, used, ..]) = video_memory
+            && budget > 0
+        {
+            let large_pct = if card_room_kept { 97 } else { 80 };
+            let limit_pct = if is_small {
+                large_pct.min(pressure_pct).min(DXGI_SMALL_ADMIT_PCT)
+            } else {
+                large_pct
+            };
+            let limit_bytes = ((u128::from(budget) * u128::from(limit_pct)) / 100) as u64;
+            if used.saturating_add(size) > limit_bytes {
+                return CardAdmit::DxgiPressure;
+            }
+        }
+        if is_small && reserve > 0 {
+            let small_cap = most.saturating_sub(reserve);
+            if self.small_bytes.saturating_add(size) > small_cap {
+                return CardAdmit::ReservedForLarge;
+            }
+        }
+        if self.total_bytes.saturating_add(size) > most {
+            return CardAdmit::CapFull;
+        }
+        self.total_bytes += size;
+        if is_small {
+            self.small_bytes += size;
+        }
+        CardAdmit::Admitted
+    }
+
+    /// Releases `size` previously admitted bytes back to the budget.
+    pub(crate) fn release(&mut self, size: u64) {
+        self.total_bytes = self.total_bytes.saturating_sub(size);
+        if size < LARGE_CARD_MIN {
+            self.small_bytes = self.small_bytes.saturating_sub(size);
+        }
+    }
+}
+
+static CARD_BUDGET: Mutex<CardBudget> = Mutex::new(CardBudget {
+    total_bytes: 0,
+    small_bytes: 0,
+});
+
+/// Computes headroom in bytes reserved inside `most` for `>= 1 MiB` buffers
+/// whenever `least < 1 MiB` (e.g. `VICTORY_CARD_BUFFERS_MIN_KB=64`).
+/// Default: `min(256 MiB, most / 3)`. `override_mb` (`VICTORY_CARD_LARGE_RESERVE_MB`)
+/// overrides the reservation (`Some(0)` disables it; clamped to `most`).
+pub(crate) fn card_large_reserve_for(least: u64, most: u64, override_mb: Option<u64>) -> u64 {
+    if least >= LARGE_CARD_MIN || most == 0 {
+        return 0;
+    }
+    match override_mb {
+        Some(mb) => mb.saturating_mul(1 << 20).min(most),
+        None => DEFAULT_LARGE_RESERVE_MAX.min(most / 3),
+    }
+}
+
+/// Active headroom reservation in bytes for `>= 1 MiB` card buffers.
+fn card_large_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| {
+        let (least, most) = card_limits();
+        let override_mb = std::env::var("VICTORY_CARD_LARGE_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        card_large_reserve_for(least, most, override_mb)
+    })
+}
+
+/// Whether fence-safe LRU demotion of cold small card buffers is enabled
+/// (on by default; `VICTORY_CARD_DEMOTE=0` turns it off).
+fn card_demote_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // CARD_ALL explicitly needs two sides even in system memory.
+    !card_all() && *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DEMOTE").is_none_or(|v| v != "0"))
+}
+
+/// DXGI video-memory usage percentage above which cold small card buffers are
+/// demoted (`VICTORY_CARD_PRESSURE_PCT`, default 88, clamped to 50..=98).
+fn card_pressure_pct() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_PRESSURE_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(DEFAULT_DXGI_PRESSURE_PCT, |pct| pct.clamp(50, 98))
+    })
+}
+
+/// Computes how many bytes of cold `< 1 MiB` card buffers should be demoted
+/// under DXGI local video-memory pressure (`video_memory = [budget, used, ..]`).
+/// Triggers at `used >= budget * pressure_pct / 100` and aims down to
+/// `(pressure_pct - 4)%` (clamped to `small_card_bytes`) to create hysteresis
+/// headroom for streaming allocations on 8-12 GB GPUs.
+pub(crate) fn dxgi_demote_target_bytes(
+    video_memory: Option<[u64; 4]>,
+    small_card_bytes: u64,
+    pressure_pct: u64,
+) -> u64 {
+    if small_card_bytes == 0 {
+        return 0;
+    }
+    let Some([budget, used, ..]) = video_memory else {
+        return 0;
+    };
+    if budget == 0 {
+        return 0;
+    }
+    let high_mark = ((u128::from(budget) * u128::from(pressure_pct)) / 100) as u64;
+    if used < high_mark {
+        return 0;
+    }
+    let low_pct = pressure_pct.saturating_sub(4);
+    let low_mark = ((u128::from(budget) * u128::from(low_pct)) / 100) as u64;
+    used.saturating_sub(low_mark).min(small_card_bytes)
+}
+
+/// Current card bytes held by `< 1 MiB` title buffers.
+fn card_small_bytes() -> u64 {
+    CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).small_bytes
+}
+
+/// Current total card bytes held by title buffers in [`CARD_BUDGET`].
+fn card_total_bytes() -> u64 {
+    CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).total_bytes
+}
+
+/// Computes the exact shortfall in bytes that must be freed from existing small
+/// card buffers so a `>= 1 MiB` buffer of `size` bytes can pass both the total
+/// `most` cap and the DXGI local video-memory budget limit.
+pub(crate) fn card_admit_shortfall(
+    size: u64,
+    total_bytes: u64,
+    most: u64,
+    video_memory: Option<[u64; 4]>,
+    card_room_kept: bool,
+) -> u64 {
+    let cap_shortfall = total_bytes.saturating_add(size).saturating_sub(most);
+    let dxgi_shortfall = match video_memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            let limit_pct: u64 = if card_room_kept { 97 } else { 80 };
+            let limit_bytes = ((u128::from(budget) * u128::from(limit_pct)) / 100) as u64;
+            used.saturating_add(size).saturating_sub(limit_bytes)
+        }
+        _ => 0,
+    };
+    cap_shortfall.max(dxgi_shortfall)
+}
+
+/// Pure calculation for [`card_room_kept`]: bytes reserved for future card
+/// copies after subtracting live card bytes, refused `>= 1 MiB` bytes, and
+/// headroom explicitly surrendered by DXGI-pressure demotion.
+pub(crate) fn card_room_kept_for(
+    most: u64,
+    card_bytes: u64,
+    refused_bytes: u64,
+    pressure_released: u64,
+) -> u64 {
+    most.saturating_sub(
+        card_bytes
+            .saturating_add(refused_bytes)
+            .saturating_add(pressure_released),
+    )
+}
+
+/// Releases a title buffer's card-side bytes from both [`CARD_BUDGET`] and
+/// [`CARD_BYTES`] in lockstep.
+fn release_card_bytes(size: u64, had_before: bool) {
+    if size > 0 {
+        let mut budget = CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        budget.release(size);
+        CARD_BYTES[0].store(budget.total_bytes, Ordering::Relaxed);
+    }
+    if had_before {
+        CARD_BYTES[1].fetch_sub(card_hash_bytes(size), Ordering::Relaxed);
+    }
+}
+
+/// Attempts to reserve `size` bytes in the global [`CARD_BUDGET`], syncing
+/// [`CARD_BYTES`]`[0]` atomically on admission.
+fn try_admit_global_card(size: u64, video_memory: Option<[u64; 4]>) -> CardAdmit {
+    let (least, most) = card_limits();
+    let reserve = card_large_reserve();
+    let mut budget = CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    let res = budget.try_admit(
+        size,
+        least,
+        most,
+        reserve,
+        video_memory,
+        card_room_kept_on(),
+        card_pressure_pct(),
+    );
+    if res == CardAdmit::Admitted {
+        CARD_BYTES[0].store(budget.total_bytes, Ordering::Relaxed);
+    }
+    res
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -270,7 +575,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
-/// [`card_for`] makes one only while the card is under eight tenths of its
+/// [`lookup`] makes one only while the card is under eight tenths of its
 /// budget. That held as long as the textures picked by index filled the
 /// card after the burst. Since the texture queue keeps packed neighbours
 /// (52b8060) it fills the card while the world loads: 85% and more at the
@@ -317,7 +622,12 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_room_kept_for(
+        card_limits().1.min(SEEN),
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+        CARD_PRESSURE_RELEASED.load(Ordering::Relaxed),
+    )
 }
 
 /// The copies in the card's memory.
@@ -353,6 +663,7 @@ pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
+        + SHARED_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
@@ -366,6 +677,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     }
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
+        + SHARED_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
@@ -379,23 +691,429 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
-/// A buffer of `size` bytes in the card's memory for a title buffer's
-/// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
-    if there.is_some() || !card_all() || size >= 1 << 30 {
-        return there;
+/// Records and periodically logs a DXGI video-memory refusal of a `>= 1 MiB`
+/// card copy using the exact `limit_pct` threshold that rejected it.
+fn note_card_refused(size: u64, video_memory: Option<[u64; 4]>, limit_pct: u64) {
+    let (_, most) = card_limits();
+    let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+    if (n <= 64 || n.is_multiple_of(32))
+        && let Some([budget, used, ..]) = video_memory
+    {
+        let limit_bytes = ((u128::from(budget) * u128::from(limit_pct)) / 100) as u64;
+        tracing::info!(
+            "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+             {} MB ({limit_pct}%); the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+            size >> 10,
+            used >> 20,
+            budget >> 20,
+            limit_bytes >> 20,
+            CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+            most >> 20,
+            n,
+            bytes >> 20,
+            crate::frame::current()
+        );
     }
-    // Two sides all the same, the card's in the PC's memory.
-    let host = host()?;
-    if !cards() || !host.card_ready() {
+}
+
+/// Checks whether `shadow` is a cold, fence-completed small (`< 1 MiB`) title
+/// buffer card copy that can safely be demoted back to host RAM:
+/// - must be a non-window card-backed copy with `card.size < LARGE_CARD_MIN`
+///   (hot `>= 1 MiB` buffers are never demoted);
+/// - `Arc::strong_count == 1` (no command list, `CardPlan`, or lookup thread
+///   holds it);
+/// - `host::references(&shadow.buffer) == 1` (no descriptor heap slot points
+///   to the VRAM buffer);
+/// - `pending` is empty (no un-merged shader write range);
+/// - `last_fence <= completed_fence` (all GPU submissions touching this buffer
+///   have completed on the host queue fence).
+fn small_card_demotable(shadow: &Arc<Shadow>, completed_fence: u64) -> Option<(u64, u64, bool)> {
+    if Arc::strong_count(shadow) != 1 {
         return None;
     }
-    let (buffer, _) = host.shared_buffer(size)?;
-    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    card_demotion_state(shadow, completed_fence)
+}
+
+fn card_demotion_state(shadow: &Shadow, completed_fence: u64) -> Option<(u64, u64, bool)> {
+    if shadow.window || completed_fence == u64::MAX {
+        return None;
+    }
+    let card = shadow.card.as_ref()?;
+    if !card.local || card.size == 0 || card.size >= LARGE_CARD_MIN {
+        return None;
+    }
+    let fence = shadow.last_fence();
+    if fence > completed_fence || crate::host::references(&shadow.buffer) != 1 {
+        return None;
+    }
+    // Do not turn a copy whose GPU writes must stay private into a copy
+    // that will merge its future GPU writes back into source memory.
+    if wc_no_back() && shadow.len >= wc_no_back_min() && shadow.write_combined() {
+        return None;
+    }
+    if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return None;
+    }
+    // Upstream records both whole refreshes and sparse CPU edits in `dirty`.
+    // Only those bytes supersede the card side. Skip readback if nobody used
+    // that side or if pending CPU writes cover it all.
+    let gpu_touched = fence > 0 || card.gpu_written.load(Ordering::Acquire);
+    let needs_readback = if !gpu_touched {
+        false
+    } else {
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        !outside(0, card.size as usize, dirty.clone()).is_empty()
+    };
+    Some((card.size, fence, needs_readback))
+}
+
+/// Demotes a single verified `Entry`'s card-backed `Shadow` back to host RAM in
+/// place by reusing `card.staging` (which is already an L0 write-back
+/// `ALLOW_UNORDERED_ACCESS` buffer persistently mapped at `shadow.data`).
+///
+/// Copies readback bytes outside `card.dirty` to staging. GPU bytes and
+/// pending CPU edits thus survive byte-for-byte. Old GPU resources go to
+/// `to_drop` so COM `Release()` runs outside the table lock.
+#[allow(clippy::too_many_arguments)]
+fn demote_entry_in_place(
+    entry: &mut Entry,
+    expected_id: u64,
+    readback_stamp: Option<(u64, u64)>,
+    completed_fence: u64,
+    readback: Option<&[u8]>,
+    budget: &mut CardBudget,
+    sync_global_bytes: bool,
+    to_drop: &mut Vec<ID3D12Resource>,
+) -> u64 {
+    let Some(shadow) = entry.shadow.as_ref() else {
+        return 0;
+    };
+    if shadow.id != expected_id {
+        return 0;
+    }
+    let valid = |shadow: &Shadow, (size, fence, needs_readback): (_, u64, bool)| {
+        readback_stamp.is_none_or(|stamp| stamp == (fence, shadow.access_tick.load(Ordering::Relaxed)))
+            && match readback {
+                Some(bytes) => bytes.len() == size as usize,
+                None => !needs_readback,
+            }
+    };
+    if !small_card_demotable(shadow, completed_fence).is_some_and(|state| valid(shadow, state)) {
+        return 0;
+    }
+    let old_arc = entry.shadow.take().unwrap();
+    let mut old = match Arc::try_unwrap(old_arc) {
+        Ok(inner) => inner,
+        Err(shared) => {
+            entry.shadow = Some(shared);
+            return 0;
+        }
+    };
+    // A weak owner may have briefly used the copy after the first check.
+    // Check again now that no weak handle to the old Arc can be upgraded.
+    if !card_demotion_state(&old, completed_fence).is_some_and(|state| valid(&old, state)) {
+        let card = old.card.as_mut().expect("verified carded shadow");
+        card.me.take();
+        let shadow = Arc::new(old);
+        if sync_global_bytes {
+            carded(&shadow);
+            let card = shadow.card.as_ref().unwrap();
+            if card.touched.load(Ordering::Acquire) {
+                TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            }
+        }
+        entry.shadow = Some(shadow);
+        return 0;
+    }
+    let card = old.card.take().expect("verified carded shadow");
+    let size = card.size;
+    if let Some(gpu_bytes) = readback {
+        let copy_len = size as usize;
+        let dirty = card.dirty.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (a, b) in outside(0, copy_len, dirty) {
+            // SAFETY: `old.data` is the persistent mapping of `card.staging`
+            // (allocated for `size` bytes), `b <= copy_len <= size`, and we
+            // hold unique ownership of `old` via `Arc::try_unwrap`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr().add(a), old.data.add(a), b - a);
+            }
+        }
+    }
+    let old_vram = std::mem::replace(&mut old.buffer, card.staging);
+    // SAFETY: `old.buffer` is the live host-RAM staging buffer.
+    old.gpu = unsafe { old.buffer.GetGPUVirtualAddress() };
+    old.id = next_shadow_id();
+    old.width = Default::default();
+    #[cfg(feature = "diagnostics")]
+    {
+        old.pc = Default::default();
+    }
+    let old_before = card.before.into_inner().unwrap_or_else(|e| e.into_inner());
+    let had_before = old_before.is_some();
+    budget.release(size);
+    if sync_global_bytes {
+        CARD_BYTES[0].store(budget.total_bytes, Ordering::Relaxed);
+        if had_before {
+            CARD_BYTES[1].fetch_sub(card_hash_bytes(size), Ordering::Relaxed);
+        }
+    }
+    CARD_TIER_STATS[0].fetch_add(1, Ordering::Relaxed);
+    CARD_TIER_STATS[1].fetch_add(size, Ordering::Relaxed);
+    to_drop.push(old_vram);
+    if let Some(before) = old_before {
+        to_drop.push(before);
+    }
+    entry.shadow = Some(Arc::new(old));
+    size
+}
+
+/// Phase 1 (fast, no GPU wait): demotes coldest fence-completed small card
+/// buffers that require no GPU readback directly inside `map`, returning
+/// `(demoted_count, demoted_bytes)`. Caller must drop `to_drop` after releasing
+/// `map`.
+fn demote_fast_small_in_map(
+    map: &mut BTreeMap<(u64, usize), Entry>,
+    target_bytes: u64,
+    completed_fence: u64,
+    budget: &mut CardBudget,
+    sync_global_bytes: bool,
+    to_drop: &mut Vec<ID3D12Resource>,
+) -> (u64, u64) {
+    if target_bytes == 0 {
+        return (0, 0);
+    }
+    // (used_moment, access_tick, key, shadow_id)
+    let mut candidates: Vec<(u64, u64, (u64, usize), u64)> = map
+        .iter()
+        .filter_map(|(&key, entry)| {
+            let shadow = entry.shadow.as_ref()?;
+            let (_, _, needs_readback) = small_card_demotable(shadow, completed_fence)?;
+            if needs_readback {
+                return None;
+            }
+            Some((
+                shadow.used.load(Ordering::Relaxed),
+                shadow.access_tick.load(Ordering::Relaxed),
+                key,
+                shadow.id,
+            ))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return (0, 0);
+    }
+    candidates.sort_unstable_by_key(|&(used, tick, _, _)| (used, tick));
+    let (mut count, mut bytes) = (0u64, 0u64);
+    for (_, _, key, id) in candidates {
+        if bytes >= target_bytes {
+            break;
+        }
+        if let Some(entry) = map.get_mut(&key) {
+            let freed = demote_entry_in_place(
+                entry,
+                id,
+                None,
+                completed_fence,
+                None,
+                budget,
+                sync_global_bytes,
+                to_drop,
+            );
+            if freed > 0 {
+                count += 1;
+                bytes += freed;
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Candidate collected for Phase 2 GPU readback outside the table lock.
+struct ReadbackCandidate {
+    key: (u64, usize),
+    id: u64,
+    fence: u64,
+    tick: u64,
+    size: u64,
+}
+
+/// Collects coldest fence-completed small card buffers requiring GPU readback,
+/// capped at `target_bytes.min(DEMOTE_BATCH_MAX_BYTES)`.
+fn collect_readback_candidates(
+    map: &BTreeMap<(u64, usize), Entry>,
+    target_bytes: u64,
+    completed_fence: u64,
+) -> (Vec<ReadbackCandidate>, Vec<(ID3D12Resource, u64)>) {
+    if target_bytes == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let cap = target_bytes.min(DEMOTE_BATCH_MAX_BYTES);
+    let mut ranked: Vec<(u64, u64, (u64, usize), u64, u64, u64)> = map
+        .iter()
+        .filter_map(|(&key, entry)| {
+            let shadow = entry.shadow.as_ref()?;
+            let (size, fence, needs_readback) = small_card_demotable(shadow, completed_fence)?;
+            if !needs_readback {
+                return None;
+            }
+            Some((
+                shadow.used.load(Ordering::Relaxed),
+                shadow.access_tick.load(Ordering::Relaxed),
+                key,
+                shadow.id,
+                fence,
+                size,
+            ))
+        })
+        .collect();
+    ranked.sort_unstable_by_key(|&(used, tick, _, _, _, _)| (used, tick));
+    let mut meta = Vec::new();
+    let mut srcs = Vec::new();
+    let mut planned = 0u64;
+    for (_, tick, key, id, fence, size) in ranked {
+        if planned >= cap {
+            break;
+        }
+        if planned + size > DEMOTE_BATCH_MAX_BYTES {
+            break;
+        }
+        if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.as_ref())
+            && shadow.id == id
+        {
+            meta.push(ReadbackCandidate { key, id, fence, tick, size });
+            srcs.push((shadow.buffer.clone(), size));
+            planned += size;
+        }
+    }
+    (meta, srcs)
+}
+
+/// Applies Phase 2 readback bytes into `map` after `srcs` have been dropped
+/// (so COM refcounts are restored to 1) and the lookup cache invalidated.
+fn apply_readback_demotions(
+    map: &mut BTreeMap<(u64, usize), Entry>,
+    meta: &[ReadbackCandidate],
+    readbacks: &[Vec<u8>],
+    completed_fence: u64,
+    budget: &mut CardBudget,
+    sync_global_bytes: bool,
+    to_drop: &mut Vec<ID3D12Resource>,
+) -> (u64, u64) {
+    if meta.is_empty() {
+        return (0, 0);
+    }
+    let (mut count, mut bytes) = (0u64, 0u64);
+    for (cand, gpu_bytes) in meta.iter().zip(readbacks.iter()) {
+        if gpu_bytes.len() < cand.size as usize {
+            continue;
+        }
+        if let Some(entry) = map.get_mut(&cand.key) {
+            let freed = demote_entry_in_place(
+                entry,
+                cand.id,
+                Some((cand.fence, cand.tick)),
+                completed_fence,
+                Some(gpu_bytes),
+                budget,
+                sync_global_bytes,
+                to_drop,
+            );
+            if freed > 0 {
+                count += 1;
+                bytes += freed;
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Runs both Phase 1 (fast) and Phase 2 (GPU-readback) fence-safe LRU demotion
+/// over cold `< 1 MiB` card buffers in `BUFFERS`, never holding `BUFFERS` lock
+/// across GPU command execution or COM resource destruction.
+fn demote_cold_small_global(target_bytes: u64, host: &crate::host::Host) -> (u64, u64) {
+    if target_bytes == 0 || !card_demote_on() {
+        return (0, 0);
+    }
+    let completed = host.completed_fence();
+    if completed == u64::MAX {
+        return (0, 0);
+    }
+    let mut to_drop = Vec::new();
+    let (mut total_count, mut total_bytes) = (0u64, 0u64);
+    let (meta, srcs) = {
+        let mut map = buffers();
+        let (c1, b1) = {
+            let mut budget = CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+            demote_fast_small_in_map(&mut map, target_bytes, completed, &mut budget, true, &mut to_drop)
+        };
+        total_count += c1;
+        total_bytes += b1;
+        let rem = target_bytes.saturating_sub(total_bytes);
+        collect_readback_candidates(&map, rem, completed)
+    };
+    // Drop Phase 1 VRAM buffers outside `BUFFERS` lock.
+    drop(to_drop);
+    if meta.is_empty() {
+        return (total_count, total_bytes);
+    }
+    let readbacks = host.demote_readback(&srcs);
+    // Release our temporary `ID3D12Resource` clones BEFORE checking COM refcounts.
+    drop(srcs);
+    let Some(readbacks) = readbacks else {
+        return (total_count, total_bytes);
+    };
+    let mut to_drop2 = Vec::new();
+    {
+        let mut map = buffers();
+        let completed_now = host.completed_fence();
+        let mut budget = CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        let (c2, b2) = apply_readback_demotions(
+            &mut map,
+            &meta,
+            &readbacks,
+            completed_now,
+            &mut budget,
+            true,
+            &mut to_drop2,
+        );
+        total_count += c2;
+        total_bytes += b2;
+    }
+    drop(to_drop2);
+    if total_count > 0 {
+        crate::host::trail(|| {
+            format!(
+                "card demotion: {total_count} cold small card buffers ({} KiB) demoted to host RAM",
+                total_bytes >> 10
+            )
+        });
+    }
+    (total_count, total_bytes)
+}
+
+/// Called periodically from `Host::sweep`: when DXGI local video-memory usage
+/// exceeds the pressure threshold (default 88%), safely demotes cold,
+/// fence-completed `< 1 MiB` card buffers back to host RAM to relieve VRAM
+/// pressure on 8-12 GB cards without disturbing hot `>= 1 MiB` buffers.
+pub(crate) fn demote_under_pressure(video_memory: Option<[u64; 4]>) -> (u64, u64) {
+    if !cards() || !card_demote_on() {
+        return (0, 0);
+    }
+    let target = dxgi_demote_target_bytes(video_memory, card_small_bytes(), card_pressure_pct());
+    if target == 0 {
+        return (0, 0);
+    }
+    let Some(host) = host() else {
+        return (0, 0);
+    };
+    let (count, bytes) = demote_cold_small_global(target, host);
+    if bytes > 0 {
+        // Surrender this headroom from `card_room_kept()` so `used + card_room_kept()`
+        // in `resource::room()` genuinely drops by `bytes` for streaming textures.
+        CARD_PRESSURE_RELEASED.fetch_add(bytes, Ordering::Relaxed);
+    }
+    (count, bytes)
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -412,64 +1130,6 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
-/// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
-    if !cards() {
-        return None;
-    }
-    let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
-    }
-    let host = host()?;
-    if !host.card_ready() {
-        return None;
-    }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
-    // (With `card_room_kept_on` the texture queue kept this copy's room
-    // free, and the copy may go up to the queue's own line.)
-    let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
-    {
-        // Said, with the numbers it was decided by: run 193 made 31 copies
-        // of 95 and no line named the others. The first 64, then every
-        // 32nd.
-        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
-        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
-        if n <= 64 || n.is_multiple_of(32) {
-            tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
-                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
-                size >> 10,
-                used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
-                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
-                most >> 20,
-                n,
-                bytes >> 20,
-                crate::frame::current()
-            );
-        }
-        return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-    }
-    buffer
-}
-
 /// The most bytes of windows outside buffers whose copies go to the card's
 /// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
 ///
@@ -484,7 +1144,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 ///
 /// A window goes to the card while there is room under this number and
 /// while a fifth of the card's budget is free, as title buffers do
-/// (`card_for`): textures keep their room, and once they have filled the
+/// (`lookup`): textures keep their room, and once they have filled the
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
@@ -2219,13 +2879,22 @@ fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     {
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+    // Mapped copies share the local cap but keep their own 80% DXGI check.
+    let reserve = card_large_reserve();
+    {
+        let mut budget = CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        match budget.try_admit(size, 0, most, reserve, None, false, card_pressure_pct()) {
+            CardAdmit::Admitted => CARD_BYTES[0].store(budget.total_bytes, Ordering::Relaxed),
+            CardAdmit::ReservedForLarge => {
+                CARD_TIER_STATS[2].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            _ => return None,
+        }
     }
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        release_card_bytes(size, false);
     }
     made
 }
@@ -2696,16 +3365,23 @@ impl Drop for Shadow {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         } else if self.mapped {
             // A write-combined buffer's (`wc_bar`), counted with card sides.
-            CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
+            release_card_bytes(self.width(), false);
         }
-        if let Some(card) = &mut self.card {
-            if window {
-                WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+        if let Some(card) = &mut self.card
+            && card.counted
+        {
+            let had_before = card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some();
+            if !window && card.local {
+                release_card_bytes(card.size, had_before);
             } else {
-                CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
-            }
-            if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
-                CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+                if window {
+                    WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                } else {
+                    SHARED_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                }
+                if had_before {
+                    CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+                }
             }
         }
     }
@@ -3083,6 +3759,17 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// Placement changes get a new ID so caches cannot name the old resource.
+fn next_shadow_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_access_tick() -> u64 {
+    static TICK: AtomicU64 = AtomicU64::new(1);
+    TICK.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -3153,6 +3840,7 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.note_access();
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -3161,6 +3849,30 @@ impl Shadow {
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.
         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
+    }
+
+    fn note_access(&self) {
+        // Keep window aging as before. Only small local copies need LRU.
+        if !self.window && self.card.as_ref().is_some_and(|card| card.local && card.size < LARGE_CARD_MIN) {
+            self.used.fetch_max(crate::host::moment(), Ordering::Relaxed);
+            self.access_tick.fetch_max(next_access_tick(), Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn note_gpu_fence(&self, fence: u64) {
+        if !self.window && self.card.as_ref().is_some_and(|card| card.local && card.size < LARGE_CARD_MIN) {
+            self.last_fence.fetch_max(fence, Ordering::Release);
+        }
+    }
+
+    fn last_fence(&self) -> u64 {
+        self.last_fence.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_gpu_written(&self) {
+        if let Some(card) = &self.card {
+            card.gpu_written.store(true, Ordering::Release);
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -3185,13 +3897,12 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            access_tick: AtomicU64::new(next_access_tick()),
+            last_fence: AtomicU64::new(0),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id: next_shadow_id(),
             card: None,
             window: false,
             changes_only: Default::default(),
@@ -3218,6 +3929,8 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.note_access();
+        self.note_gpu_written();
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -3273,6 +3986,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.note_gpu_written();
         if self.place.is_some() {
             return;
         }
@@ -3916,6 +4630,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.note_access();
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4440,6 +5155,7 @@ impl Shadow {
     /// card's side before the submission's lists run. Without one (no
     /// memory) every piece of a declared range is fetched.
     pub(crate) fn card_make_before(&self, make: impl FnOnce(u64) -> Option<ID3D12Resource>) -> bool {
+        self.note_gpu_written();
         let Some(card) = &self.card else {
             return false;
         };
@@ -4448,7 +5164,7 @@ impl Shadow {
             return false;
         }
         *before = make(card.size);
-        if before.is_some() {
+        if before.is_some() && card.counted {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
         }
         before.is_some()
@@ -4670,6 +5386,9 @@ impl Shadow {
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
+                gpu_written: AtomicBool::new(false),
+                local: false,
+                counted: false,
             });
         }
         let shadow = Arc::new(shadow);
@@ -4827,6 +5546,9 @@ mod land_tests {
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
             size: len as u64,
+            gpu_written: AtomicBool::new(false),
+            local: false,
+            counted: false,
         });
         Some(shadow)
     }
@@ -5176,6 +5898,7 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        shadow.note_access();
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -5184,6 +5907,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
+                shadow.note_access();
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -5197,19 +5921,19 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end, len <= 1, any);
-    };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
+    let mut passes_left = DEMOTE_MAX_PASSES;
+    let mut reclaim_left = DEMOTE_BATCH_MAX_BYTES * DEMOTE_MAX_PASSES as u64;
+    loop {
+        let mut map = buffers();
+        let found = map.range_mut(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
+        let Some((&key, entry)) = found else {
+            drop(map);
+            return loose(address, end, len <= 1, any);
+        };
+        if let Some(shadow) = &entry.shadow {
+            shadow.note_access();
+            return Some(shadow.clone());
+        }
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
@@ -5252,30 +5976,89 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+        let host = host()?;
+        let ready = big && size < 1 << 30 && host.card_ready();
+        let memory = if ready { host.video_memory() } else { None };
+        let admission = if ready {
+            try_admit_global_card(size, memory)
+        } else {
+            CardAdmit::OutOfRange
+        };
+        if matches!(admission, CardAdmit::CapFull | CardAdmit::DxgiPressure)
+            && size >= LARGE_CARD_MIN
+            && size <= card_limits().1
+            && passes_left > 0
+            && card_demote_on()
+        {
+            let shortfall = card_admit_shortfall(
+                size, card_total_bytes(), card_limits().1, memory, card_room_kept_on(),
+            );
+            if shortfall > 0 && shortfall <= reclaim_left && shortfall <= card_small_bytes() {
+                // No shadow lock may cover the readback or release of the
+                // old resources. On retry, find the entry again: it may
+                // have been replaced or filled in while unlocked.
+                drop(map);
+                let (_, freed) = demote_cold_small_global(shortfall, host);
+                reclaim_left = reclaim_left.saturating_sub(freed);
+                passes_left = if freed == 0 { 0 } else { passes_left - 1 };
+                continue;
+            }
+        }
+        match admission {
+            CardAdmit::ReservedForLarge => {
+                CARD_TIER_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            CardAdmit::DxgiPressure if size >= LARGE_CARD_MIN => {
+                let limit = if card_room_kept_on() { 97 } else { 80 };
+                note_card_refused(size, memory, limit);
+            }
+            _ => {}
+        }
+        let local = admission == CardAdmit::Admitted;
+        let Some((staging, data)) = host.shared_buffer(size) else {
+            if local {
+                release_card_bytes(size, false);
+            }
+            return None;
+        };
+        crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let on_card = if local { host.uav_buffer(size) } else { None };
+        if local && on_card.is_none() {
+            release_card_bytes(size, false);
+        }
+        let on_card = on_card.map(|buffer| (buffer, true)).or_else(|| {
+            if ready && card_all() {
+                let (buffer, _) = host.shared_buffer(size)?;
+                SHARED_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+                Some((buffer, false))
+            } else {
+                None
+            }
+        });
+        let (buffer, card) = if let Some((buffer, local)) = on_card {
+            if local {
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
+            }
+            let card = Card {
+                staging,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
+                size,
+                gpu_written: AtomicBool::new(false),
+                local,
+                counted: true,
+            };
+            (buffer, Some(card))
+        } else {
+            (staging, None)
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5298,9 +6081,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if shadow.card.is_some() {
             carded(&shadow);
         }
-        entry.shadow = Some(shadow);
+        entry.shadow = Some(shadow.clone());
+        return Some(shadow);
     }
-    entry.shadow.clone()
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -5501,6 +6284,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         touched: Default::default(),
         me: std::sync::OnceLock::new(),
         size: len,
+        gpu_written: AtomicBool::new(false),
+        local: place == 0,
+        counted: true,
     });
     let shadow = Arc::new(shadow);
     carded(&shadow);
@@ -5591,6 +6377,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 touched: Default::default(),
                 me: std::sync::OnceLock::new(),
                 size: len,
+                gpu_written: AtomicBool::new(false),
+                local: true,
+                counted: true,
             };
             (on_card, Some(card))
         }
@@ -5914,4 +6703,1000 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod vram_tier_tests {
+    use super::*;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+
+    /// Compute shader that writes `base + tid` to `count` consecutive dwords
+    /// starting at `offset` in a raw UAV buffer.
+    const WRITE_PATTERN_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer Params : register(b0) { uint byte_offset; uint count; uint base_val; };
+RWByteAddressBuffer buf : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x < count) {
+        buf.Store(byte_offset + tid.x * 4u, base_val + tid.x);
+    }
+}
+"#;
+
+    /// Self-contained D3D12 WARP rig so tests run deterministically in plain
+    /// `cargo test -p victory-gpu` without touching the global `Host` singleton.
+    struct WarpRig {
+        device: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        allocator: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        fence: ID3D12Fence,
+        event: HANDLE,
+        signal: u64,
+        readback_alloc: ID3D12CommandAllocator,
+        readback_list: ID3D12GraphicsCommandList,
+        readback_fence: ID3D12Fence,
+        readback_event: HANDLE,
+        readback_signal: u64,
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+
+    impl Drop for WarpRig {
+        fn drop(&mut self) {
+            // SAFETY: handles created by `CreateEventW` in `WarpRig::new`.
+            unsafe {
+                let _ = CloseHandle(self.event);
+                let _ = CloseHandle(self.readback_event);
+            }
+        }
+    }
+
+    impl WarpRig {
+        fn new() -> Option<Self> {
+            let adapter = crate::host::warp_adapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            // SAFETY: creating a software WARP device and standard D3D12 objects.
+            unsafe {
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                let device = device.expect("WARP device");
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .expect("WARP direct queue");
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("WARP allocator");
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .expect("WARP list");
+                list.Close().expect("close WARP list");
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("WARP fence");
+
+                let readback_alloc: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("WARP readback allocator");
+                let readback_list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &readback_alloc, None)
+                    .expect("WARP readback list");
+                readback_list.Close().expect("close WARP readback list");
+                let readback_fence: ID3D12Fence = device
+                    .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                    .expect("WARP readback fence");
+
+                let code = crate::host::compile(
+                    WRITE_PATTERN_CS,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                )
+                .expect("compile the WARP write pattern");
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).expect("WARP root signature");
+                let pso: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .expect("WARP write-pattern pipeline");
+                let event = CreateEventW(None, false, false, None).expect("WARP event");
+                let readback_event = CreateEventW(None, false, false, None).expect("WARP readback event");
+
+                Some(Self {
+                    device,
+                    queue,
+                    allocator,
+                    list,
+                    fence,
+                    event,
+                    signal: 0,
+                    readback_alloc,
+                    readback_list,
+                    readback_fence,
+                    readback_event,
+                    readback_signal: 0,
+                    root,
+                    pso,
+                })
+            }
+        }
+
+        fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8) {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(1),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buf: Option<ID3D12Resource> = None;
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: valid D3D12 device and buffer description.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buf,
+                    )
+                    .expect("shared_buffer");
+                let buf = buf.unwrap();
+                buf.Map(0, None, Some(&mut ptr)).expect("map shared_buffer");
+                (buf, ptr.cast())
+            }
+        }
+
+        fn default_uav_buffer(&self, size: u64) -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(1),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buf: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 device and buffer description.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buf,
+                    )
+                    .expect("default_uav_buffer");
+                buf.unwrap()
+            }
+        }
+
+        /// Makes an isolated `Shadow` (either carded or host-RAM) whose `Card`
+        /// has `counted: false` so it never interferes with global counters.
+        fn make_shadow(&self, start: u64, size: u64, on_card: bool) -> Arc<Shadow> {
+            let (staging, data) = self.shared_buffer(size);
+            let (buffer, card) = if on_card {
+                let card_buf = self.default_uav_buffer(size);
+                let card = Card {
+                    staging,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    touched: Default::default(),
+                    size,
+                    gpu_written: AtomicBool::new(false),
+                    local: true,
+                    counted: false,
+                    me: std::sync::OnceLock::new(),
+                };
+                (card_buf, Some(card))
+            } else {
+                (staging, None)
+            };
+            // SAFETY: live D3D12 buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, start, size);
+            shadow.card = card;
+            Arc::new(shadow)
+        }
+
+        fn completed_fence(&self) -> u64 {
+            // SAFETY: plain fence query.
+            unsafe { self.fence.GetCompletedValue() }
+        }
+
+        fn run_and_wait(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> u64 {
+            self.signal += 1;
+            let target = self.signal;
+            // SAFETY: allocator/list are idle between waits.
+            unsafe {
+                self.allocator.Reset().unwrap();
+                self.list.Reset(&self.allocator, None).unwrap();
+                record(&self.list);
+                self.list.Close().unwrap();
+                let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
+                self.queue.ExecuteCommandLists(&lists);
+                self.queue.Signal(&self.fence, target).unwrap();
+                self.fence.SetEventOnCompletion(target, self.event).unwrap();
+                WaitForSingleObject(self.event, INFINITE);
+            }
+            target
+        }
+
+        fn upload_staging_to_card(&mut self, shadow: &Shadow) -> u64 {
+            let card = shadow.card.as_ref().expect("carded shadow");
+            let len = card.size;
+            let fence = self.run_and_wait(|list| unsafe {
+                list.CopyBufferRegion(&shadow.buffer, 0, &card.staging, 0, len);
+            });
+            card.dirty.lock().unwrap().clear();
+            shadow.note_gpu_fence(fence);
+            fence
+        }
+
+        fn dispatch_uav_write(&mut self, shadow: &Shadow, byte_offset: u32, count: u32, base_val: u32) -> u64 {
+            let va = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+            let root = self.root.clone();
+            let pso = self.pso.clone();
+            let fence = self.run_and_wait(|list| unsafe {
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                let constants = [byte_offset, count, base_val];
+                list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                list.SetComputeRootUnorderedAccessView(1, va);
+                list.Dispatch(count.div_ceil(64), 1, 1);
+            });
+            shadow.note_gpu_fence(fence);
+            fence
+        }
+
+        fn read_gpu_buffer(&mut self, src: &ID3D12Resource, len: u64) -> Vec<u8> {
+            let (rb, ptr) = self.shared_buffer(len);
+            self.run_and_wait(|list| unsafe {
+                list.CopyBufferRegion(&rb, 0, src, 0, len);
+            });
+            // SAFETY: copy finished and `rb` is persistently mapped at `ptr`.
+            unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec()
+        }
+
+        fn demote_readback(&mut self, srcs: &[(ID3D12Resource, u64)]) -> Option<Vec<Vec<u8>>> {
+            let total: u64 = srcs.iter().map(|&(_, l)| l).sum();
+            if total == 0 {
+                return Some(Vec::new());
+            }
+            let (staging, ptr) = self.shared_buffer(total.next_multiple_of(64 * KIB));
+            self.readback_signal += 1;
+            // SAFETY: this queue owns the idle allocator and list, and the
+            // live staging mapping holds all the source bytes.
+            unsafe {
+                crate::host::demote_readback_run(
+                    &self.readback_alloc,
+                    &self.readback_list,
+                    &self.queue,
+                    &self.readback_fence,
+                    self.readback_event,
+                    self.readback_signal,
+                    &staging,
+                    ptr,
+                    srcs,
+                    None,
+                )
+            }
+            .ok()
+        }
+    }
+
+    /// (a) Unit test: with `VICTORY_CARD_BUFFERS_MIN_KB=64` and 1024 MiB / 512 MiB
+    /// caps, a flood of thousands of 64 KiB buffers stops at `cap - reserve`
+    /// (`ReservedForLarge`) and cannot starve subsequent `>= 1 MiB` buffers.
+    #[test]
+    fn small_buffer_flood_cannot_starve_large_buffers_with_tiered_reserve() {
+        // Default 1024 MiB cap with 64 KiB min -> reserve = min(256 MiB, 1024/3) = 256 MiB.
+        assert_eq!(card_large_reserve_for(64 * KIB, 1024 * MIB, None), 256 * MIB);
+        // Smaller 512 MiB cap -> reserve = min(256 MiB, 512/3) = 170 MiB (+ fraction).
+        assert_eq!(card_large_reserve_for(64 * KIB, 512 * MIB, None), (512 * MIB) / 3);
+        // Min >= 1 MiB -> no small buffers exist, reserve is 0.
+        assert_eq!(card_large_reserve_for(MIB, 1024 * MIB, None), 0);
+        // Explicit override 0 disables; huge override clamps to cap.
+        assert_eq!(card_large_reserve_for(64 * KIB, 1024 * MIB, Some(0)), 0);
+        assert_eq!(card_large_reserve_for(64 * KIB, 1024 * MIB, Some(2048)), 1024 * MIB);
+
+        // A flood of 16,384 small buffers of 64 KiB arrives first.
+        let (least, most) = (64 * KIB, 1024 * MIB);
+        let reserve = card_large_reserve_for(least, most, None);
+        let mut budget = CardBudget::default();
+        let mut small_admitted = 0u64;
+        let mut reserved_rejects = 0u64;
+        for _ in 0..16_384 {
+            match budget.try_admit(64 * KIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT) {
+                CardAdmit::Admitted => small_admitted += 1,
+                CardAdmit::ReservedForLarge => reserved_rejects += 1,
+                other => panic!("unexpected outcome during small flood: {other:?}"),
+            }
+        }
+        assert_eq!(small_admitted * 64 * KIB, 768 * MIB);
+        assert_eq!(reserved_rejects, 4_096);
+        assert_eq!(budget.small_bytes, 768 * MIB);
+        assert_eq!(budget.total_bytes, 768 * MIB);
+
+        // Now 16 hot 16 MiB buffers (= 256 MiB total) arrive: EVERY ONE fits!
+        for i in 0..16 {
+            assert_eq!(
+                budget.try_admit(16 * MIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT),
+                CardAdmit::Admitted,
+                "large buffer {i} must not be starved by small-buffer flood"
+            );
+        }
+        assert_eq!(budget.total_bytes, 1024 * MIB);
+        assert_eq!(budget.small_bytes, 768 * MIB);
+        // One more large buffer hits CapFull (triggering demotion of cold small buffers).
+        assert_eq!(
+            budget.try_admit(16 * MIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT),
+            CardAdmit::CapFull
+        );
+
+        // Conversely, when large buffers already occupy 800 MiB (> 256 MiB reserve),
+        // small buffers may still use the remaining 224 MiB without wasting the cap.
+        let mut b2 = CardBudget::default();
+        assert_eq!(b2.try_admit(800 * MIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT), CardAdmit::Admitted);
+        for _ in 0..(224 * 16) {
+            assert_eq!(b2.try_admit(64 * KIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT), CardAdmit::Admitted);
+        }
+        assert_eq!(b2.total_bytes, 1024 * MIB);
+        assert_eq!(b2.try_admit(64 * KIB, least, most, reserve, None, true, DEFAULT_DXGI_PRESSURE_PCT), CardAdmit::CapFull);
+    }
+
+    /// (c) Unit test: DXGI pressure policy on 8 GB and 12 GB GPUs triggers
+    /// cleanly above 88% (aiming down to 84%) and guards small admissions above 85%.
+    #[test]
+    fn dxgi_pressure_target_reclaims_headroom_on_8gb_and_12gb_cards() {
+        // Simulated 8 GB card (DXGI local budget ~7,200 MiB) and 12 GB card (~11,200 MiB).
+        for (label, budget_mb) in [("8GB", 7_200u64), ("12GB", 11_200u64)] {
+            let vram = budget_mb * MIB;
+            let small_resident = 512 * MIB;
+
+            // Below 88% -> zero demotion.
+            assert_eq!(
+                dxgi_demote_target_bytes(Some([vram, vram * 80 / 100, 0, 0]), small_resident, 88),
+                0,
+                "{label} at 80%"
+            );
+            assert_eq!(
+                dxgi_demote_target_bytes(Some([vram, vram * 87 / 100, 0, 0]), small_resident, 88),
+                0,
+                "{label} at 87%"
+            );
+
+            // At 88% -> targets 84% (4% of budget), clamped to small_resident.
+            let at_88 = dxgi_demote_target_bytes(Some([vram, vram * 88 / 100, 0, 0]), small_resident, 88);
+            assert_eq!(at_88, (vram * 4 / 100).min(small_resident), "{label} at 88%");
+
+            // At 92% -> targets 84% (8% of budget), clamped to small_resident.
+            let at_92 = dxgi_demote_target_bytes(Some([vram, vram * 92 / 100, 0, 0]), small_resident, 88);
+            assert_eq!(at_92, (vram * 8 / 100).min(small_resident), "{label} at 92%");
+
+            // Small-buffer admission blocks above 85% DXGI usage while >=1 MiB
+            // buffers still admit up to 97% when `card_room_kept` is on.
+            let mut cb = CardBudget::default();
+            let vm_86 = Some([vram, vram * 86 / 100, 0, 0]);
+            assert_eq!(
+                cb.try_admit(64 * KIB, 64 * KIB, 1024 * MIB, 256 * MIB, vm_86, true, 88),
+                CardAdmit::DxgiPressure,
+                "{label}: small buffer must not admit at 86% DXGI usage"
+            );
+            assert_eq!(
+                cb.try_admit(16 * MIB, 64 * KIB, 1024 * MIB, 256 * MIB, vm_86, true, 88),
+                CardAdmit::Admitted,
+                "{label}: hot >=1 MiB buffer still admits at 86% DXGI usage"
+            );
+        }
+    }
+
+    /// (a) D3D12 WARP test: flooding 64 KiB buffers cannot starve `>= 1 MiB`
+    /// buffers, and when a second `>= 1 MiB` buffer hits `CapFull`, cold small
+    /// buffers are demoted in strict LRU order to make room on the card.
+    #[test]
+    fn warp_small_buffer_flood_reserves_headroom_and_demotes_for_large_buffers() {
+        let Some(rig) = WarpRig::new() else {
+            eprintln!("vram_tier_tests: WARP adapter unavailable, skipping");
+            return;
+        };
+        let (least, most) = (64 * KIB, 3 * MIB);
+        let reserve = card_large_reserve_for(least, most, None); // 1 MiB
+        assert_eq!(reserve, MIB);
+
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        let mut budget = CardBudget::default();
+        let before_stats = card_tier_stats();
+
+        // Flood 48 x 64 KiB (= 3 MiB) small buffers.
+        let mut local_reserved_rejects = 0u64;
+        for i in 0..48u64 {
+            let start = 0x1000_0000 + i * (64 * KIB);
+            let admit = budget.try_admit(64 * KIB, least, most, reserve, None, true, 88);
+            let on_card = match admit {
+                CardAdmit::Admitted => true,
+                CardAdmit::ReservedForLarge => {
+                    local_reserved_rejects += 1;
+                    CARD_TIER_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                other => panic!("unexpected small admit #{i}: {other:?}"),
+            };
+            let shadow = rig.make_shadow(start, 64 * KIB, on_card);
+            map.insert(
+                (start, i as usize + 1),
+                Entry {
+                    end: start + 64 * KIB,
+                    shadow: Some(shadow),
+                },
+            );
+        }
+        assert_eq!(local_reserved_rejects, 16);
+        assert_eq!(budget.small_bytes, 2 * MIB);
+        assert_eq!(budget.total_bytes, 2 * MIB);
+        assert!(card_tier_stats().card_reserved_large_rejects >= before_stats.card_reserved_large_rejects + 16);
+
+        // Make small buffers 0..16 visibly warmer than 16..32 so 16..32 are coldest.
+        for i in 0..16u64 {
+            let key = (0x1000_0000 + i * (64 * KIB), i as usize + 1);
+            map.get(&key).unwrap().shadow.as_ref().unwrap().note_access();
+        }
+
+        // First hot 1 MiB buffer fits immediately into reserved headroom!
+        let large1_start = 0x2000_0000u64;
+        assert_eq!(
+            budget.try_admit(MIB, least, most, reserve, None, true, 88),
+            CardAdmit::Admitted
+        );
+        map.insert(
+            (large1_start, 1001),
+            Entry {
+                end: large1_start + MIB,
+                shadow: Some(rig.make_shadow(large1_start, MIB, true)),
+            },
+        );
+        assert_eq!(budget.total_bytes, 3 * MIB);
+
+        // Second hot 1 MiB buffer hits CapFull -> demote 1 MiB of cold small buffers.
+        let large2_start = 0x2100_0000u64;
+        assert_eq!(
+            budget.try_admit(MIB, least, most, reserve, None, true, 88),
+            CardAdmit::CapFull
+        );
+        let mut to_drop = Vec::new();
+        let (demoted_n, demoted_b) =
+            demote_fast_small_in_map(&mut map, MIB, rig.completed_fence(), &mut budget, false, &mut to_drop);
+        drop(to_drop);
+        assert_eq!(demoted_n, 16);
+        assert_eq!(demoted_b, MIB);
+        assert_eq!(budget.small_bytes, MIB);
+        assert_eq!(budget.total_bytes, 2 * MIB);
+
+        // Coldest small buffers (16..32) were demoted; warmer ones (0..16) stayed carded!
+        for i in 0..16u64 {
+            let key = (0x1000_0000 + i * (64 * KIB), i as usize + 1);
+            assert!(map.get(&key).unwrap().shadow.as_ref().unwrap().carded(), "warm small buffer {i} stayed on card");
+        }
+        for i in 16..32u64 {
+            let key = (0x1000_0000 + i * (64 * KIB), i as usize + 1);
+            assert!(!map.get(&key).unwrap().shadow.as_ref().unwrap().carded(), "cold small buffer {i} demoted");
+        }
+
+        // Now second hot 1 MiB buffer admits cleanly onto the card!
+        assert_eq!(
+            budget.try_admit(MIB, least, most, reserve, None, true, 88),
+            CardAdmit::Admitted
+        );
+        map.insert(
+            (large2_start, 1002),
+            Entry {
+                end: large2_start + MIB,
+                shadow: Some(rig.make_shadow(large2_start, MIB, true)),
+            },
+        );
+        assert!(map.get(&(large1_start, 1001)).unwrap().shadow.as_ref().unwrap().carded());
+        assert!(map.get(&(large2_start, 1002)).unwrap().shadow.as_ref().unwrap().carded());
+    }
+
+    /// (b) D3D12 WARP test: demotion syncs GPU shader writes back from VRAM
+    /// while preserving pending CPU dirty ranges in staging, losing zero bytes.
+    #[test]
+    fn warp_demotion_preserves_exact_bytes_across_gpu_writes_and_cpu_dirty_ranges() {
+        let Some(mut rig) = WarpRig::new() else {
+            eprintln!("vram_tier_tests: WARP adapter unavailable, skipping");
+            return;
+        };
+        const LEN: u64 = 64 * KIB;
+        let key = (0x3000_0000u64, 3001usize);
+        let shadow = rig.make_shadow(key.0, LEN, true);
+        let old_id = shadow.id();
+
+        // 1. Fill initial pattern P0 in staging and upload to card VRAM.
+        let mut expected = vec![0u32; (LEN / 4) as usize];
+        for (i, word) in expected.iter_mut().enumerate() {
+            *word = 0x5A00_0000 | (i as u32);
+        }
+        // SAFETY: `shadow.data` maps `LEN` bytes of `card.staging`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr().cast::<u8>(), shadow.data, LEN as usize);
+        }
+        let f1 = rig.upload_staging_to_card(&shadow);
+        assert!(rig.completed_fence() >= f1);
+
+        // 2. Execute a real WARP compute shader writing G1 directly into VRAM
+        //    at byte offset 0x2000..0x2400 (256 dwords). Staging still has P0 there!
+        const GPU_OFF: usize = 0x2000;
+        const GPU_WORDS: usize = 256;
+        const GPU_BASE: u32 = 0xCAFE_1000;
+        let f2 = rig.dispatch_uav_write(&shadow, GPU_OFF as u32, GPU_WORDS as u32, GPU_BASE);
+        assert!(rig.completed_fence() >= f2);
+        for i in 0..GPU_WORDS {
+            expected[GPU_OFF / 4 + i] = GPU_BASE + i as u32;
+        }
+
+        // 3. Write a pending CPU dirty range C2 at byte offset 0x8000..0x8400
+        //    into staging ONLY (not uploaded to VRAM).
+        const CPU_OFF: usize = 0x8000;
+        const CPU_WORDS: usize = 256;
+        const CPU_BASE: u32 = 0xBEEF_2000;
+        for i in 0..CPU_WORDS {
+            let val = CPU_BASE + i as u32;
+            expected[CPU_OFF / 4 + i] = val;
+            // SAFETY: inside `LEN`-byte staging mapping.
+            unsafe {
+                shadow.data.add(CPU_OFF + i * 4).cast::<u32>().write(val);
+            }
+        }
+        shadow.card_changed(CPU_OFF, CPU_OFF + CPU_WORDS * 4);
+
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        map.insert(
+            key,
+            Entry {
+                end: key.0 + LEN,
+                shadow: Some(shadow),
+            },
+        );
+        let mut budget = CardBudget {
+            total_bytes: LEN,
+            small_bytes: LEN,
+        };
+        let stats_before = card_tier_stats();
+
+        // Phase 1 fast path must NOT demote it because GPU touched it (needs readback).
+        let mut to_drop = Vec::new();
+        let (c1, b1) = demote_fast_small_in_map(&mut map, LEN, rig.completed_fence(), &mut budget, false, &mut to_drop);
+        assert_eq!((c1, b1), (0, 0), "GPU-touched buffer requires readback before demotion");
+
+        // Phase 2 readback demotion: collect -> GPU readback -> drop clones -> apply.
+        let (meta, srcs) = collect_readback_candidates(&map, LEN, rig.completed_fence());
+        assert_eq!(meta.len(), 1);
+        let readbacks = rig.demote_readback(&srcs).expect("WARP demote readback");
+        drop(srcs);
+        let (c2, b2) = apply_readback_demotions(
+            &mut map,
+            &meta,
+            &readbacks,
+            rig.completed_fence(),
+            &mut budget,
+            false,
+            &mut to_drop,
+        );
+        drop(to_drop);
+
+        assert_eq!((c2, b2), (1, LEN));
+        assert_eq!(budget, CardBudget { total_bytes: 0, small_bytes: 0 });
+        let stats_after = card_tier_stats();
+        assert!(stats_after.card_demoted_count > stats_before.card_demoted_count);
+        assert!(stats_after.card_demoted_bytes >= stats_before.card_demoted_bytes + LEN);
+
+        // Verify demoted shadow is now in host RAM with a fresh ID and 100% exact bytes!
+        let demoted = map.get(&key).unwrap().shadow.as_ref().unwrap();
+        assert!(!demoted.carded(), "buffer must now reside in host RAM");
+        assert_ne!(demoted.id(), old_id, "demoted shadow receives fresh ID");
+
+        // Check CPU-mapped bytes directly.
+        // SAFETY: `demoted.data` maps `LEN` bytes of the now-primary host buffer.
+        let cpu_words = unsafe { std::slice::from_raw_parts(demoted.data.cast::<u32>(), (LEN / 4) as usize) };
+        assert_eq!(cpu_words, expected.as_slice(), "CPU-mapped bytes after demotion must match P0+G1+C2 exactly");
+
+        // Also read `demoted.buffer` from the WARP GPU via CopyBufferRegion!
+        let gpu_bytes = rig.read_gpu_buffer(&demoted.buffer, LEN);
+        let gpu_words: Vec<u32> = gpu_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(gpu_words, expected, "GPU-visible bytes of demoted host buffer must match P0+G1+C2 exactly");
+    }
+
+    /// D3D12 WARP: sparse CPU patches survive demotion alongside GPU writes,
+    /// even when both touch nearby bytes. Full dirty coverage skips readback.
+    #[test]
+    fn warp_demotion_preserves_pending_masked_patch_ranges_and_gpu_writes() {
+        let Some(mut rig) = WarpRig::new() else {
+            eprintln!("vram_tier_tests: WARP adapter unavailable, skipping");
+            return;
+        };
+        const LEN: u64 = 64 * KIB;
+        let key = (0x3500_0000u64, 3501usize);
+        let shadow = rig.make_shadow(key.0, LEN, true);
+
+        // 1. Seed initial pattern P0 in staging and upload to card VRAM.
+        let mut expected = vec![0u8; LEN as usize];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(37)) ^ (i >> 8)) as u8;
+        }
+        // SAFETY: `shadow.data` maps `LEN` bytes of `card.staging`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), shadow.data, LEN as usize);
+        }
+        let f1 = rig.upload_staging_to_card(&shadow);
+        assert!(rig.completed_fence() >= f1);
+
+        // 2. Run a real WARP UAV compute write G1 directly into VRAM at 0x2000..0x2400.
+        const GPU_OFF: usize = 0x2000;
+        const GPU_WORDS: usize = 256;
+        const GPU_BASE: u32 = 0xD00D_4000;
+        let f2 = rig.dispatch_uav_write(&shadow, GPU_OFF as u32, GPU_WORDS as u32, GPU_BASE);
+        assert!(rig.completed_fence() >= f2);
+        for i in 0..GPU_WORDS {
+            expected[GPU_OFF + i * 4..GPU_OFF + (i + 1) * 4]
+                .copy_from_slice(&(GPU_BASE + i as u32).to_le_bytes());
+        }
+
+        // 3. Patch staging at unaligned byte ranges inside and outside G1.
+        // Upstream queues sparse edits in the same dirty list as whole copies.
+        let patch1 = [0xA1u8, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x77];
+        let patch2 = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF1, 0xE2, 0xD3, 0xC4,
+        ];
+        expected[0x2010..0x2017].copy_from_slice(&patch1);
+        expected[0x9003..0x9015].copy_from_slice(&patch2);
+        // SAFETY: both slices lie strictly inside the `LEN`-byte staging mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(patch1.as_ptr(), shadow.data.add(0x2010), patch1.len());
+            std::ptr::copy_nonoverlapping(patch2.as_ptr(), shadow.data.add(0x9003), patch2.len());
+        }
+        shadow.card_changed_runs([(0x2010, 0x2017), (0x9003, 0x9015)].into_iter());
+        assert_eq!(shadow.card_dirty_now(), vec![(0x2010, 0x2017), (0x9003, 0x9015)]);
+
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        map.insert(
+            key,
+            Entry {
+                end: key.0 + LEN,
+                shadow: Some(shadow),
+            },
+        );
+        let mut budget = CardBudget {
+            total_bytes: LEN,
+            small_bytes: LEN,
+        };
+
+        // Fast path must defer to readback because untouched GPU bytes exist outside patch ranges.
+        let mut to_drop = Vec::new();
+        assert_eq!(
+            demote_fast_small_in_map(&mut map, LEN, rig.completed_fence(), &mut budget, false, &mut to_drop),
+            (0, 0)
+        );
+        let (meta, srcs) = collect_readback_candidates(&map, LEN, rig.completed_fence());
+        assert_eq!(meta.len(), 1);
+        let readbacks = rig.demote_readback(&srcs).expect("WARP demote readback");
+        drop(srcs);
+        let (c2, b2) = apply_readback_demotions(
+            &mut map,
+            &meta,
+            &readbacks,
+            rig.completed_fence(),
+            &mut budget,
+            false,
+            &mut to_drop,
+        );
+        drop(to_drop);
+        assert_eq!((c2, b2), (1, LEN));
+
+        let demoted = map.get(&key).unwrap().shadow.as_ref().unwrap();
+        assert!(!demoted.carded());
+        // SAFETY: `demoted.data` maps `LEN` bytes of the now-primary host buffer.
+        let cpu_bytes = unsafe { std::slice::from_raw_parts(demoted.data, LEN as usize) };
+        assert_eq!(
+            cpu_bytes,
+            expected.as_slice(),
+            "CPU staging must keep masked-patch bytes and merge surrounding GPU-written bytes"
+        );
+        let gpu_bytes = rig.read_gpu_buffer(&demoted.buffer, LEN);
+        assert_eq!(
+            gpu_bytes, expected,
+            "GPU-visible demoted buffer must preserve both masked-patch and GPU-written bytes"
+        );
+
+        // Whole and sparse dirty runs can together cover the entire buffer.
+        let covered_shadow = rig.make_shadow(0x3600_0000, LEN, true);
+        let f3 = rig.dispatch_uav_write(&covered_shadow, 0, 16, 0x1111_0000);
+        assert!(rig.completed_fence() >= f3);
+        let (mid, end) = ((LEN / 2) as usize, LEN as usize);
+        covered_shadow.card_changed(0, mid);
+        covered_shadow.card_changed_runs([(mid, end)].into_iter());
+        let (_, _, needs_readback) =
+            small_card_demotable(&covered_shadow, rig.completed_fence()).expect("demotable");
+        assert!(
+            !needs_readback,
+            "full coverage by whole and sparse dirty ranges needs no GPU readback"
+        );
+    }
+
+    /// (b) D3D12 WARP test: demotion strictly respects GPU flight fences,
+    /// active `Arc<Shadow>` references, descriptor COM refs, and pending writes.
+    #[test]
+    fn warp_demotion_never_evicts_inflight_or_referenced_card_buffers() {
+        let Some(mut rig) = WarpRig::new() else {
+            eprintln!("vram_tier_tests: WARP adapter unavailable, skipping");
+            return;
+        };
+        const LEN: u64 = 64 * KIB;
+        let key = (0x4000_0000u64, 4001usize);
+        let shadow = rig.make_shadow(key.0, LEN, true);
+        let f_done = rig.dispatch_uav_write(&shadow, 0x100, 16, 0x7777_0000);
+        // Simulate a newer in-flight GPU submission at `f_done + 1`.
+        shadow.note_gpu_fence(f_done + 1);
+
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        map.insert(
+            key,
+            Entry {
+                end: key.0 + LEN,
+                shadow: Some(shadow),
+            },
+        );
+
+        // 1. In-flight GPU fence (`last_fence = f_done + 1 > completed = f_done`) -> REFUSED.
+        let (meta, _) = collect_readback_candidates(&map, LEN, f_done);
+        assert!(meta.is_empty(), "must NEVER demote buffer with in-flight GPU fence");
+
+        // 2. Fence completed, but extra `Arc<Shadow>` held (active command list) -> REFUSED.
+        let held_arc = map.get(&key).unwrap().shadow.clone().unwrap();
+        let (meta, _) = collect_readback_candidates(&map, LEN, f_done + 1);
+        assert!(meta.is_empty(), "must NEVER demote buffer held by active command list");
+        drop(held_arc);
+
+        // 3. Fence completed, but extra COM ref held (descriptor slot) -> REFUSED.
+        let held_com = map.get(&key).unwrap().shadow.as_ref().unwrap().buffer.clone();
+        let (meta, _) = collect_readback_candidates(&map, LEN, f_done + 1);
+        assert!(meta.is_empty(), "must NEVER demote buffer bound to a live descriptor slot");
+        drop(held_com);
+
+        // 4. Fence completed, but `pending` shader write not yet merged -> REFUSED.
+        map.get(&key)
+            .unwrap()
+            .shadow
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .push((key.0 as usize, (key.0 + LEN) as usize));
+        let (meta, _) = collect_readback_candidates(&map, LEN, f_done + 1);
+        assert!(meta.is_empty(), "must NEVER demote buffer with pending un-merged shader writes");
+        map.get(&key).unwrap().shadow.as_ref().unwrap().pending.lock().unwrap().clear();
+
+        // 5. All guards satisfied -> demotion succeeds and preserves GPU-written dwords!
+        let completed = f_done + 1;
+        let (meta, srcs) = collect_readback_candidates(&map, LEN, completed);
+        assert_eq!(meta.len(), 1);
+        let readbacks = rig.demote_readback(&srcs).expect("WARP readback");
+        drop(srcs);
+        let mut budget = CardBudget {
+            total_bytes: LEN,
+            small_bytes: LEN,
+        };
+        let mut to_drop = Vec::new();
+        let (c, b) = apply_readback_demotions(&mut map, &meta, &readbacks, completed, &mut budget, false, &mut to_drop);
+        drop(to_drop);
+        assert_eq!((c, b), (1, LEN));
+        let demoted = map.get(&key).unwrap().shadow.as_ref().unwrap();
+        assert!(!demoted.carded());
+        for i in 0..16usize {
+            // SAFETY: inside `LEN` mapping.
+            let got = unsafe { demoted.data.add(0x100 + i * 4).cast::<u32>().read() };
+            assert_eq!(got, 0x7777_0000 + i as u32, "GPU dword {i} preserved");
+        }
+    }
+
+    /// (c) D3D12 WARP test: simulated 8 GB and 12 GB DXGI pressure safely
+    /// demotes cold small buffers in LRU order while keeping hot >=1 MiB
+    /// buffers resident on the card.
+    #[test]
+    fn warp_dxgi_8gb_and_12gb_pressure_demotes_cold_small_and_keeps_hot_large() {
+        let Some(mut rig) = WarpRig::new() else {
+            eprintln!("vram_tier_tests: WARP adapter unavailable, skipping");
+            return;
+        };
+        let mut map: BTreeMap<(u64, usize), Entry> = BTreeMap::new();
+        let mut budget = CardBudget::default();
+
+        // 12 small 64 KiB card buffers (0..6 cold, 6..12 warm), each with a
+        // unique GPU-written marker dword so we verify byte preservation too.
+        for i in 0..12u64 {
+            let start = 0x5000_0000 + i * (64 * KIB);
+            let shadow = rig.make_shadow(start, 64 * KIB, true);
+            rig.dispatch_uav_write(&shadow, 0, 4, 0xA000_0000 + (i as u32) * 0x100);
+            budget.total_bytes += 64 * KIB;
+            budget.small_bytes += 64 * KIB;
+            map.insert(
+                (start, 5000 + i as usize),
+                Entry {
+                    end: start + 64 * KIB,
+                    shadow: Some(shadow),
+                },
+            );
+        }
+        // Touch 6..12 so 0..6 are strictly colder in LRU order.
+        for i in 6..12u64 {
+            let key = (0x5000_0000 + i * (64 * KIB), 5000 + i as usize);
+            map.get(&key).unwrap().shadow.as_ref().unwrap().note_access();
+        }
+        // 2 hot 2 MiB large card buffers (= 4 MiB).
+        for j in 0..2u64 {
+            let start = 0x6000_0000 + j * (2 * MIB);
+            let shadow = rig.make_shadow(start, 2 * MIB, true);
+            budget.total_bytes += 2 * MIB;
+            map.insert(
+                (start, 6000 + j as usize),
+                Entry {
+                    end: start + 2 * MIB,
+                    shadow: Some(shadow),
+                },
+            );
+        }
+
+        // Below pressure on 8 GB card (80% of 7,200 MiB) -> 0 target.
+        let vram_8gb = 7_200 * MIB;
+        assert_eq!(dxgi_demote_target_bytes(Some([vram_8gb, vram_8gb * 80 / 100, 0, 0]), budget.small_bytes, 88), 0);
+
+        // Step 1: 8 GB card pressure (>88%), bounded to reclaim first 384 KiB (6 coldest).
+        let target_8gb = dxgi_demote_target_bytes(Some([vram_8gb, vram_8gb * 90 / 100, 0, 0]), budget.small_bytes, 88);
+        assert_eq!(target_8gb, 12 * 64 * KIB);
+        let completed = rig.completed_fence();
+        let (meta, srcs) = collect_readback_candidates(&map, 6 * 64 * KIB, completed);
+        assert_eq!(meta.len(), 6);
+        let readbacks = rig.demote_readback(&srcs).expect("8GB pressure readback");
+        drop(srcs);
+        let mut to_drop = Vec::new();
+        let (c1, b1) = apply_readback_demotions(&mut map, &meta, &readbacks, completed, &mut budget, false, &mut to_drop);
+        drop(to_drop);
+        assert_eq!((c1, b1), (6, 6 * 64 * KIB));
+        for i in 0..6u64 {
+            let key = (0x5000_0000 + i * (64 * KIB), 5000 + i as usize);
+            let s = map.get(&key).unwrap().shadow.as_ref().unwrap();
+            assert!(!s.carded(), "cold small buffer {i} demoted under 8 GB pressure");
+            // SAFETY: mapped host staging buffer.
+            let marker = unsafe { s.data.cast::<u32>().read() };
+            assert_eq!(marker, 0xA000_0000 + (i as u32) * 0x100);
+        }
+        for i in 6..12u64 {
+            let key = (0x5000_0000 + i * (64 * KIB), 5000 + i as usize);
+            assert!(map.get(&key).unwrap().shadow.as_ref().unwrap().carded(), "warmer small buffer {i} still carded");
+        }
+
+        // Step 2: 12 GB card pressure (90% of 11,200 MiB) -> reclaims remaining 6 small buffers,
+        // while BOTH hot 2 MiB large buffers stay card-resident!
+        let vram_12gb = 11_200 * MIB;
+        let target_12gb = dxgi_demote_target_bytes(Some([vram_12gb, vram_12gb * 90 / 100, 0, 0]), budget.small_bytes, 88);
+        assert_eq!(target_12gb, 6 * 64 * KIB);
+        let (meta2, srcs2) = collect_readback_candidates(&map, target_12gb, completed);
+        assert_eq!(meta2.len(), 6);
+        let readbacks2 = rig.demote_readback(&srcs2).expect("12GB pressure readback");
+        drop(srcs2);
+        let mut to_drop2 = Vec::new();
+        let (c2, b2) = apply_readback_demotions(&mut map, &meta2, &readbacks2, completed, &mut budget, false, &mut to_drop2);
+        drop(to_drop2);
+        assert_eq!((c2, b2), (6, 6 * 64 * KIB));
+        assert_eq!(budget.small_bytes, 0);
+        assert_eq!(budget.total_bytes, 4 * MIB);
+        for j in 0..2u64 {
+            let key = (0x6000_0000 + j * (2 * MIB), 6000 + j as usize);
+            assert!(
+                map.get(&key).unwrap().shadow.as_ref().unwrap().carded(),
+                "hot >=1 MiB buffer {j} must stay card-resident under DXGI pressure"
+            );
+        }
+        for i in 6..12u64 {
+            let key = (0x5000_0000 + i * (64 * KIB), 5000 + i as usize);
+            let s = map.get(&key).unwrap().shadow.as_ref().unwrap();
+            assert!(!s.carded());
+            // SAFETY: mapped host staging buffer.
+            let marker = unsafe { s.data.cast::<u32>().read() };
+            assert_eq!(marker, 0xA000_0000 + (i as u32) * 0x100);
+        }
+    }
+
+    /// Regression test for `card_room_kept()` invariants:
+    /// (1) `< 1 MiB` DXGI rejections at 85% do not collapse `card_room_kept()`;
+    /// (2) DXGI-pressure demotion records `pressure_released` so
+    ///     `used + card_room_kept()` genuinely decreases for `resource::room()`;
+    /// (3) `card_admit_shortfall` computes exact cap & DXGI shortfalls (incl.
+    ///     `> 16 MiB` multi-batch buffers and `dxgi_shortfall > size`).
+    #[test]
+    fn card_room_kept_and_admit_shortfall_preserve_vram_accounting_invariants() {
+        let most = 1024 * MIB;
+        let mut card_bytes = 500 * MIB;
+        let refused_large = 0u64;
+        let mut pressure_released = 0u64;
+        let mut used = 6_480 * MIB; // 90% of 7,200 MiB (8 GB card)
+
+        // Initial `card_room_kept` = 524 MiB.
+        let initial_kept = card_room_kept_for(most, card_bytes, refused_large, pressure_released);
+        assert_eq!(initial_kept, 524 * MIB);
+
+        // (1) Small `< 1 MiB` buffer rejected at 86% DXGI must NOT touch `refused_large`:
+        // `card_room_kept` remains 524 MiB so textures cannot starve `>= 1 MiB` buffers.
+        assert_eq!(
+            card_room_kept_for(most, card_bytes, refused_large, pressure_released),
+            524 * MIB
+        );
+
+        // (2) Pressure demotion frees 200 MiB of cold small card buffers:
+        // `card_bytes` drops by 200 MiB, `used` drops by 200 MiB, AND
+        // `pressure_released` rises by 200 MiB so `card_room_kept` stays 524 MiB
+        // and `used + card_room_kept` genuinely drops by the full 200 MiB!
+        let before_effective = used + initial_kept;
+        let demoted = 200 * MIB;
+        card_bytes -= demoted;
+        used -= demoted;
+        pressure_released += demoted;
+        let after_kept = card_room_kept_for(most, card_bytes, refused_large, pressure_released);
+        assert_eq!(after_kept, initial_kept);
+        assert_eq!(used + after_kept, before_effective - demoted);
+
+        // (3) Exact shortfall for `>= 1 MiB` buffers:
+        // CapFull for a 32 MiB buffer when 1000 MiB of 1024 MiB is used -> shortfall = 8 MiB.
+        assert_eq!(card_admit_shortfall(32 * MIB, 1000 * MIB, 1024 * MIB, None, true), 8 * MIB);
+        // CapFull for a 32 MiB buffer when cap is completely full -> shortfall = 32 MiB (> 16 MiB batch).
+        assert_eq!(card_admit_shortfall(32 * MIB, 1024 * MIB, 1024 * MIB, None, true), 32 * MIB);
+        // DxgiPressure where `used` is already above the 97% limit: shortfall > `size`!
+        let vram_8gb = 7_200 * MIB;
+        let limit_97 = (vram_8gb * 97) / 100; // 6,984 MiB
+        let used_98 = limit_97 + 10 * MIB;
+        assert_eq!(
+            card_admit_shortfall(4 * MIB, 500 * MIB, 1024 * MIB, Some([vram_8gb, used_98, 0, 0]), true),
+            14 * MIB
+        );
+    }
 }
