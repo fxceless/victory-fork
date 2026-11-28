@@ -1,16 +1,16 @@
 //! Loading a prepared image as a real Windows module and binding it.
 
 use std::collections::HashSet;
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
+use windows_sys::Win32::System::LibraryLoader::LoadLibraryExW;
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
@@ -82,7 +82,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(err) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // SAFETY: `module` was just mapped by `LoadLibraryExW` and not yet registered.
+            unsafe { FreeLibrary(loaded.module) };
+            return Err(err);
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -106,7 +110,10 @@ pub fn load_title_dlls(
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
     let dirs = (title_dir, cache_dir);
-    map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    if let Err(err) = map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded) {
+        unload_all(loaded);
+        return Err(err);
+    }
     Ok(loaded)
 }
 
@@ -122,8 +129,55 @@ pub fn load_title_dll(
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
     let dirs = (title_dir, cache_dir);
-    map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    if let Err(err) = map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded) {
+        unload_all(loaded);
+        return Err(err);
+    }
     Ok(loaded)
+}
+
+fn unload_all(loaded: Vec<(String, LoadedImage)>) {
+    for (_, image) in loaded.into_iter().rev() {
+        // SAFETY: newly mapped images whose code has never run.
+        unsafe { image.unload() };
+    }
+}
+
+/// Validates that a PE DLL reference is a single plain filename (no path
+/// separators, drive prefixes, or `.`/`..` traversal) and normalizes it to
+/// lowercase.
+fn safe_dll_name(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains(['/', '\\', ':', '\0']) || name == "." || name == ".." {
+        return None;
+    }
+    let mut comps = Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => Some(name.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Parses a PE export forwarder (`"dll.Symbol"` or `"dll.#123"`) into its
+/// target DLL filename (appending `.dll` when omitted) and [`ImportSymbol`].
+fn parse_forward(spec: &str) -> Option<(String, ImportSymbol)> {
+    let (module, target) = spec.rsplit_once('.')?;
+    if module.is_empty() || target.is_empty() {
+        return None;
+    }
+    let dll = if module.to_ascii_lowercase().ends_with(".dll") {
+        module.to_owned()
+    } else {
+        format!("{module}.dll")
+    };
+    let symbol = if let Some(ord) = target.strip_prefix('#') {
+        ImportSymbol::Ordinal(ord.parse::<u16>().ok()?)
+    } else {
+        ImportSymbol::Name {
+            hint: 0,
+            name: target.to_owned(),
+        }
+    };
+    Some((dll, symbol))
 }
 
 fn map_imports(
@@ -136,6 +190,13 @@ fn map_imports(
     for module in info.imports.iter().chain(&info.delay_imports) {
         map_dll(&module.dll, dirs, wanted, seen, loaded)?;
     }
+    for export in &info.exports {
+        if let Some(forward) = &export.forward
+            && let Some((dll, _)) = parse_forward(forward)
+        {
+            map_dll(&dll, dirs, wanted, seen, loaded)?;
+        }
+    }
     Ok(())
 }
 
@@ -146,7 +207,9 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let name = name.to_ascii_lowercase();
+    let Some(name) = safe_dll_name(name) else {
+        return Ok(());
+    };
     let path = dirs.0.join(&name);
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
@@ -154,7 +217,11 @@ fn map_dll(
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
-    map_imports(&image.info, dirs, wanted, seen, loaded)?;
+    if let Err(err) = map_imports(&image.info, dirs, wanted, seen, loaded) {
+        // SAFETY: `image` was just mapped and never attached.
+        unsafe { image.unload() };
+        return Err(err);
+    }
     loaded.push((name, image));
     Ok(())
 }
@@ -165,21 +232,46 @@ pub struct WithTitleDlls<'a> {
     pub dlls: &'a [(String, LoadedImage)],
 }
 
-impl ImportResolver for WithTitleDlls<'_> {
-    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+const MAX_FORWARD_DEPTH: usize = 16;
+
+impl WithTitleDlls<'_> {
+    fn resolve_depth(&self, dll: &str, symbol: &ImportSymbol, depth: usize) -> Resolution {
+        if depth > MAX_FORWARD_DEPTH {
+            return Resolution::Missing;
+        }
         let found = self.inner.resolve(dll, symbol);
         if found != Resolution::Missing {
             return found;
         }
-        self.dlls
+        let Some((_, image)) = self
+            .dlls
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(dll))
-            .and_then(|(_, image)| image.export_symbol(symbol))
-            .map_or(Resolution::Missing, |address| Resolution::Found {
+        else {
+            return Resolution::Missing;
+        };
+        match image.lookup_export(symbol) {
+            Some(ExportTarget::Address(address)) => Resolution::Found {
                 address,
                 provenance: Provenance::Title,
-            })
+            },
+            Some(ExportTarget::Forward(next_dll, next_symbol)) => {
+                self.resolve_depth(&next_dll, &next_symbol, depth + 1)
+            }
+            None => Resolution::Missing,
+        }
     }
+}
+
+impl ImportResolver for WithTitleDlls<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        self.resolve_depth(dll, symbol, 0)
+    }
+}
+
+enum ExportTarget {
+    Address(usize),
+    Forward(String, ImportSymbol),
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -197,21 +289,39 @@ impl LoadedImage {
         &self.info
     }
 
-    /// Address of an export of the image, if it has one by that name.
-    pub fn export(&self, name: &str) -> Option<usize> {
-        let name = CString::new(name).ok()?;
-        // SAFETY: valid module handle and NUL-terminated name.
-        unsafe { GetProcAddress(self.module, name.as_ptr().cast()) }
-            .map(|f| f as *const () as usize)
+    fn lookup_export(&self, symbol: &ImportSymbol) -> Option<ExportTarget> {
+        let entry = self.info.exports.iter().find(|e| match symbol {
+            ImportSymbol::Name { name, .. } => e.name.as_deref() == Some(name.as_str()),
+            ImportSymbol::Ordinal(o) => e.ordinal == *o,
+        })?;
+        if let Some(rva) = entry.rva {
+            if rva >= self.info.size_of_image {
+                return None;
+            }
+            return self
+                .base()
+                .checked_add(rva as usize)
+                .map(ExportTarget::Address);
+        }
+        let forward = entry.forward.as_deref()?;
+        parse_forward(forward).map(|(dll, sym)| ExportTarget::Forward(dll, sym))
     }
 
-    /// Address of an export, by name or ordinal.
+    /// Address of a non-forwarded export of the image, if it has one by that name.
+    pub fn export(&self, name: &str) -> Option<usize> {
+        self.export_symbol(&ImportSymbol::Name {
+            hint: 0,
+            name: name.to_owned(),
+        })
+    }
+
+    /// Address of a non-forwarded export, by name or ordinal. Forwarded
+    /// exports resolve through [`WithTitleDlls`] so they stay within HLE and
+    /// mapped title DLLs instead of asking the host loader.
     pub fn export_symbol(&self, symbol: &ImportSymbol) -> Option<usize> {
-        match symbol {
-            ImportSymbol::Name { name, .. } => self.export(name),
-            // SAFETY: MAKEINTRESOURCE-style ordinal lookup on a valid module.
-            ImportSymbol::Ordinal(o) => unsafe { GetProcAddress(self.module, *o as usize as _) }
-                .map(|f| f as *const () as usize),
+        match self.lookup_export(symbol) {
+            Some(ExportTarget::Address(addr)) => Some(addr),
+            Some(ExportTarget::Forward(..)) | None => None,
         }
     }
 
@@ -423,5 +533,212 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_pe::ExportInfo;
+
+    struct FakeResolver {
+        hits: Vec<(&'static str, &'static str, usize, Provenance)>,
+    }
+
+    impl ImportResolver for FakeResolver {
+        fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+            let sym_name = match symbol {
+                ImportSymbol::Name { name, .. } => name.as_str(),
+                ImportSymbol::Ordinal(_) => return Resolution::Missing,
+            };
+            self.hits
+                .iter()
+                .find(|(d, s, _, _)| d.eq_ignore_ascii_case(dll) && *s == sym_name)
+                .map_or(Resolution::Missing, |&(_, _, address, provenance)| {
+                    Resolution::Found {
+                        address,
+                        provenance,
+                    }
+                })
+        }
+    }
+
+    fn fake_image(base: usize, size_of_image: u32, exports: Vec<ExportInfo>) -> LoadedImage {
+        LoadedImage {
+            module: base as HMODULE,
+            path: PathBuf::new(),
+            info: ImageInfo {
+                machine: victory_pe::MACHINE_AMD64,
+                characteristics: 0x2000,
+                timestamp: 0,
+                subsystem: 0,
+                dll_characteristics: 0,
+                image_base: base as u64,
+                size_of_image,
+                entry_rva: 0,
+                stack_reserve: 0,
+                stack_commit: 0,
+                has_relocations: true,
+                has_exception_table: false,
+                has_load_config: false,
+                sections: Vec::new(),
+                imports: Vec::new(),
+                delay_imports: Vec::new(),
+                exports,
+                tls: None,
+                codeview: None,
+            },
+        }
+    }
+
+    #[test]
+    fn safe_dll_name_rejects_traversal_and_paths() {
+        assert_eq!(safe_dll_name("Title_Foo.DLL").as_deref(), Some("title_foo.dll"));
+        assert_eq!(safe_dll_name(""), None);
+        assert_eq!(safe_dll_name("."), None);
+        assert_eq!(safe_dll_name(".."), None);
+        assert_eq!(safe_dll_name("../evil.dll"), None);
+        assert_eq!(safe_dll_name(r"..\evil.dll"), None);
+        assert_eq!(safe_dll_name(r"sub\evil.dll"), None);
+        assert_eq!(safe_dll_name(r"C:\Windows\System32\kernel32.dll"), None);
+        assert_eq!(safe_dll_name("foo.dll\0bar"), None);
+    }
+
+    #[test]
+    fn parse_forward_handles_names_ordinals_and_dotted_dlls() {
+        assert_eq!(
+            parse_forward("KERNELBASE.CreateEventW"),
+            Some((
+                "KERNELBASE.dll".to_owned(),
+                ImportSymbol::Name {
+                    hint: 0,
+                    name: "CreateEventW".to_owned(),
+                }
+            ))
+        );
+        assert_eq!(
+            parse_forward("title_b.#42"),
+            Some(("title_b.dll".to_owned(), ImportSymbol::Ordinal(42)))
+        );
+        assert_eq!(
+            parse_forward("api-ms-win-core-synch-l1-2-0.dll.WaitOnAddress"),
+            Some((
+                "api-ms-win-core-synch-l1-2-0.dll".to_owned(),
+                ImportSymbol::Name {
+                    hint: 0,
+                    name: "WaitOnAddress".to_owned(),
+                }
+            ))
+        );
+        assert_eq!(parse_forward("nodot"), None);
+        assert_eq!(parse_forward("bad.#notanumber"), None);
+    }
+
+    #[test]
+    fn with_title_dlls_follows_forwards_to_hle_and_title_dlls_and_breaks_cycles() {
+        let inner = FakeResolver {
+            hits: vec![("kernelbase.dll", "CreateEventW", 0x1111_0000, Provenance::Hle)],
+        };
+        let dll_a = fake_image(
+            0x2000_0000,
+            0x4000,
+            vec![
+                ExportInfo {
+                    name: Some("Direct".into()),
+                    ordinal: 1,
+                    rva: Some(0x1200),
+                    forward: None,
+                },
+                ExportInfo {
+                    name: Some("OutOfBounds".into()),
+                    ordinal: 2,
+                    rva: Some(0x5000),
+                    forward: None,
+                },
+                ExportInfo {
+                    name: Some("FwdToHle".into()),
+                    ordinal: 3,
+                    rva: None,
+                    forward: Some("KERNELBASE.CreateEventW".into()),
+                },
+                ExportInfo {
+                    name: Some("FwdToTitleOrd".into()),
+                    ordinal: 4,
+                    rva: None,
+                    forward: Some("title_b.#7".into()),
+                },
+                ExportInfo {
+                    name: Some("Cycle".into()),
+                    ordinal: 5,
+                    rva: None,
+                    forward: Some("title_b.CycleBack".into()),
+                },
+            ],
+        );
+        let dll_b = fake_image(
+            0x3000_0000,
+            0x4000,
+            vec![
+                ExportInfo {
+                    name: None,
+                    ordinal: 7,
+                    rva: Some(0x2340),
+                    forward: None,
+                },
+                ExportInfo {
+                    name: Some("CycleBack".into()),
+                    ordinal: 8,
+                    rva: None,
+                    forward: Some("title_a.Cycle".into()),
+                },
+            ],
+        );
+        let dlls = vec![("title_a.dll".into(), dll_a), ("title_b.dll".into(), dll_b)];
+        let resolver = WithTitleDlls {
+            inner: &inner,
+            dlls: &dlls,
+        };
+
+        let name = |s: &str| ImportSymbol::Name {
+            hint: 0,
+            name: s.into(),
+        };
+
+        // Direct in-bounds export resolves within title DLL; OOB RVA is rejected.
+        assert_eq!(
+            resolver.resolve("title_a.dll", &name("Direct")),
+            Resolution::Found {
+                address: 0x2000_1200,
+                provenance: Provenance::Title,
+            }
+        );
+        assert_eq!(
+            resolver.resolve("title_a.dll", &name("OutOfBounds")),
+            Resolution::Missing
+        );
+
+        // Forwarded export into HLE resolves through `inner` (never host GetProcAddress).
+        assert_eq!(
+            resolver.resolve("title_a.dll", &name("FwdToHle")),
+            Resolution::Found {
+                address: 0x1111_0000,
+                provenance: Provenance::Hle,
+            }
+        );
+
+        // Forwarded export by ordinal into another mapped title DLL resolves cleanly.
+        assert_eq!(
+            resolver.resolve("title_a.dll", &name("FwdToTitleOrd")),
+            Resolution::Found {
+                address: 0x3000_2340,
+                provenance: Provenance::Title,
+            }
+        );
+
+        // Cyclic forwarders terminate cleanly instead of recursing forever.
+        assert_eq!(
+            resolver.resolve("title_a.dll", &name("Cycle")),
+            Resolution::Missing
+        );
     }
 }
