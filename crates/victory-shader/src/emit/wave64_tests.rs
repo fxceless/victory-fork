@@ -1140,3 +1140,75 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// Issue #111: `v_writelane_b32` writes its target lane whenever any lane of
+/// the console wave is in EXEC, even if the target lane itself is outside EXEC;
+/// if no lane is in EXEC (the wave skipped), the write must not happen.
+#[test]
+fn a_lane_write_reaches_its_lane_outside_exec() {
+    // One console wave of 64: v9 = 7, s6 = 5, if (t > s0) { v_writelane_b32 v9, s6, 0 },
+    // then every thread stores v_readlane_b32(v9, 0). v9 also has an ordinary use (v_mov_b32)
+    // so ir::unspill keeps v_writelane_b32 / v_readlane_b32.
+    let words = [
+        0x7E12_0287, // v_mov_b32 v9, 7
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0  (t > s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz +2 (over the 2-dword v_writelane_b32)
+        0xD761_0009,
+        0x0001_0006, // v_writelane_b32 v9, s6, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0007,
+        0x0001_0109, // v_readlane_b32 s7, v9, 0
+        0x7E02_0207, // v_mov_b32 v1, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &native).expect("io");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+    let empty_bytes = crate::dxbc::build(&[]);
+    let empty = crate::Container::parse(&empty_bytes).unwrap();
+
+    // On a 32-lane host, per-lane lowering refuses the skipped write so emit()
+    // switches to the without_skips form where all 64 lanes reach the write.
+    let per_lane = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&per_lane, Err(ShaderError::Unsupported { what, .. }) if *what == "a lane write where not every lane runs"),
+        "{:?}",
+        per_lane.err()
+    );
+    let shader = lower::TEST_HOST_WAVE.with(|cell| {
+        let was = cell.replace(Some(32));
+        let r = super::emit(&empty, &native, &p, &st, &io, &res);
+        cell.set(was);
+        r
+    })
+    .expect("emit on 32-lane host");
+    // Also check native 64-lane lowering (without_skips form).
+    let no_skips = ir::without_skips(&p, false).expect("without_skips");
+    let st_ns = structure::structure(&no_skips).expect("structure");
+    let io_ns = io::raise(&no_skips, &native).expect("io");
+    let res_ns = resource::track(&no_skips, &native.layout, native.stage, Some(&st_ns)).expect("res");
+    let shader64 = lower::TEST_HOST_WAVE.with(|cell| {
+        let was = cell.replace(Some(64));
+        let r = super::emit(&empty, &native, &no_skips, &st_ns, &io_ns, &res_ns);
+        cell.set(was);
+        r
+    })
+    .expect("emit on 64-lane host");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("32-lane DXIL validation failed");
+        v.validate(&mut shader64.dxil.clone()).expect("64-lane DXIL validation failed");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (s0, expected) in [(10u32, 5u32), (62, 5), (63, 7)] {
+        let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
+        assert_eq!(got, expected, "s0 = {s0}");
+    }
+    eprintln!("ran on the hardware device: v_writelane_b32 reaches lane 0 outside EXEC");
+}
