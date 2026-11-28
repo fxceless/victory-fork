@@ -54,9 +54,16 @@ No arbitrary render-target resizing or unguarded resolution patch was added.
   high/reference/mid/entry). A single operation can overrun the soft deadline;
   required one-shot material bakes are deliberately retained.
 - Known used pipelines can be warmed **before** starting the game, with bounded
-  worker counts. A failed warm-up prevents launch and restores the parent's
-  environment. First-time pipelines not yet recorded can still stall or drop
+  worker counts. The launcher uses `warm --used --strict`: refused host pipelines,
+  child-process spawn failures, crashes, timeouts and incomplete completion
+  streams fail warm-up and prevent launch. Strict mode retries selected entries
+  from the old bad list; it cannot silently count them as warmed. Manual `warm`
+  without `--strict` retains best-effort behavior. The parent's environment is
+  restored on failure. First-time pipelines not yet recorded can still stall or drop
   draws; first traversal and warm traversal must be tested separately.
+- Warm-up success records use `ready-v2` and the translator/driver fingerprint.
+  Refused pipelines are not marked done. Old records are rebuilt once because
+  the previous format could incorrectly mark a refused pipeline as completed.
 - Pipeline recording stays enabled so later starts know which pipelines were
   requested. Shared pipeline wait accounting remains enabled. Main at `368967f`
   removed the dynamic descriptor-wait switch; the launcher follows its current
@@ -148,7 +155,8 @@ hitches hidden by averages, higher unmet targets, warm-up boundaries, missing
 tail samples, sequence gaps, generated frames and incomplete captures.
 
 Rust regressions cover a full nonblocking report queue, fractional-microsecond
-timestamp consistency and partial timing-patch rejection. They have not run on
+timestamp consistency, partial timing-patch rejection, warm-up completion
+integrity and success-record compatibility. They have not run on
 this host. CI also runs the launcher/analyzer regressions and a release build;
 an unrun or pending CI job is not a passing result. `scripts\check-local-fixes.ps1
 -RequireRust` runs the required workspace Clippy, tests and release build once

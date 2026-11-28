@@ -45,7 +45,7 @@ try {
     Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
     try {
         if ($Warm) {
-            & $victory warm --used --jobs $WarmJobs
+            & $victory warm --used --strict --jobs $WarmJobs
             if ($LASTEXITCODE -ne 0) { throw "Pipeline warm-up exited with code $LASTEXITCODE; game was not started." }
         }
         & $victory run $Exe --console $Console --execute

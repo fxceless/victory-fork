@@ -21,7 +21,7 @@ $plan = & $launcher -Exe 'unused' -Console series-s -Output stock -SkipWarm -Sho
 if ($plan.Warm) { throw 'SkipWarm was ignored.' }
 $probe = Join-Path $PSScriptRoot 'launcher-probe.ps1'
 $observed = @(& (Join-Path $root 'scripts\play.ps1') -Exe (Join-Path $root 'README.md') -Runner $probe -Warm -WarmJobs 2 -More @{VICTORY_TEST_EXIT_CODE='0'})
-if ($observed.Count -ne 2 -or ($observed[0].Arguments -join '|') -ne 'warm|--used|--jobs|2' -or $observed[1].Arguments[0] -ne 'run') { throw 'Warm-up must finish before game launch.' }
+if ($observed.Count -ne 2 -or ($observed[0].Arguments -join '|') -ne 'warm|--used|--strict|--jobs|2' -or $observed[1].Arguments[0] -ne 'run') { throw 'Strict warm-up must finish before game launch.' }
 $events = [Collections.Generic.List[object]]::new()
 try {
     & (Join-Path $root 'scripts\play.ps1') -Exe (Join-Path $root 'README.md') -Runner $probe -Warm -More @{VICTORY_TEST_EXIT_CODE='9'} | ForEach-Object {$events.Add($_)}
