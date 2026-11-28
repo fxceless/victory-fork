@@ -45,9 +45,22 @@ pub(crate) fn listed(n: u64) -> bool {
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     });
+    // A file named `now` in the capture folder: the next three frames are
+    // captured (and the file removed), to catch a view on demand.
+    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    use std::sync::atomic::Ordering::Relaxed;
+    if CHECKED.swap(n, Relaxed) != n
+        && let Some(f) = folder()
+        && std::fs::remove_file(f.join("now")).is_ok()
+    {
+        NOW.store(n + 1, Relaxed);
+    }
+    let now = NOW.load(Relaxed);
+    let on_demand = now != u64::MAX && n >= now && n < now + 3;
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || on_demand || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
