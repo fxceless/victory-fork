@@ -120,6 +120,10 @@ struct List {
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
+    /// A private translator list: after detaching, it needs no host side
+    /// until another recording resets it. Title lists keep their empty one.
+    #[cfg(windows)]
+    thin_back: bool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
@@ -340,6 +344,22 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Takes the recorded host side. A private translator back is not visible
+/// to the title and is always reset before another recording uses it.
+#[cfg(windows)]
+fn take_host(list: &mut List) -> Option<crate::host::HostList> {
+    let host = if list.thin_back {
+        list.host.take()
+    } else {
+        let fresh = fresh_list()?;
+        fresh.leave_open();
+        list.host.replace(fresh)
+    }?;
+    // (A title list submitted again without a reset runs closed, empty.)
+    host.close_if_left_open();
+    Some(host)
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -446,10 +466,10 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
-/// [`detach`] does. What comes back is in the order the queue runs it: a
-/// new entry starts at every part that has waits; host lists without
-/// waits join the entry before them. The list's upload memory and draw
+/// and leaves each title list an empty host list, as [`detach`] does;
+/// private translator backs get theirs at reset. What comes back is in the
+/// order the queue runs it: a new entry starts at every part that has
+/// waits; host lists without waits join the entry before them. The list's upload memory and draw
 /// state (its dynamic descriptor slots) go with its last part, which runs
 /// last.
 /// shortcut: a list the submission names a second time runs again only if
@@ -477,20 +497,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which finds it so (or wants it closed).
-        fresh.leave_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list) else {
             continue;
         };
-        // (Submitted again without a reset: it runs closed, empty.)
-        host.close_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -538,8 +550,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 }
 
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
+/// submission names it) and leaves each title list an empty host list for
+/// its next reset. Private translator backs get theirs at reset instead.
+/// Returns what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
@@ -552,21 +565,13 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which finds it so (or wants it closed).
-        fresh.leave_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list) else {
                 continue;
             };
-            // (Submitted again without a reset: it runs closed, empty.)
-            host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let mut state =
@@ -694,6 +699,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
             }
         }),
         #[cfg(windows)]
+        thin_back: false,
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -764,6 +771,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if list.thin_back && list.host.is_none() {
+            let Some(host) = fresh_list() else {
+                crate::host::fail(format_args!("no host list for a translator recording"));
+            };
+            host.leave_open();
+            list.host = Some(host);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -2466,6 +2480,40 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_title_list_keeps_its_empty_host_after_detaching() {
+        if crate::host::host().is_none() {
+            eprintln!("SKIPPED a_title_list_keeps_its_empty_host_after_detaching: no host D3D12 device");
+            return;
+        }
+        for parts in [false, true] {
+            let this: This = Box::into_raw(boxed(0, std::ptr::null(), false)).cast_const().cast();
+            close(this);
+            let detached = if parts {
+                let mut parts = detach_parts(&[this, this]);
+                assert_eq!(parts.len(), 1);
+                let (_, lists, order) = parts.pop().unwrap();
+                assert_eq!(order, [0, 0]);
+                lists
+            } else {
+                let (lists, order) = detach(&[this, this]);
+                assert_eq!(order, [0, 0]);
+                lists
+            };
+            assert_eq!(detached.len(), 1);
+            // SAFETY: our list; nothing has been submitted to the GPU.
+            unsafe {
+                assert!((*this.cast::<List>()).host.as_ref().unwrap().untouched());
+                let (empty, order) = detach(&[this]);
+                assert_eq!(empty.len(), 1);
+                assert_eq!(order, [0]);
+                assert!(empty[0].host().untouched());
+                drop(Box::from_raw(this.cast_mut().cast::<List>()));
+            }
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

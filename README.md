@@ -84,6 +84,10 @@ contributors. Thank you.
   without in busy scenes; one copy of a table for every length a list reads
   it to; slots go back at the start of a landing; a counter line says how
   many a frame takes and who holds them.
+- *Idle translator lists* (`crates/victory-gpu/src/list.rs`): when a
+  translated recording is submitted, its private list no longer acquires
+  an empty host replacement immediately. The next recording takes a host
+  list from the existing reuse pool at reset instead.
 - *Instruments* (diagnostics builds): the card's time of draws by what was
   recorded with them and by whether they read a copy in the PC's memory, a
   census of windows of title memory, and F9 to save one frame with every

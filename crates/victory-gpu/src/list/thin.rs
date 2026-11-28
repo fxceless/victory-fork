@@ -422,7 +422,9 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let mut back = super::boxed(kind, std::ptr::null(), false);
+    back.thin_back = true;
+    let list: This = Box::into_raw(back).cast_const().cast();
     super::close(list);
     list
 }
@@ -1051,6 +1053,50 @@ const MINE: [(usize, *const ()); 50] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_submitted_back_list_waits_until_reset_for_its_replacement() {
+        use crate::object::This;
+        use super::super::{List, allocate_upload, detach, detach_parts, reset};
+
+        if crate::host::host().is_none() {
+            eprintln!("SKIPPED a_submitted_back_list_waits_until_reset_for_its_replacement: no host D3D12 device");
+            return;
+        }
+        for parts in [false, true] {
+            let back = super::back_list(0);
+            let upload = allocate_upload(back, 40, 0x100);
+            assert!(!upload.is_null());
+            // SAFETY: 40 bytes of list-owned memory were handed out.
+            unsafe { upload.write_bytes(0xab, 40) };
+            let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+            let detached = if parts {
+                let mut parts = detach_parts(&[back, back]);
+                assert_eq!(parts.len(), 1);
+                let (_, lists, order) = parts.pop().unwrap();
+                assert_eq!(order, [0, 0]);
+                lists
+            } else {
+                let (lists, order) = detach(&[back, back]);
+                assert_eq!(order, [0, 0]);
+                lists
+            };
+            assert_eq!(detached.len(), 1);
+            assert_eq!(detached[0]._uploads.len(), 1);
+            // SAFETY: a private translator list, never submitted to the GPU.
+            unsafe {
+                assert!((*back.cast::<List>()).host.is_none(), "an idle translator back must not keep an empty host replacement");
+                assert_eq!(reset(back, allocator, std::ptr::null()), crate::object::S_OK);
+                assert!((*back.cast::<List>()).host.as_ref().unwrap().untouched());
+                drop(Box::from_raw(back.cast_mut().cast::<List>()));
+            }
+            // The detached submission, not the reset/dropped backing list,
+            // still owns the upload its commands can name.
+            assert_eq!(detached[0]._uploads.len(), 1);
+            // SAFETY: the detached submission still owns the allocation.
+            assert_eq!(unsafe { std::slice::from_raw_parts(upload, 40) }, [0xab; 40]);
+        }
+    }
+
     use super::*;
 
     /// Every method of the tables that records is written down too: what is
