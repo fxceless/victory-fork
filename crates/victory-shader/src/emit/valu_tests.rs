@@ -2391,3 +2391,659 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+/// `victory_formats::bcpack::zz`, the function the test below runs as console code.
+fn zz_reference(v: u8, bits: u32) -> u8 {
+    let mask = ((1u32 << bits) - 1) as u8;
+    ((v >> 1) ^ if v & 1 != 0 { mask } else { 0 }) & mask
+}
+
+/// BCPack's zigzag decode written as console code matches the formats crate's function on
+/// the GPU: every symbol at every width, widths past a byte included.
+#[test]
+fn bcpack_zigzag_decode_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol, v2 = its width in bits; v5 = the width's mask, as a byte.
+    body.extend(vop3(0x11A, 5, vgpr(2), 129, 128)); // v_lshlrev_b32 v5, v2, 1
+    body.extend(vop3(0x125, 5, 193, vgpr(5), 128)); // v_add_nc_u32 v5, -1, v5
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 128 + 8)); // v_bfe_u32 v5, v5, 0, 8
+    body.extend(vop3(0x116, 6, 129, vgpr(1), 128)); // v_lshrrev_b32 v6, 1, v1
+    body.extend(vop3(0x148, 7, vgpr(1), 128, 129)); // v_bfe_u32 v7, v1, 0, 1
+    body.extend(vop3(0x0C5, 106, 128, vgpr(7), 128)); // v_cmp_ne_u32 vcc, 0, v7
+    body.extend(vop3(0x101, 8, 128, vgpr(5), vcc)); // v_cndmask_b32 v8, 0, v5, vcc
+    body.extend(vop3(0x11D, 9, vgpr(6), vgpr(8), 128)); // v_xor_b32 v9, v6, v8
+    body.extend(vop3(0x11B, 0, vgpr(9), vgpr(5), 128)); // v_and_b32 v0, v9, v5
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for bits in (0u32..=9).chain([16, 31]) {
+        for v in 0u32..256 {
+            cases.push([v, bits, 0, 0]);
+            want.push(u32::from(zz_reference(v as u8, bits)));
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: zz{inputs:?}");
+    });
+}
+
+/// `victory_formats::bcpack::add_index`, the function the test below runs as console code.
+fn add_index_reference(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
+    let up = |v: i16, b: u8| {
+        if b == 0 || b > 16 {
+            0
+        } else {
+            (v as u16) << (16 - b)
+        }
+    };
+    let sum = up(cur, bits).wrapping_add(up(refv, ref_bits)) as i16;
+    if bits == 0 { 0 } else { sum >> (16 - bits) }
+}
+
+fn add_index_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = cur, v2 = bits, v3 = refv, v4 = ref_bits. v6 = cur left-aligned to 16 bits.
+    body.extend(vop3(0x126, 5, 128 + 16, vgpr(2), 128)); // v_sub_nc_u32 v5, 16, v2
+    body.extend(vop3(0x11A, 6, vgpr(5), vgpr(1), 128)); // v_lshlrev_b32 v6, v5, v1
+    body.extend(vop3(0x148, 6, vgpr(6), 128, 128 + 16)); // v_bfe_u32 v6, v6, 0, 16
+    body.extend(vop3(0x125, 7, 193, vgpr(2), 128)); // v_add_nc_u32 v7, -1, v2
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(7), 128)); // v_cmp_gt_u32 vcc, 16, v7
+    body.extend(vop3(0x101, 6, 128, vgpr(6), vcc)); // v_cndmask_b32 v6, 0, v6, vcc
+    // v9 = refv left-aligned the same way.
+    body.extend(vop3(0x126, 8, 128 + 16, vgpr(4), 128));
+    body.extend(vop3(0x11A, 9, vgpr(8), vgpr(3), 128));
+    body.extend(vop3(0x148, 9, vgpr(9), 128, 128 + 16));
+    body.extend(vop3(0x125, 10, 193, vgpr(4), 128));
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(10), 128));
+    body.extend(vop3(0x101, 9, 128, vgpr(9), vcc));
+    // The 16-bit sum, signed, back down to `bits` bits; nothing at a width of 0.
+    body.extend(vop3(0x125, 11, vgpr(6), vgpr(9), 128)); // v_add_nc_u32 v11, v6, v9
+    body.extend(vop3(0x149, 11, vgpr(11), 128, 128 + 16)); // v_bfe_i32 v11, v11, 0, 16
+    body.extend(vop3(0x118, 0, vgpr(5), vgpr(11), 128)); // v_ashrrev_i32 v0, v5, v11
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    body
+}
+
+/// BCPack's index residual plus its reference, written as console code, matches the formats
+/// crate's function on the GPU at every width, reference widths out of range included.
+#[test]
+fn bcpack_index_residual_sum_matches_the_formats_function() {
+    let shader = build_valu_cs(&add_index_body());
+    let values: [i16; 6] = [0, 1, -1, 0x7FFF, -0x8000, -0x1235];
+    let refs: [i16; 3] = [0, 0x2A5, -7];
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for bits in 0u8..=16 {
+        for ref_bits in [0u8, 1, 4, 8, 15, 16, 17] {
+            for cur in values {
+                for refv in refs {
+                    cases.push([
+                        cur as i32 as u32,
+                        u32::from(bits),
+                        refv as i32 as u32,
+                        u32::from(ref_bits),
+                    ]);
+                    want.push(add_index_reference(cur, bits, refv, ref_bits) as i32 as u32);
+                }
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: add_index{inputs:?}");
+    });
+}
+
+/// `victory_formats::bcpack::nibbles`, the function the test below runs as console code.
+fn nibbles_reference(b: u8, odd_first: bool) -> [i16; 2] {
+    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    if odd_first { [odd, even] } else { [even, odd] }
+}
+
+fn nibbles_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    // v1 = the byte, v2 = whether the odd bits come first. v5 and v6 gather the even and
+    // the odd bits.
+    let mut body = vec![vop1(0x001, 5, 128), vop1(0x001, 6, 128)]; // v_mov_b32 v5, 0; v6, 0
+    for k in 0u16..4 {
+        for (half, bit) in [(5, 2 * k), (6, 2 * k + 1)] {
+            body.extend(vop3(0x148, 7, vgpr(1), 128 + bit, 129)); // v_bfe_u32 v7, v1, bit, 1
+            body.extend(vop3(0x36F, half, vgpr(7), 128 + k, vgpr(half))); // v_lshl_or_b32
+        }
+    }
+    // Zigzag to signed, kept as 16 bits: v8 from the even half, v11 from the odd one.
+    for (half, out) in [(5, 8), (6, 11)] {
+        body.extend(vop3(0x116, 9, 129, vgpr(half), 128)); // v_lshrrev_b32 v9, 1, half
+        body.extend(vop3(0x148, 10, vgpr(half), 128, 129)); // v_bfe_u32 v10, half, 0, 1
+        body.extend(vop3(0x126, 10, 128, vgpr(10), 128)); // v_sub_nc_u32 v10, 0, v10
+        body.extend(vop3(0x11D, out, vgpr(9), vgpr(10), 128)); // v_xor_b32 out, v9, v10
+        body.extend(vop3(0x148, out, vgpr(out), 128, 128 + 16)); // v_bfe_u32 out, out, 0, 16
+    }
+    // The pair in the order asked for, the second in the result's high half.
+    body.extend(vop3(0x0C5, 106, 128, vgpr(2), 128)); // v_cmp_ne_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 14, vgpr(8), vgpr(11), vcc)); // v_cndmask_b32 v14, v8, v11, vcc
+    body.extend(vop3(0x101, 15, vgpr(11), vgpr(8), vcc)); // v_cndmask_b32 v15, v11, v8, vcc
+    body.extend(vop3(0x36F, 0, vgpr(15), 128 + 16, vgpr(14))); // v_lshl_or_b32 v0, v15, 16, v14
+    body
+}
+
+/// BCPack's split of a byte into two signed nibbles, written as console code, matches the
+/// formats crate's function on the GPU for every byte in both orders.
+#[test]
+fn bcpack_nibble_split_matches_the_formats_function() {
+    let shader = build_valu_cs(&nibbles_body());
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for odd_first in [false, true] {
+        for b in 0u32..256 {
+            cases.push([b, u32::from(odd_first), 0, 0]);
+            let [first, second] = nibbles_reference(b as u8, odd_first);
+            want.push(u32::from(second as u16) << 16 | u32::from(first as u16));
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: nibbles{inputs:?}");
+    });
+}
+
+/// `victory_formats::bcpack::bc7_precision` with its table and `pbits`, the function the
+/// test below runs as console code.
+fn bc7_precision_reference(ctrl: u16) -> [u8; 4] {
+    const BC7_BITS: [[u8; 4]; 8] = [
+        [4, 4, 4, 0],
+        [6, 6, 6, 0],
+        [5, 5, 5, 0],
+        [7, 7, 7, 0],
+        [5, 5, 5, 6],
+        [7, 7, 7, 8],
+        [7, 7, 7, 7],
+        [5, 5, 5, 5],
+    ];
+    fn pbits(mode: u16) -> bool {
+        matches!(mode, 0 | 1 | 3 | 6 | 7)
+    }
+    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let mut p = BC7_BITS[usize::from(mode)];
+    if rot != 0 {
+        p.swap(3, rot - 1);
+    } else if pbits(mode) {
+        p[0] += 1;
+    }
+    p
+}
+
+fn bc7_precision_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    // The table's rows as little-endian dwords, and the modes with a p-bit as a bit set.
+    const ROWS: [u32; 8] = [
+        0x0004_0404,
+        0x0006_0606,
+        0x0005_0505,
+        0x0007_0707,
+        0x0605_0505,
+        0x0807_0707,
+        0x0707_0707,
+        0x0505_0505,
+    ];
+    let mut body = Vec::new();
+    // v1 = the control word; v2 = its mode, v3 = its rotation, v5 = the mode's row.
+    body.extend(vop3(0x148, 2, vgpr(1), 128, 128 + 3)); // v_bfe_u32 v2, v1, 0, 3
+    body.extend(vop3(0x148, 3, vgpr(1), 128 + 3, 128 + 2)); // v_bfe_u32 v3, v1, 3, 2
+    body.extend([vop1(0x001, 5, 255), ROWS[0]]); // v_mov_b32 v5, row 0
+    for (mode, row) in ROWS.iter().enumerate().skip(1) {
+        body.extend([vop1(0x001, 6, 255), *row]); // v_mov_b32 v6, row
+        body.extend(vop3(0x0C2, 106, 128 + mode as u16, vgpr(2), 128)); // v_cmp_eq_u32 vcc, mode, v2
+        body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+    }
+    // No rotation: red gains the p-bit. v7 = the row with it.
+    body.extend([vop1(0x001, 7, 255), 0b1100_1011]); // v_mov_b32 v7, modes 0, 1, 3, 6, 7
+    body.extend(vop3(0x116, 7, vgpr(2), vgpr(7), 128)); // v_lshrrev_b32 v7, v2, v7
+    body.extend(vop3(0x148, 7, vgpr(7), 128, 129)); // v_bfe_u32 v7, v7, 0, 1
+    body.extend(vop3(0x125, 7, vgpr(5), vgpr(7), 128)); // v_add_nc_u32 v7, v5, v7
+    // A rotation swaps alpha with channel `rot - 1`: v8 = that channel's shift, v9 = the
+    // two bytes' difference, v10 = the row with them exchanged.
+    body.extend(vop3(0x125, 8, 193, vgpr(3), 128)); // v_add_nc_u32 v8, -1, v3
+    body.extend(vop3(0x11A, 8, 128 + 3, vgpr(8), 128)); // v_lshlrev_b32 v8, 3, v8
+    body.extend(vop3(0x116, 9, vgpr(8), vgpr(5), 128)); // v_lshrrev_b32 v9, v8, v5
+    body.extend(vop3(0x148, 9, vgpr(9), 128, 128 + 8)); // v_bfe_u32 v9, v9, 0, 8
+    body.extend(vop3(0x148, 10, vgpr(5), 128 + 24, 128 + 8)); // v_bfe_u32 v10, v5, 24, 8
+    body.extend(vop3(0x11D, 9, vgpr(9), vgpr(10), 128)); // v_xor_b32 v9, v9, v10
+    body.extend(vop3(0x11A, 10, vgpr(8), vgpr(9), 128)); // v_lshlrev_b32 v10, v8, v9
+    body.extend(vop3(0x11D, 10, vgpr(5), vgpr(10), 128)); // v_xor_b32 v10, v5, v10
+    body.extend(vop3(0x11A, 9, 128 + 24, vgpr(9), 128)); // v_lshlrev_b32 v9, 24, v9
+    body.extend(vop3(0x11D, 10, vgpr(10), vgpr(9), 128)); // v_xor_b32 v10, v10, v9
+    body.extend(vop3(0x0C5, 106, 128, vgpr(3), 128)); // v_cmp_ne_u32 vcc, 0, v3
+    body.extend(vop3(0x101, 0, vgpr(7), vgpr(10), vcc)); // v_cndmask_b32 v0, v7, v10, vcc
+    body
+}
+
+/// BC7's channel precisions for a control word, written as console code, match the
+/// formats crate's function on the GPU for every mode and rotation.
+#[test]
+fn bcpack_bc7_precisions_match_the_formats_function() {
+    let shader = build_valu_cs(&bc7_precision_body());
+    // Every mode and rotation, alone and under each of the control word's higher bits.
+    let cases: Vec<[u32; 4]> = (0u32..32)
+        .flat_map(|low| [0u32, 0x20, 0x8000, 0xFFE0].map(|high| [high | low, 0, 0, 0]))
+        .collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from_le_bytes(bc7_precision_reference(inputs[0] as u16));
+        assert_eq!(got, want, "{backend}: bc7_precision({:#x})", inputs[0]);
+    });
+}
+
+/// `victory_formats::bcpack::bc6_index_bits`, the function the test below runs as console
+/// code.
+fn bc6_index_bits_reference(mode: u8) -> u8 {
+    match mode {
+        1..=10 => 3,
+        11..=14 => 4,
+        _ => 0,
+    }
+}
+
+/// BC6H's index width for a mode, written as console code, matches the formats crate's
+/// function on the GPU for every byte.
+#[test]
+fn bcpack_bc6_index_width_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
+    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
+    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
+    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
+    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
+    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
+    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
+    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
+    let shader = build_valu_cs(&body);
+    let cases: Vec<[u32; 4]> = (0u32..256).map(|mode| [mode, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from(bc6_index_bits_reference(inputs[0] as u8));
+        assert_eq!(got, want, "{backend}: bc6_index_bits({})", inputs[0]);
+    });
+}
+
+/// `victory_formats::bcpack::pairs`, the function the test below runs as console code.
+fn pairs_reference(rank: &[u8; 64], s: &[u8], ix: &mut [u8]) {
+    for (k, &sym) in s.iter().enumerate() {
+        let v = rank[usize::from(sym & 63)];
+        ix[2 * k] = v & 7;
+        ix[2 * k + 1] = v >> 4 & 7;
+    }
+}
+
+/// BCPack's 3-bit index residuals, one symbol per two pixels, written as console code,
+/// match the formats crate's function on the GPU: a rank table that tells the two pixels
+/// apart, read through every symbol, the symbols' two unused bits included.
+#[test]
+fn bcpack_pixel_pair_residuals_match_the_formats_function() {
+    // No entry gives its two pixels the same residual, and the pair is never symmetric.
+    // Alternate the unused bits so extracting four bits instead of three is observable.
+    let rank: [u8; 64] = std::array::from_fn(|i| {
+        let unused = [0, 0x08, 0x80, 0x88][i / 16];
+        ((i % 8) | (((i * 3 + 1) % 8) << 4) | unused) as u8
+    });
+    assert!(rank.iter().all(|v| v & 7 != v >> 4 & 7));
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol; v2 = its table index, v3 = the index's dword, v5 = that dword.
+    body.extend(vop3(0x148, 2, vgpr(1), 128, 128 + 6)); // v_bfe_u32 v2, v1, 0, 6
+    body.extend(vop3(0x116, 3, 128 + 2, vgpr(2), 128)); // v_lshrrev_b32 v3, 2, v2
+    for (d, row) in rank.as_chunks::<4>().0.iter().enumerate() {
+        let reg = if d == 0 { 5 } else { 6 };
+        body.extend([vop1(0x001, reg, 255), u32::from_le_bytes(*row)]); // v_mov_b32 reg, row
+        if d != 0 {
+            body.extend(vop3(0x0C2, 106, 128 + d as u16, vgpr(3), 128)); // v_cmp_eq_u32 vcc, d, v3
+            body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+        }
+    }
+    // The entry's byte, then its two residuals, the second pixel's in the next byte.
+    body.extend(vop3(0x148, 7, vgpr(2), 128, 128 + 2)); // v_bfe_u32 v7, v2, 0, 2
+    body.extend(vop3(0x11A, 7, 128 + 3, vgpr(7), 128)); // v_lshlrev_b32 v7, 3, v7
+    body.extend(vop3(0x116, 8, vgpr(7), vgpr(5), 128)); // v_lshrrev_b32 v8, v7, v5
+    body.extend(vop3(0x148, 9, vgpr(8), 128, 128 + 3)); // v_bfe_u32 v9, v8, 0, 3
+    body.extend(vop3(0x148, 10, vgpr(8), 128 + 4, 128 + 3)); // v_bfe_u32 v10, v8, 4, 3
+    body.extend(vop3(0x36F, 0, vgpr(10), 128 + 8, vgpr(9))); // v_lshl_or_b32 v0, v10, 8, v9
+    let shader = build_valu_cs(&body);
+    let symbols: Vec<u8> = (0..=255).collect();
+    let mut ix = vec![0u8; 2 * symbols.len()];
+    pairs_reference(&rank, &symbols, &mut ix);
+    let cases: Vec<[u32; 4]> = symbols.iter().map(|&s| [u32::from(s), 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, k, inputs, got| {
+        let want = u32::from(ix[2 * k]) | u32::from(ix[2 * k + 1]) << 8;
+        assert_eq!(got, want, "{backend}: pairs, symbol {}", inputs[0]);
+    });
+}
+
+/// `victory_formats::bcpack::quads`, the function the test below runs as console code.
+fn quads_reference(rank: &[u8; 256], s: &[u8], ix: &mut [u8]) {
+    for (q, &sym) in s.iter().enumerate() {
+        let v = rank[usize::from(sym)];
+        let base = (q >> 1) * 8 + (q & 1) * 2;
+        for (k, p) in [0, 1, 4, 5].into_iter().enumerate() {
+            ix[base + p] = v >> (2 * k) & 3;
+        }
+    }
+}
+
+/// BCPack's 2-bit index residuals, one symbol per 2x2 quad, written as console code, match
+/// the formats crate's function on the GPU: each quad's four residuals and where the quad
+/// starts in the block row, for a rank table and a symbol order that are both permutations.
+#[test]
+fn bcpack_quad_residuals_match_the_formats_function() {
+    let rank: [u8; 256] = std::array::from_fn(|i| (i * 167 + 13) as u8);
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol, v2 = the quad's number; v3 = the symbol's dword in the table, v5 =
+    // that dword.
+    body.extend(vop3(0x148, 1, vgpr(1), 128, 128 + 8)); // v_bfe_u32 v1, v1, 0, 8
+    body.extend(vop3(0x116, 3, 128 + 2, vgpr(1), 128)); // v_lshrrev_b32 v3, 2, v1
+    for (d, row) in rank.as_chunks::<4>().0.iter().enumerate() {
+        let reg = if d == 0 { 5 } else { 6 };
+        body.extend([vop1(0x001, reg, 255), u32::from_le_bytes(*row)]); // v_mov_b32 reg, row
+        if d != 0 {
+            body.extend(vop3(0x0C2, 106, 128 + d as u16, vgpr(3), 128)); // v_cmp_eq_u32 vcc, d, v3
+            body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+        }
+    }
+    // The entry's byte, then its four residuals, one to a nibble of the result.
+    body.extend(vop3(0x148, 7, vgpr(1), 128, 128 + 2)); // v_bfe_u32 v7, v1, 0, 2
+    body.extend(vop3(0x11A, 7, 128 + 3, vgpr(7), 128)); // v_lshlrev_b32 v7, 3, v7
+    body.extend(vop3(0x116, 8, vgpr(7), vgpr(5), 128)); // v_lshrrev_b32 v8, v7, v5
+    body.extend(vop3(0x148, 0, vgpr(8), 128, 128 + 2)); // v_bfe_u32 v0, v8, 0, 2
+    for k in 1u16..4 {
+        body.extend(vop3(0x148, 9, vgpr(8), 128 + 2 * k, 128 + 2)); // v_bfe_u32 v9, v8, 2k, 2
+        body.extend(vop3(0x36F, 0, vgpr(9), 128 + 4 * k, vgpr(0))); // v_lshl_or_b32 v0, v9, 4k, v0
+    }
+    // Where the quad starts: eight pixels per pair of quads, two for the odd one. It goes
+    // in the result's high half.
+    body.extend(vop3(0x116, 10, 129, vgpr(2), 128)); // v_lshrrev_b32 v10, 1, v2
+    body.extend(vop3(0x148, 11, vgpr(2), 128, 129)); // v_bfe_u32 v11, v2, 0, 1
+    body.extend(vop3(0x11A, 11, 129, vgpr(11), 128)); // v_lshlrev_b32 v11, 1, v11
+    body.extend(vop3(0x36F, 10, vgpr(10), 128 + 3, vgpr(11))); // v_lshl_or_b32 v10, v10, 3, v11
+    body.extend(vop3(0x36F, 0, vgpr(10), 128 + 16, vgpr(0))); // v_lshl_or_b32 v0, v10, 16, v0
+    let shader = build_valu_cs(&body);
+    let symbols: Vec<u8> = (0..256).map(|k| (k * 91 + 7) as u8).collect();
+    let mut ix = vec![0xFFu8; 4 * symbols.len()];
+    quads_reference(&rank, &symbols, &mut ix);
+    let cases: Vec<[u32; 4]> = symbols
+        .iter()
+        .enumerate()
+        .map(|(q, &s)| [u32::from(s), q as u32, 0, 0])
+        .collect();
+    // Each backend must read every cell the function wrote, each once.
+    let mut read = std::collections::BTreeMap::new();
+    run_cases(&shader, &cases, |backend, q, _, got| {
+        let base = (got >> 16) as usize;
+        let seen: &mut Vec<bool> = read
+            .entry(backend.to_string())
+            .or_insert(vec![false; ix.len()]);
+        for (k, p) in [0, 1, 4, 5].into_iter().enumerate() {
+            let cell = base + p;
+            assert!(
+                cell < ix.len() && !seen[cell],
+                "{backend}: quad {q} lands on cell {cell}"
+            );
+            seen[cell] = true;
+            assert_eq!(
+                got >> (4 * k) & 15,
+                u32::from(ix[cell]),
+                "{backend}: quad {q}, pixel {k}"
+            );
+        }
+    });
+    for (backend, seen) in read {
+        assert!(seen.iter().all(|&s| s), "{backend}: cells never read");
+    }
+}
+
+/// `victory_formats::bcpack::pick` with its history length, the function the test below
+/// runs as console code.
+fn pick_reference<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [T],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
+    const HISTORY: usize = 256;
+    match r {
+        0 => zero,
+        r if r <= i => &history[(i - r) % HISTORY],
+        r => &dictionary[r - i - 1],
+    }
+}
+
+/// BCPack's choice of a block's reference, written as console code, matches the formats
+/// crate's function on the GPU: none, a block of the history ring, or a dictionary entry
+/// before the first block, on both sides of each boundary.
+#[test]
+fn bcpack_reference_choice_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the block, v2 = its reference. The result names the source in its high half
+    // (1 the history, 2 the dictionary) and the entry in its low half.
+    body.extend(vop3(0x126, 5, vgpr(1), vgpr(2), 128)); // v_sub_nc_u32 v5, v1, v2
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 128 + 8)); // v_bfe_u32 v5, v5, 0, 8
+    body.extend(vop3(0x36F, 5, 129, 128 + 16, vgpr(5))); // v_lshl_or_b32 v5, 1, 16, v5
+    body.extend(vop3(0x126, 6, vgpr(2), vgpr(1), 128)); // v_sub_nc_u32 v6, v2, v1
+    body.extend(vop3(0x125, 6, 193, vgpr(6), 128)); // v_add_nc_u32 v6, -1, v6
+    body.extend(vop3(0x36F, 6, 130, 128 + 16, vgpr(6))); // v_lshl_or_b32 v6, 2, 16, v6
+    body.extend(vop3(0x0C3, 106, vgpr(2), vgpr(1), 128)); // v_cmp_le_u32 vcc, v2, v1
+    body.extend(vop3(0x101, 7, vgpr(6), vgpr(5), vcc)); // v_cndmask_b32 v7, v6, v5, vcc
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(7), 128, vcc)); // v_cndmask_b32 v0, v7, 0, vcc
+    let shader = build_valu_cs(&body);
+    // Entries that say where they are, so the function's choice reads as the result does.
+    let history: Vec<u32> = (0..256).map(|k| 1 << 16 | k).collect();
+    let dictionary: Vec<u32> = (0..255).map(|k| 2 << 16 | k).collect();
+    // Blocks and references on both sides of `r == 0`, `r == i` and the ring's length.
+    let cases: Vec<[u32; 4]> = [0u32, 1, 2, 254, 255, 256, 1000]
+        .into_iter()
+        .flat_map(|i| [0u32, 1, 2, 3, 128, 254, 255].map(|r| [i, r, 0, 0]))
+        .collect();
+    run_cases(&shader, &cases, |backend, _, [i, r, ..], got| {
+        let want = *pick_reference(i as usize, r as usize, &history, &dictionary, &0);
+        assert_eq!(got, want, "{backend}: pick(block {i}, reference {r})");
+    });
+}
+
+/// `victory_formats::xma::log2`, the function the test below runs as console code.
+fn xma_log2_reference(v: usize) -> u32 {
+    usize::BITS - 1 - v.max(1).leading_zeros()
+}
+
+/// XMA's integer base-2 logarithm, written as console code, matches the formats crate's
+/// function on the GPU: zero, every power of two and both of its neighbours.
+#[test]
+fn xma_integer_log2_matches_the_formats_function() {
+    let mut body = Vec::new();
+    // v1 = the value; zero counts as one.
+    body.extend(vop3(0x114, 5, vgpr(1), 129, 128)); // v_max_u32 v5, v1, 1
+    body.push(vop1(0x039, 6, vgpr(5))); // v_ffbh_u32 v6, v5
+    body.extend(vop3(0x126, 0, 128 + 31, vgpr(6), 128)); // v_sub_nc_u32 v0, 31, v6
+    let shader = build_valu_cs(&body);
+    let mut values = vec![0u32, u32::MAX];
+    for bit in 0..32 {
+        let p = 1u32 << bit;
+        values.extend([p.wrapping_sub(1), p, p.wrapping_add(1)]);
+    }
+    let cases: Vec<[u32; 4]> = values.into_iter().map(|v| [v, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = xma_log2_reference(inputs[0] as usize);
+        assert_eq!(got, want, "{backend}: log2({:#x})", inputs[0]);
+    });
+}
+
+/// `victory_formats::xma::to_i16`, the function the test below runs as console code.
+fn xma_to_i16_reference(v: f32) -> i16 {
+    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+}
+
+/// XMA's sample conversion from float to 16 bits, written as console code, matches the
+/// formats crate's function on the GPU: ties round away from zero, both ends saturate.
+#[test]
+fn xma_sample_to_i16_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the sample. v5 = it scaled, v6 = that truncated, v7 = the fraction cut off.
+    body.extend([vop1(0x001, 5, 255), 32768f32.to_bits()]); // v_mov_b32 v5, 32768.0
+    body.extend(vop3(0x108, 5, vgpr(1), vgpr(5), 128)); // v_mul_f32 v5, v1, v5
+    body.push(vop1(0x021, 6, vgpr(5))); // v_trunc_f32 v6, v5
+    body.extend(vop3(0x104, 7, vgpr(5), vgpr(6), 128)); // v_sub_f32 v7, v5, v6
+    // A fraction of a half or more moves one further from zero.
+    body.extend(vop3(0x103, 8, vgpr(6), 242, 128)); // v_add_f32 v8, v6, 1.0
+    body.extend(vop3(0x006, 106, vgpr(7), 240, 128)); // v_cmp_ge_f32 vcc, v7, 0.5
+    body.extend(vop3(0x101, 9, vgpr(6), vgpr(8), vcc)); // v_cndmask_b32 v9, v6, v8, vcc
+    body.extend(vop3(0x103, 8, vgpr(6), 243, 128)); // v_add_f32 v8, v6, -1.0
+    body.extend(vop3(0x003, 106, vgpr(7), 241, 128)); // v_cmp_le_f32 vcc, v7, -0.5
+    body.extend(vop3(0x101, 9, vgpr(9), vgpr(8), vcc)); // v_cndmask_b32 v9, v9, v8, vcc
+    // Saturate, then convert.
+    body.extend([vop1(0x001, 10, 255), (-32768f32).to_bits()]); // v_mov_b32 v10, -32768.0
+    body.extend(vop3(0x110, 9, vgpr(9), vgpr(10), 128)); // v_max_f32 v9, v9, v10
+    body.extend([vop1(0x001, 10, 255), 32767f32.to_bits()]); // v_mov_b32 v10, 32767.0
+    body.extend(vop3(0x10F, 9, vgpr(9), vgpr(10), 128)); // v_min_f32 v9, v9, v10
+    body.push(vop1(0x008, 0, vgpr(9))); // v_cvt_i32_f32 v0, v9
+    // Not a number converts to zero: `v_max_f32` alone would have saturated it.
+    body.extend(vop3(0x008, 106, vgpr(1), vgpr(1), 128)); // v_cmp_u_f32 vcc, v1, v1
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    let shader = build_valu_cs(&body);
+    let step = 1.0 / 32768.0;
+    let mut samples = vec![
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    // Ties and their neighbours on both sides of zero, and just inside each end.
+    for k in [0.5f32, 1.5, 2.5, 3.5, 32766.5, 32767.5] {
+        for x in [
+            k,
+            f32::from_bits(k.to_bits() - 1),
+            f32::from_bits(k.to_bits() + 1),
+        ] {
+            samples.extend([x * step, -x * step]);
+        }
+    }
+    samples.extend((0..64).map(|i| (i as f32 * 0.618_034).sin() * 1.1));
+    let cases: Vec<[u32; 4]> = samples.iter().map(|s| [s.to_bits(), 0, 0, 0]).collect();
+    let mut wrong = Vec::new();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let v = f32::from_bits(inputs[0]);
+        let want = xma_to_i16_reference(v) as i32 as u32;
+        if got != want {
+            wrong.push(format!(
+                "{backend}: to_i16({v:e}) = {} want {}",
+                got as i32, want as i32
+            ));
+        }
+    });
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `victory_formats::bcpack::interleave`, the function the test below runs as console code.
+fn interleave_reference(a: u8, b: u8) -> u8 {
+    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
+    spread(a) | spread(b) << 1
+}
+
+/// BCPack's interleave of two 4-bit symbols, written as console code, matches the formats
+/// crate's function on the GPU: every pair of symbols, with and without bits above the
+/// nibble that the function ignores.
+#[test]
+fn bcpack_symbol_interleave_matches_the_formats_function() {
+    // v1 = the first symbol, on the even bits; v2 = the second, on the odd ones.
+    let mut body = vec![vop1(0x001, 0, 128)]; // v_mov_b32 v0, 0
+    for bit in 0u16..4 {
+        for (symbol, position) in [(1, 2 * bit), (2, 2 * bit + 1)] {
+            body.extend(vop3(0x148, 3, vgpr(symbol), 128 + bit, 129)); // v_bfe_u32 v3, symbol, bit, 1
+            body.extend(vop3(0x36F, 0, vgpr(3), 128 + position, vgpr(0))); // v_lshl_or_b32 v0, v3, position, v0
+        }
+    }
+    let shader = build_valu_cs(&body);
+    let mut cases: Vec<[u32; 4]> = (0u32..256)
+        .map(|pair| [pair & 15, pair >> 4, 0, 0])
+        .collect();
+    cases.extend((0u32..16).map(|a| [a | 0xF0, (15 - a) | 0xA0, 0, 0]));
+    run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+        let want = u32::from(interleave_reference(a as u8, b as u8));
+        assert_eq!(got, want, "{backend}: interleave({a:#x}, {b:#x})");
+    });
+}
+
+/// `victory_formats::texture::dim`, one of the two functions the test below runs as
+/// console code.
+fn texture_dim_reference(texels: u32, mip: u32, block: u32) -> u32 {
+    (texels >> mip).max(1).div_ceil(block)
+}
+
+/// `victory_formats::texture::padded_dim`, the other one.
+fn texture_padded_dim_reference(texels: u32, mip: u32, block: u32) -> u32 {
+    texels.max(1).div_ceil(block).div_ceil(1 << mip)
+}
+
+/// A mip's size in elements, as data sees it and as placement pads it, written as console
+/// code, matches the formats crate's two functions on the GPU for texel and compressed
+/// block sizes. The block is a power of two, so each division is a shift.
+#[test]
+fn texture_mip_sizes_match_the_formats_functions() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = texels, v2 = the mip, v3 = the block, v4 = which size. v5 = the block's shift,
+    // v6 = the block less one.
+    body.push(vop1(0x03A, 5, vgpr(3))); // v_ffbl_b32 v5, v3
+    body.extend(vop3(0x125, 6, 193, vgpr(3), 128)); // v_add_nc_u32 v6, -1, v3
+    // As data sees it: halve rounding down, at least one, round up to whole elements.
+    body.extend(vop3(0x116, 7, vgpr(2), vgpr(1), 128)); // v_lshrrev_b32 v7, v2, v1
+    body.extend(vop3(0x114, 7, vgpr(7), 129, 128)); // v_max_u32 v7, v7, 1
+    body.extend(vop3(0x125, 7, vgpr(7), vgpr(6), 128)); // v_add_nc_u32 v7, v7, v6
+    body.extend(vop3(0x116, 7, vgpr(5), vgpr(7), 128)); // v_lshrrev_b32 v7, v5, v7
+    // As placement pads it: mip 0's elements, halved rounding up.
+    body.extend(vop3(0x114, 8, vgpr(1), 129, 128)); // v_max_u32 v8, v1, 1
+    body.extend(vop3(0x125, 8, vgpr(8), vgpr(6), 128)); // v_add_nc_u32 v8, v8, v6
+    body.extend(vop3(0x116, 8, vgpr(5), vgpr(8), 128)); // v_lshrrev_b32 v8, v5, v8
+    body.extend(vop3(0x11A, 9, vgpr(2), 129, 128)); // v_lshlrev_b32 v9, v2, 1
+    body.extend(vop3(0x125, 9, 193, vgpr(9), 128)); // v_add_nc_u32 v9, -1, v9
+    body.extend(vop3(0x125, 8, vgpr(8), vgpr(9), 128)); // v_add_nc_u32 v8, v8, v9
+    body.extend(vop3(0x116, 8, vgpr(2), vgpr(8), 128)); // v_lshrrev_b32 v8, v2, v8
+    body.extend(vop3(0x0C5, 106, 128, vgpr(4), 128)); // v_cmp_ne_u32 vcc, 0, v4
+    body.extend(vop3(0x101, 0, vgpr(7), vgpr(8), vcc)); // v_cndmask_b32 v0, v7, v8, vcc
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    for texels in [0u32, 1, 2, 3, 5, 8, 9, 100, 255, 257, 4096, 16383] {
+        for mip in [0u32, 1, 2, 3, 5, 13] {
+            for block in [1u32, 4] {
+                cases.extend([[texels, mip, block, 0], [texels, mip, block, 1]]);
+            }
+        }
+    }
+    // The two sizes must differ somewhere, or the test could not tell them apart.
+    assert!(cases.iter().any(|&[t, m, b, _]| {
+        texture_dim_reference(t, m, b) != texture_padded_dim_reference(t, m, b)
+    }));
+    run_cases(
+        &shader,
+        &cases,
+        |backend, _, [texels, mip, block, padded], got| {
+            let want = if padded == 0 {
+                texture_dim_reference(texels, mip, block)
+            } else {
+                texture_padded_dim_reference(texels, mip, block)
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: {texels} texels, mip {mip}, block {block}, padded {padded}"
+            );
+        },
+    );
+}
