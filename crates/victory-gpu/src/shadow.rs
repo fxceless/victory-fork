@@ -2526,6 +2526,63 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
 }
 
 #[cfg(test)]
+mod writing_tests {
+    use super::outside;
+
+    /// The parts of `[from, to)` no range of `pending` holds, cutting each
+    /// out in turn as `Shadow::writing` did, and the lists that made.
+    fn one_at_a_time(from: usize, to: usize, pending: &[(usize, usize)]) -> (Vec<(usize, usize)>, usize) {
+        let (mut parts, mut lists) = (vec![(from, to)], 1);
+        for &(a, e) in pending {
+            let mut rest = Vec::with_capacity(parts.len() + 1);
+            lists += 1;
+            for (from, to) in parts {
+                if e <= from || a >= to {
+                    rest.push((from, to));
+                    continue;
+                }
+                if from < a {
+                    rest.push((from, a));
+                }
+                if e < to {
+                    rest.push((e, to));
+                }
+            }
+            parts = rest;
+        }
+        (parts.into_iter().filter(|&(a, e)| a < e).collect(), lists)
+    }
+
+    /// Overlapping, repeated, touching and empty declared ranges: one pass
+    /// gives the same non-empty parts, in order, with two lists a range
+    /// instead of one per range declared before it.
+    #[test]
+    fn a_new_range_s_parts_are_those_one_cut_at_a_time_gave() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        let (mut before, mut after) = (0, 0);
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..960 {
+            let a = next(1 << 16);
+            let range = (a, a + [0, 1, 16, 256, 4096, 40_000][next(6)]);
+            let (old, lists) = one_at_a_time(range.0, range.1, &pending);
+            let new = outside(range.0, range.1, pending.clone());
+            assert_eq!(new.iter().copied().filter(|&(a, e)| a < e).collect::<Vec<_>>(), old, "{range:?}");
+            assert!(new.windows(2).all(|w| w[0].1 <= w[1].0), "in order, apart");
+            (before, after) = (before + lists, after + 2);
+            if !pending.contains(&range) {
+                pending.push(range);
+            }
+        }
+        eprintln!("lists for 960 declared ranges: {before} one at a time, {after} in one pass");
+        assert!(after * 100 < before);
+    }
+}
+
+#[cfg(test)]
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs, dword_runs, put_changed, word_runs};
 
@@ -3410,24 +3467,11 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        // In one pass over the declared ranges, sorted ([`outside`]):
+        // cutting them out one at a time made a list per declared range for
+        // every new one (461,280 lists for 960 distinct ranges).
+        let (from, to) = self.inside(address, len);
+        let parts = outside(from, to, pending.iter().map(|&(a, e)| self.inside(a, e - a)).collect());
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
