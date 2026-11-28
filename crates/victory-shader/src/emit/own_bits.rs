@@ -638,6 +638,27 @@ impl Ctx<'_> {
                         })
                     })
         };
+        let atom_in_region = |a: Atom| -> bool {
+            let v = match a {
+                Atom::Lane(v)
+                | Atom::Uniform(v)
+                | Atom::Phi(v)
+                | Atom::Quad(v)
+                | Atom::Opaque(v) => v,
+                Atom::Constant(_) => return false,
+            };
+            self.def
+                .get(&v)
+                .is_some_and(|&(b, _)| lp[b] || pre[b])
+                || (0..n).any(|b| (lp[b] || pre[b]) && p.blocks[b].phis.iter().any(|phi| phi.value == v))
+        };
+        let mask_depends_on_region = |w: Value| -> bool {
+            let lo = st.highs.get(&w).copied().unwrap_or(w);
+            st.masks
+                .get(&lo)
+                .is_none_or(|&m| st.bools.support(m).iter().any(|&a| atom_in_region(a)))
+        };
+        let mut non_body_masks: Vec<Atom> = Vec::new();
         // ---- a round outside the body leaves nothing behind ----
         for b in (0..n).filter(|&b| lp[b] || pre[b]) {
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -646,8 +667,22 @@ impl Ctx<'_> {
                 }
                 let u = (b, i);
                 for &(reg, w) in &inst.writes {
-                    if rem.contains(&w) || is_mask(w) || matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                    if rem.contains(&w) || matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
                         continue;
+                    }
+                    if is_mask(w) {
+                        if lp[b]
+                            && let Some(&m) = st.masks.get(&w)
+                        {
+                            for atom in st.bools.support(m) {
+                                if matches!(atom, Atom::Lane(v) | Atom::Quad(v) | Atom::Opaque(v) if v == w) {
+                                    non_body_masks.push(atom);
+                                }
+                            }
+                        }
+                        if !mask_depends_on_region(w) {
+                            continue;
+                        }
                     }
                     for user in self.users.get(&w).into_iter().flatten() {
                         let stays = match *user {
@@ -693,8 +728,8 @@ impl Ctx<'_> {
                 }
             }
         }
-        // ---- no mask that depends on the test outlives its round ----
-        let mut dep: HashSet<Atom> = tests.iter().map(|t| t.0).collect();
+        // ---- no mask that depends on the test or a non-body loop compare outlives its round ----
+        let mut dep: HashSet<Atom> = tests.iter().map(|t| t.0).chain(non_body_masks).collect();
         let mut changed = true;
         while changed {
             changed = false;
@@ -910,5 +945,39 @@ mod tests {
         let p = light_loop(true, &[ADD_BIT_NUMBER], &[0xD834_0000, 0x0000_0505], &[]);
         assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_write_b32"));
         assert!(found(&p).totals.is_empty());
+    }
+
+    #[test]
+    fn a_non_test_mask_written_in_latch_cannot_escape_after_loop() {
+        // v_cmp_eq_u32 s[14:15], s10, v0 in latch writes a non-test mask depending on
+        // the round's bit index s10 (which differs between wave64 and split wave32).
+        let cmp_latch = [0xD4C2_000E, 0x0002_000A];
+        // Direct use in `after`: v_cndmask_b32 v6, v1, v2, s[14:15]
+        let cnd = 257 | (258 << 9) | (14 << 18);
+        let p_direct = light_loop(true, &[ADD_BIT_NUMBER], &cmp_latch, &[0xD501_0006, cnd]);
+        assert!(
+            p_direct
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_cmp_eq_u32")
+        );
+        assert!(
+            found(&p_direct).totals.is_empty(),
+            "non-test latch mask read by v_cndmask_b32 after the loop must be rejected"
+        );
+
+        // Indirect escape through EXEC: latch narrows EXEC with s[14:15] (so s[14:15]
+        // itself has only an in-loop user), guarding a VALU instruction in `after`.
+        let p_exec = light_loop(
+            true,
+            &[ADD_BIT_NUMBER],
+            &[cmp_latch[0], cmp_latch[1], 0xBE80_240E], // s_and_saveexec_b64 s[0:1], s[14:15]
+            &[0x7E0C_0281],                              // v_mov_b32 v6, 1 (guarded by s[14:15])
+        );
+        assert!(
+            found(&p_exec).totals.is_empty(),
+            "non-test latch mask escaping via EXEC guard into post-loop block must be rejected"
+        );
     }
 }
