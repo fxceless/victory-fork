@@ -615,12 +615,6 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Since the last frame-rate line: why submissions were refused and waited
-/// (the check's own words), and how many for each. In every build: a refusal
-/// costs a wait for flights, some thirty milliseconds, and the line said how
-/// many there were but not why.
-static REFUSED_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
-
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -684,15 +678,9 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut all = REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner());
-                    match all.iter_mut().find(|w| w.0 == why) {
-                        Some(w) => w.1 += 1,
-                        None => all.push((why, 1)),
-                    }
-                }
                 #[cfg(feature = "diagnostics")]
                 refused(why);
+                let _ = why;
                 None
             }
         }
@@ -925,12 +913,6 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
-    let mut why = std::mem::take(&mut *REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner()));
-    if !why.is_empty() {
-        why.sort_unstable_by_key(|w| std::cmp::Reverse(w.1));
-        let text: Vec<String> = why.iter().take(6).map(|(why, n)| format!("{:.2} {why}", *n as f64 / frames)).collect();
-        tracing::info!("submissions refused steps on the card and waited for flights, per frame, by why: {}", text.join("; "));
-    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
