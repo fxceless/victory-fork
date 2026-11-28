@@ -385,6 +385,28 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // The window shows the system's white (the title's class brush) from
+    // its creation until our first present, a second or more at start.
+    // It is black instead, as a console's screen is before its first frame.
+    if message == wm::WM_ERASEBKGND {
+        use windows_sys::Win32::Graphics::Gdi;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: the device context the message hands over, for our window.
+        unsafe {
+            wm::GetClientRect(hwnd, &mut rect);
+            Gdi::FillRect(
+                wparam as Gdi::HDC,
+                &rect,
+                Gdi::GetStockObject(Gdi::BLACK_BRUSH) as Gdi::HBRUSH,
+            );
+        }
+        return 1;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
