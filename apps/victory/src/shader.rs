@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use victory_game::sgd5;
 use victory_shader::gfx10::{self, Instruction};
+use victory_shader::psv::{self, Geometry, InputPrimitive, OutputTopology};
 use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
@@ -93,6 +94,9 @@ struct Totals {
     unnamed: BTreeMap<String, usize>,
     decode_errors: BTreeMap<&'static str, usize>,
     files_with_shaders: usize,
+    /// Geometry shaders by what their `PSV0` gives.
+    geometry: BTreeMap<String, usize>,
+    geometry_errors: BTreeMap<String, usize>,
 }
 
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
@@ -194,6 +198,19 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     }
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
+                // Independent of the native code: the container's own PSV0.
+                let line = match container.part(FourCC::PSV0).map(|p| psv::geometry(p.data)) {
+                    Some(Ok(Some(g))) => {
+                        let d = describe(&g);
+                        *t.geometry.entry(d.clone()).or_default() += 1;
+                        format!("{line}, geometry {d}")
+                    }
+                    Some(Err(e)) => {
+                        *t.geometry_errors.entry(e.to_string()).or_default() += 1;
+                        format!("{line}, geometry: {e}")
+                    }
+                    _ => line,
+                };
                 if verbose {
                     // As a run's log and a replay name it (`hash=`).
                     let hash = blake3::hash(&bytes).to_hex();
@@ -239,10 +256,45 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
             println!("  opcode not in table  {op} x{n}");
         }
     }
+    if !t.geometry.is_empty() || !t.geometry_errors.is_empty() {
+        println!(
+            "  geometry (PSV0)      {}",
+            t.geometry.values().sum::<usize>()
+        );
+        for (d, n) in &t.geometry {
+            println!("    {n:<6} {d}");
+        }
+        for (e, n) in &t.geometry_errors {
+            println!("  geometry unreadable  {n}: {e}");
+        }
+    }
     if t.containers == 0 {
         println!("(none found: shaders may sit in compressed or encrypted archives)");
     }
     Ok(())
+}
+
+/// A geometry shader's limits in a few words.
+fn describe(g: &Geometry) -> String {
+    let input = match g.input {
+        InputPrimitive::Point => "points".to_owned(),
+        InputPrimitive::Line => "lines".to_owned(),
+        InputPrimitive::Triangle => "triangles".to_owned(),
+        InputPrimitive::LineAdjacency => "lines with adjacency".to_owned(),
+        InputPrimitive::TriangleAdjacency => "triangles with adjacency".to_owned(),
+        InputPrimitive::Patch(n) => format!("{n}-point patches"),
+    };
+    let output = match g.output {
+        OutputTopology::Points => "points",
+        OutputTopology::LineStrips => "line strips",
+        OutputTopology::TriangleStrips => "triangle strips",
+    };
+    format!(
+        "{input} in, {output} out, at most {} vertices, streams {:#x}{}",
+        g.max_vertices,
+        g.streams,
+        if g.position { ", position" } else { "" }
+    )
 }
 
 fn format_instruction(i: &Instruction, wave64: bool) -> String {
@@ -252,4 +304,35 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_geometry_limits() {
+        let g = Geometry {
+            input: InputPrimitive::Triangle,
+            output: OutputTopology::TriangleStrips,
+            streams: 1,
+            position: true,
+            max_vertices: 3,
+        };
+        assert_eq!(
+            describe(&g),
+            "triangles in, triangle strips out, at most 3 vertices, streams 0x1, position"
+        );
+        let g = Geometry {
+            input: InputPrimitive::Patch(4),
+            output: OutputTopology::Points,
+            streams: 0b11,
+            position: false,
+            max_vertices: 12,
+        };
+        assert_eq!(
+            describe(&g),
+            "4-point patches in, points out, at most 12 vertices, streams 0x3"
+        );
+    }
 }

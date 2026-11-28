@@ -489,4 +489,28 @@ mod tests {
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
+
+    #[test]
+    fn the_geometry_psv_written_reads_back() {
+        // The built-in rectangle GS's PSV0, through the title-side reader.
+        for (position, max_vertices) in [(true, 4), (false, 6)] {
+            let part = psv(&Psv {
+                stage: 2,
+                flag: position,
+                inputs: &[],
+                outputs: &[],
+                prims: &[],
+                mesh: None,
+                geometry: Some(max_vertices),
+                bindings: &[],
+                threads: [0; 3],
+                wave_size: None,
+            });
+            let g = crate::psv::geometry(&part).unwrap().unwrap();
+            assert_eq!(g.input, crate::psv::InputPrimitive::Triangle);
+            assert_eq!(g.output, crate::psv::OutputTopology::TriangleStrips);
+            assert_eq!((g.streams, g.position), (1, position));
+            assert_eq!(u32::from(g.max_vertices), max_vertices);
+        }
+    }
 }
