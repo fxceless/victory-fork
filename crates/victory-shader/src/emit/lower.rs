@@ -8900,6 +8900,31 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_mad_i64_i32" => {
+                // a * b + c with a and b signed 32 bits, c and the result 64
+                // bits wide. The carry out is not modelled: a program that
+                // reads it is refused, as for any lane mask read as data.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let a = self.s.m.cast(c, Cast::SExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::SExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("the carry of a signed multiply-add"));
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
