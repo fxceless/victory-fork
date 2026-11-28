@@ -9828,6 +9828,14 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        crate::flip::window(|| {
+            let slots = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+            format!(
+                "ms {ms:.1} prep {cpu:.1} copies {copy_ms:.1} textures {texture_ms:.1} gpu {gpu:.1} back {back_ms:.1}                  heap {picked_ms:.1} draws {draws:.0} drop {dropped:.0} making {} queued {} frames {frames:.0}",
+                crate::pipeline::making(),
+                slots[0]
+            )
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
