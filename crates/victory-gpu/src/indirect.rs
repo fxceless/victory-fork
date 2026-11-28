@@ -2370,7 +2370,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             };
             for (i, groups) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                assert_eq!(rec, [groups, 1, 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
             // As one window ahead of its draws and one by one alike.

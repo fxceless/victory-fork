@@ -933,7 +933,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool, loops_kept: bool) -> Option
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for b in 0..n {
+    for (b, block) in blocks.iter_mut().enumerate().take(n) {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
         };
