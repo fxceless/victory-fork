@@ -89,16 +89,18 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         let at = info
             .rva_to_file_offset(tls.directory_rva)
             .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
-        write_u64(
-            &mut bytes,
-            at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
-            0,
-        )?;
+        let callback_offset = (at as usize)
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS)
+            .ok_or(PrepareError::Patch("TLS callback field offset overflow"))?;
+        write_u64(&mut bytes, callback_offset, 0)?;
         // The field's base relocation would turn the 0 into `delta` whenever
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -124,34 +126,51 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return out;
     };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
-    else {
+    let (Some(rva), Some(size)) = (
+        layout::read_u32(bytes, d),
+        d.checked_add(4).and_then(|o| layout::read_u32(bytes, o)),
+    ) else {
         return out;
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
-        let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
-        else {
+    let start = start as usize;
+    let end = start
+        .checked_add(size as usize)
+        .map_or(bytes.len(), |e| e.min(bytes.len()));
+    let mut at = start;
+    while let Some(header_end) = at.checked_add(8) {
+        if header_end > end {
+            break;
+        }
+        let (Some(page), Some(block)) = (
+            layout::read_u32(bytes, at),
+            layout::read_u32(bytes, at + 4),
+        ) else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(block_end) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || block_end > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+        for (idx, chunk) in bytes[header_end..block_end]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let e = u16::from_le_bytes(*chunk);
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((header_end + idx * 2, target));
             }
         }
-        at += block;
+        at = block_end;
     }
     out
 }
@@ -166,8 +185,11 @@ fn write_u64(bytes: &mut [u8], at: usize, v: u64) -> Result<(), PrepareError> {
     write(bytes, at, &v.to_le_bytes())
 }
 fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
+    let end = at
+        .checked_add(v.len())
+        .ok_or(PrepareError::Patch("header field outside of file"))?;
     bytes
-        .get_mut(at..at + v.len())
+        .get_mut(at..end)
         .ok_or(PrepareError::Patch("header field outside of file"))?
         .copy_from_slice(v);
     Ok(())
@@ -279,5 +301,78 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    /// Minimal synthetic PE32+ image with one section at RVA 0x1000 holding
+    /// a base-relocation table (at 0x1000) and optional TLS directory.
+    fn synthetic_reloc_image(reloc: &[u8], reloc_dir_size: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 0x200];
+        d[0..2].copy_from_slice(b"MZ");
+        d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x44..0x46].copy_from_slice(&victory_pe::MACHINE_AMD64.to_le_bytes());
+        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        d[0x56..0x58].copy_from_slice(&0x0022u16.to_le_bytes());
+        let opt = 0x58;
+        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        d[opt + 24..opt + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let dd_reloc = opt + layout::OPT_DATA_DIRECTORY + dir::BASERELOC * 8;
+        d[dd_reloc..dd_reloc + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[dd_reloc + 4..dd_reloc + 8].copy_from_slice(&reloc_dir_size.to_le_bytes());
+        let sec = opt + 240;
+        d[sec..sec + 6].copy_from_slice(b".reloc");
+        d[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        d.resize(0x400, 0);
+        d[0x200..0x200 + reloc.len()].copy_from_slice(reloc);
+        d
+    }
+
+    #[test]
+    fn dir64_relocations_handle_overflowing_rva_and_odd_blocks() {
+        // Block 1: page = 0xFFFF_F800, two DIR64 entries:
+        //   - offset 0x900 overflows u32 (must be skipped, not panic/wrap)
+        //   - offset 0x100 is valid (0xFFFF_F900)
+        // Block 2: odd block size 11 (header 8 + 3 bytes): only the first
+        // 2-byte entry fits inside the block; the trailing single byte must
+        // not be paired with the first byte of the following block.
+        let mut reloc = Vec::new();
+        reloc.extend_from_slice(&0xFFFF_F800u32.to_le_bytes());
+        reloc.extend_from_slice(&12u32.to_le_bytes());
+        reloc.extend_from_slice(&((10u16 << 12) | 0x900).to_le_bytes());
+        reloc.extend_from_slice(&((10u16 << 12) | 0x100).to_le_bytes());
+
+        // Block 2 (starts at reloc offset 12, file offset 0x20C):
+        reloc.extend_from_slice(&0x1000u32.to_le_bytes());
+        reloc.extend_from_slice(&11u32.to_le_bytes()); // odd size: 1 complete entry + 1 stray byte
+        reloc.extend_from_slice(&((10u16 << 12) | 0x018).to_le_bytes());
+        reloc.push(0x00); // stray byte at end of odd block
+        // Following bytes whose first byte would form type DIR64 (0xA0) if read past block_end:
+        reloc.extend_from_slice(&[0xA0, 0x00, 0x00, 0x00]);
+
+        let img = synthetic_reloc_image(&reloc, reloc.len() as u32);
+        let info = ImageInfo::parse(&img).unwrap();
+        let entries = dir64_relocations(&img, &info);
+        assert_eq!(entries, vec![(0x20A, 0xFFFF_F900), (0x214, 0x1018)]);
+
+        // Declared directory size larger than the file must not panic.
+        let oversized = synthetic_reloc_image(&reloc, u32::MAX);
+        let info = ImageInfo::parse(&oversized).unwrap();
+        let entries = dir64_relocations(&oversized, &info);
+        assert_eq!(entries, vec![(0x20A, 0xFFFF_F900), (0x214, 0x1018)]);
+    }
+
+    #[test]
+    fn write_rejects_overflowing_offset() {
+        let mut buf = [0u8; 16];
+        assert!(write(&mut buf, usize::MAX - 2, &[1, 2, 3, 4]).is_err());
     }
 }
