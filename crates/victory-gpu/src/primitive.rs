@@ -150,10 +150,15 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let exponent = (bits >> 23) & 0xff;
     let man = bits & 0x7f_ffff;
+    if exponent == 0xff && man != 0 {
+        // Keep the representable payload bits and make the result a quiet NaN.
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
+    let exp = exponent as i32 - 127 + 15;
     if exp >= 31 {
-        return sign | 0x7c00; // too large: infinity
+        return sign | 0x7c00; // infinity or finite overflow
     }
     if exp <= 0 {
         if exp < -10 {
@@ -163,22 +168,47 @@ fn f32_to_half(v: f32) -> u16 {
         // normal (exponent field >= 1), so its significand has the implicit
         // leading 1; shift it into the half mantissa, rounding to even.
         let sig = (1u32 << 23) | man;
-        let shift = (14 - exp) as u32;
-        let halfway = 1u32 << (shift - 1);
-        let q = sig >> shift;
-        let r = sig & ((1u32 << shift) - 1);
-        let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
-        return sign | m as u16;
+        return sign | round_right_to_even(sig, (14 - exp) as u32) as u16;
     }
     // Rounded to nearest: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    sign | (half + round_right_to_even(man, 13)) as u16
+}
+
+fn round_right_to_even(value: u32, shift: u32) -> u32 {
+    let retained = value >> shift;
+    let remainder = value & ((1 << shift) - 1);
+    let halfway = 1 << (shift - 1);
+    retained + u32::from(remainder > halfway || (remainder == halfway && (retained & 1) != 0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expanded_r16_corner(corners: [u16; 3]) -> u16 {
+        let src: Vec<_> = corners.into_iter().flat_map(u16::to_le_bytes).collect();
+        let mut dst = [0; 12];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]); // R16_FLOAT
+        u16::from_le_bytes([dst[10], dst[11]])
+    }
+
+    #[test]
+    fn half_rectangle_midpoints_round_to_even() {
+        assert_eq!(expanded_r16_corner([0x3c00, 0, 0x1000]), 0x3c00);
+        assert_eq!(expanded_r16_corner([0x3c01, 0, 0x1000]), 0x3c02);
+        assert_eq!(expanded_r16_corner([0xbc00, 0, 0x9000]), 0xbc00);
+    }
+
+    #[test]
+    fn half_rectangle_keeps_a_quiet_nan() {
+        let out = expanded_r16_corner([0x7e00, 0, 0]);
+        assert_eq!(out & 0x7e00, 0x7e00);
+        assert_eq!(f32_to_half(f32::from_bits(0xff80_0001)), 0xfe00);
+        assert_eq!(f32_to_half(f32::from_bits(0xffa0_a000)), 0xff05);
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
@@ -276,9 +306,10 @@ mod tests {
         assert_eq!(f32_to_half(-2f32.powi(-24)), 0x8001);
         assert_eq!(f32_to_half(2f32.powi(-23)), 0x0002);
         assert_eq!(f32_to_half(1023.0 * 2f32.powi(-24)), 0x03ff);
-        // Ties go to an even mantissa: 0/1 and 1/2.
+        // Ties go to an even mantissa, including the transition into normal values.
         assert_eq!(f32_to_half(2f32.powi(-25)), 0x0000);
         assert_eq!(f32_to_half(3.0 * 2f32.powi(-25)), 0x0002);
+        assert_eq!(f32_to_half(2f32.powi(-14) - 2f32.powi(-25)), 0x0400);
         // Below half the smallest subnormal, and normal values, are unchanged.
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
