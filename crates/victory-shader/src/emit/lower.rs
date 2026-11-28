@@ -8881,11 +8881,19 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
                 let product = self.s.m.bin(c, Bin::Mul, a, b);
                 let r = self.s.m.bin(c, Bin::Add, product, x);
-                let carry = self.s.m.cmp(c, pred::IULT, r, x);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 64-bit result");
                 };
                 let (lo, hi) = self.split64(r);
+                // The carry is `r < c` (unsigned), on the dwords: as an i64
+                // compare, AMD's D3D12 compiler answers wrong where c shares a
+                // register with the second factor (RX 7900 XT); WARP is right.
+                let (xlo, xhi) = self.split64(x);
+                let hi_lt = self.s.m.cmp(c, pred::IULT, hi, xhi);
+                let hi_eq = self.s.m.cmp(c, pred::EQ, hi, xhi);
+                let lo_lt = self.s.m.cmp(c, pred::IULT, lo, xlo);
+                let lo_lt = self.s.m.bin(c, Bin::And, hi_eq, lo_lt);
+                let carry = self.s.m.bin(c, Bin::Or, hi_lt, lo_lt);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 if let Some(Operand::Scalar { code, .. }) = v.carry

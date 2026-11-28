@@ -1296,6 +1296,87 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
 }
 
+/// `v_mad_u64_u32` gives `{carry, D} = a * b + c` (65 bits): the two dwords
+/// of the result and the carry out, with the addend in a register pair of
+/// its own and sharing a register with the second factor. The addends are
+/// picked so that comparing with the dwords swapped would answer otherwise.
+/// Every case runs; the mismatches are counted by device, form and output
+/// before the test fails.
+#[test]
+fn v_mad_u64_u32_matches_its_definition() {
+    let factors: [u32; 6] = [0, 1, 2, 0xFFFF, 0x8000_0000, 0xFFFF_FFFF];
+    let addends: [u64; 9] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFE_0000_0002,
+        0xFFFF_FFFF_0000_0000,
+        0xFFFF_FFFF_FFFF_FFFF,
+    ];
+    let mut inputs: Vec<[u32; 4]> = Vec::new();
+    for &a in &factors {
+        for &b in &factors {
+            for &c in &addends {
+                inputs.push([a, b, c as u32, (c >> 32) as u32]);
+            }
+        }
+    }
+    let mut counts: std::collections::BTreeMap<(String, &str, &str), usize> = Default::default();
+    let mut first: Vec<String> = Vec::new();
+    // v_mad_u64_u32 v[5:6], s20, v1, v2, v[3:4] and, sharing v2,
+    // v_mad_u64_u32 v[5:6], s20, v1, v2, v[2:3] (VOP3B: s20 in bits 14:8);
+    // then v0 = the carry (v_cndmask_b32_e64 v0, 0, 1, s20), v5 or v6
+    for (third, form) in [(3u8, "v[3:4]"), (2, "v[2:3]")] {
+        for output in ["carry", "low", "high"] {
+            let mut body = vec![
+                0x35 << 26 | 0x176 << 16 | 20 << 8 | 5,
+                vgpr(1) as u32 | (vgpr(2) as u32) << 9 | (vgpr(third) as u32) << 18,
+            ];
+            match output {
+                "carry" => body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20))),
+                "low" => body.push(vop1(0x001, 0, vgpr(5))),
+                _ => body.push(vop1(0x001, 0, vgpr(6))),
+            }
+            let shader = build_valu_cs(&body);
+            let at = usize::from(third) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let (a, b) = (inp[0], inp[1]);
+                let c = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let sum = u128::from(a) * u128::from(b) + u128::from(c);
+                let want = match output {
+                    "carry" => (sum >> 64) as u32,
+                    "low" => sum as u32,
+                    _ => (sum >> 32) as u32,
+                };
+                if got != want {
+                    *counts
+                        .entry((backend.to_owned(), form, output))
+                        .or_default() += 1;
+                    if first.len() < 12 {
+                        first.push(format!(
+                            "{backend} {form} {output}: v_mad_u64_u32({a:#010x}, {b:#010x}, {c:#018x}) = {got:#010x}, want {want:#010x}"
+                        ));
+                    }
+                }
+            });
+        }
+    }
+    for ((backend, form, output), n) in &counts {
+        eprintln!(
+            "v_mad_u64_u32 {backend} {form} {output}: {n} of {} wrong",
+            inputs.len()
+        );
+    }
+    assert!(
+        counts.is_empty(),
+        "v_mad_u64_u32 mismatches: {counts:?}\n{}",
+        first.join("\n")
+    );
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
