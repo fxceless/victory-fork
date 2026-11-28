@@ -667,16 +667,18 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
+        let prev = (context.Rip, context.Rsp);
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
         if entry.is_null() {
-            // SAFETY: `rsp` is inside this thread's stack.
-            context.Rip = unsafe { (rsp as *const u64).read() };
-            context.Rsp += 8;
+            // SAFETY: `[rsp, rsp + 8)` lies inside this thread's stack; a
+            // crashing thread's RSP may be unaligned.
+            context.Rip = unsafe { (rsp as *const u64).read_unaligned() };
+            context.Rsp = context.Rsp.wrapping_add(8);
         } else {
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
@@ -693,7 +695,7 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 {
+        if context.Rip == 0 || (context.Rip, context.Rsp) == prev {
             break;
         }
         frames.push(context.Rip);
@@ -721,9 +723,13 @@ fn module_of(address: usize) -> Option<String> {
     let mut path = [0u16; 260];
     // SAFETY: `module` is a loaded module; the buffer length is passed.
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    if len == 0 {
+        return None;
+    }
+    let rva = address.checked_sub(module as usize)?;
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    Some(format!("{name}+{rva:#x}"))
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
@@ -1450,5 +1456,31 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn unwind_into_handles_overflowing_and_unaligned_rsp() {
+        // 1. High RSP near usize::MAX must not overflow `rsp + 8` or dereference.
+        // SAFETY: zeroed CONTEXT is valid for synthetic unwind bounds testing.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = 0x1000;
+        ctx.Rsp = u64::MAX - 4;
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        unwind_into(ctx, 0, usize::MAX, &mut frames);
+        assert_eq!(frames, vec![0x1000]);
+
+        // 2. Unaligned RSP on a leaf frame (no RUNTIME_FUNCTION for Rip = 0x1000)
+        // must read unaligned return addresses cleanly without alignment UB/panic.
+        let mut stack = [0u8; 32];
+        let ret_addr = 0x1234_5678_9abc_def0u64;
+        stack[1..9].copy_from_slice(&ret_addr.to_le_bytes());
+        // Next return slot at stack[9..17] is 0, terminating the unwind.
+        let low = stack.as_ptr() as usize;
+        let high = low + stack.len();
+        ctx.Rip = 0x1000;
+        ctx.Rsp = (low + 1) as u64;
+        frames.clear();
+        unwind_into(ctx, low, high, &mut frames);
+        assert_eq!(frames, vec![0x1000, ret_addr]);
     }
 }
