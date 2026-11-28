@@ -716,6 +716,138 @@ pub(crate) fn status() {
     );
 }
 
+#[cfg(test)]
+mod cpu_claim_tests {
+    use super::*;
+
+    fn texture(levels: u32, standard: usize, backed: u32, packed: bool) -> Tiled {
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        BLANK[0].fetch_add(1, Ordering::Relaxed);
+        Tiled {
+            standard: vec![1; standard],
+            packed: u32::from(standard < levels as usize),
+            levels,
+            full: 0,
+            given: Mutex::new(Given {
+                levels: (0..standard).map(|i| backed & (1 << i) != 0).collect(),
+                packed,
+                runs: Vec::new(),
+            }),
+            shown: AtomicU32::new(u32::MAX),
+            held: AtomicU32::new(0),
+            card: AtomicU32::new(0),
+            claimed: AtomicU32::new(0),
+        }
+    }
+
+    #[test]
+    fn claims_and_retries_follow_backing_for_every_mip_layout() {
+        let mut cases = 0;
+        for levels in 1..=16 {
+            let all = (1u32 << levels) - 1;
+            for standard in 0..=levels as usize {
+                for backed in [0, all, 0x5555, 1, 1 << (levels - 1)] {
+                    for packed in [false, true] {
+                        for requested in [0, all, u32::MAX, 0xAAAA, 1, 1 << (levels - 1)] {
+                            let t = texture(levels, standard, backed, packed);
+                            let missing: std::collections::BTreeSet<_> = (0..levels)
+                                .filter(|&i| if (i as usize) < standard { backed & (1 << i) == 0 } else { !packed })
+                                .collect();
+                            let expected = missing.iter().filter(|&&i| requested & (1 << i) != 0).fold(0, |bits, &i| bits | (1 << i));
+                            assert_eq!(t.without(requested), expected);
+                            assert_eq!(t.claim(requested), expected);
+                            assert_eq!(t.claim(requested), 0, "a second list must not claim the same zeros");
+                            let retry = expected & 0x5555;
+                            t.unclaim(retry);
+                            assert_eq!(t.claim(requested), retry, "cancelled work must be claimable again");
+                            assert_eq!(t.without(requested), expected, "claiming does not give tiles");
+                            assert_eq!(t.card.load(Ordering::Relaxed), 0);
+                            for level in 0..=levels {
+                                let expected_group = if level >= levels { 0 } else if (level as usize) < standard {
+                                    1 << level
+                                } else {
+                                    (standard as u32..levels).fold(0, |bits, i| bits | (1 << i))
+                                };
+                                assert_eq!(t.with_level(level), expected_group);
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("CPU mip-claim matrix: {cases} cases, no device or tile allocations");
+    }
+
+    #[test]
+    fn concurrent_lists_claim_each_missing_level_once_and_cancelled_claims_retry() {
+        let t = texture(16, 9, 0x15, false);
+        let missing = t.without(u32::MAX);
+        let barrier = std::sync::Barrier::new(8);
+        let claims = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                barrier.wait();
+                t.claim(u32::MAX)
+            })).collect();
+            jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
+        });
+        let mut seen = 0;
+        for claim in claims {
+            assert_eq!(seen & claim, 0, "two lists claimed the same initialization");
+            seen |= claim;
+        }
+        assert_eq!(seen, missing);
+        let cancelled = missing & 0xAAAA;
+        t.unclaim(cancelled);
+        assert_eq!(t.claim(u32::MAX), cancelled);
+        assert_eq!(t.claim(u32::MAX), 0);
+    }
+
+    #[test]
+    fn resident_view_ranges_preserve_lod_and_array_metadata() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        for dimension in [D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY] {
+            for base in 0..8u32 {
+                for count in [1, 3, 12 - base, u32::MAX] {
+                    if count != u32::MAX && base + count > 12 { continue; }
+                    for first in 0..12u32 {
+                        if count != u32::MAX && first >= base + count { continue; }
+                        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+                            ViewDimension: dimension,
+                            Shader4ComponentMapping: 5768,
+                            ..Default::default()
+                        };
+                        let clamp = base as f32 + 0.5;
+                        if dimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+                            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: base, MipLevels: count, PlaneSlice: 1, ResourceMinLODClamp: clamp };
+                        } else {
+                            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: base, MipLevels: count, FirstArraySlice: 3, ArraySize: 2, PlaneSlice: 1, ResourceMinLODClamp: clamp };
+                        }
+                        show_from(&mut desc, first, 12);
+                        let expected_base = base.max(first);
+                        let expected_count = if count == u32::MAX { count } else { base + count - expected_base };
+                        // SAFETY: each descriptor was initialized using its matching dimension.
+                        unsafe {
+                            if dimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+                                let view = desc.Anonymous.Texture2D;
+                                assert_eq!((view.MostDetailedMip, view.MipLevels, view.PlaneSlice), (expected_base, expected_count, 1));
+                                assert_eq!(view.ResourceMinLODClamp, clamp);
+                            } else {
+                                let view = desc.Anonymous.Texture2DArray;
+                                assert_eq!((view.MostDetailedMip, view.MipLevels, view.FirstArraySlice, view.ArraySize, view.PlaneSlice), (expected_base, expected_count, 3, 2, 1));
+                                assert_eq!(view.ResourceMinLODClamp, clamp);
+                            }
+                        }
+                        assert_eq!(desc.Format, DXGI_FORMAT_X24_TYPELESS_G8_UINT);
+                        assert_eq!(desc.Shader4ComponentMapping, 5768);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// On the card, without the title: what levels on demand relies on, with
 /// the pool and the mapping call of this module on a device of the test's
 /// own. One test, one device: the pool is one for the process, and its
