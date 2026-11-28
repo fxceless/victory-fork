@@ -310,23 +310,57 @@ fn commit(
 /// The containers under a provider's root, by exact name; containers in
 /// the old one-file-per-blob layout are converted first.
 fn containers(root: &Path) -> Vec<(String, PathBuf)> {
+    scan_containers(root, |_, _| {})
+}
+
+fn scan_containers(
+    root: &Path,
+    mut scan_failed: impl FnMut(Option<&str>, std::io::Error),
+) -> Vec<(String, PathBuf)> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                scan_failed(None, error);
+            }
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan_failed(None, error);
+                continue;
+            }
+        };
         let path = entry.path();
         let file = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_dir() {
-            continue;
+        let gone = file.ends_with(".gone");
+        let versioned = file.contains('~');
+        let legacy = if gone || versioned { None } else { decode(&file) };
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                if let Some(name) = &legacy {
+                    scan_failed(Some(name), error);
+                }
+                continue;
+            }
         }
-        if file.ends_with(".gone") {
+        if gone {
             let _ = std::fs::remove_dir_all(&path);
-        } else if file.contains('~') {
+        } else if versioned {
             if let Ok(Some(v)) = current(&path) {
                 out.push((v.name, path));
             }
-        } else if let Some(name) = decode(&file)
-            && let Some(dir) = migrate(root, &name, &path)
-        {
-            out.push((name, dir));
+        } else if let Some(name) = legacy {
+            match migrate(root, &name, &path) {
+                Ok(dir) => out.push((name, dir)),
+                Err(error) => scan_failed(Some(&name), error),
+            }
         }
     }
     out.sort();
@@ -335,33 +369,32 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 
 /// Moves a container of the old layout (blob files named by encoded name,
 /// a `.display` file) into a committed version, then removes it.
-fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
+fn migrate(root: &Path, name: &str, old: &Path) -> std::io::Result<PathBuf> {
     let dir = container_dir(root, name);
-    let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
+    let done = current_named(&dir, name)?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs = Vec::new();
+        for entry in std::fs::read_dir(old)? {
+            let entry = entry?;
+            if let Some(blob) = entry.file_name().to_str().and_then(decode) {
+                blobs.push((blob, std::fs::read(entry.path())?));
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
             .map(|(n, d)| (n.as_str(), Source::Data(d)))
             .collect();
-        commit(&dir, 1, name, &display, &sources).ok()?;
+        commit(&dir, 1, name, &display, &sources)?;
     }
-    std::fs::remove_dir_all(old).ok()?;
+    std::fs::remove_dir_all(old)?;
     tracing::info!(container = name, "game save moved to the versioned layout");
-    Some(dir)
+    Ok(dir)
 }
 
-fn used_bytes(root: &Path) -> u64 {
-    containers(root)
+fn used_bytes(containers: &[(String, PathBuf)]) -> u64 {
+    containers
         .iter()
         .filter_map(|(name, dir)| current_named(dir, name).ok().flatten())
         .map(|v| v.sizes().iter().map(|(_, size)| size).sum::<u64>())
@@ -430,7 +463,7 @@ impl Provider {
 /// Quota left under a provider's root, or less if the host disk is fuller.
 fn remaining(root: &Path) -> u64 {
     QUOTA
-        .saturating_sub(used_bytes(root))
+        .saturating_sub(used_bytes(&containers(root)))
         .min(storage::disk_free(root))
 }
 
@@ -462,11 +495,25 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
+        let root = self.dir.parent().unwrap_or(&self.dir);
+        // Scan before taking the update's base. An incomplete scan or a
+        // failed migration cannot establish that a new version is safe.
+        let mut scan_error = None;
+        let containers = scan_containers(root, |name, error| {
+            if name.is_none_or(|name| name == self.name) {
+                scan_error = Some(error);
+            }
+        });
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return io_error(&self.dir, &e),
         };
+        if current.is_none()
+            && let Some(error) = scan_error
+        {
+            return io_error(&self.dir, &error);
+        }
         if current.as_ref().is_some_and(|v| v.name != self.name) {
             // Another container's name hashes alike: never mix the two.
             return NO_ACCESS;
@@ -501,9 +548,8 @@ impl Update {
             let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
-        let root = self.dir.parent().unwrap_or(&self.dir);
         let free = storage::disk_free(root);
-        if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
+        if let Some(hr) = no_room(written as u64, replaced, used_bytes(&containers), free) {
             return hr;
         }
         let display = self.display.as_deref();
@@ -1210,6 +1256,119 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    #[test]
+    fn the_old_layout_retries_unreadable_blobs() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Player");
+        let header = old.join("Save%20Header");
+        // A directory at the blob path makes reading it fail on any host.
+        std::fs::create_dir_all(&header).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        std::fs::create_dir(old.join("bad%XX")).unwrap();
+        std::fs::create_dir(old.join("Data.new")).unwrap();
+        std::fs::create_dir(old.join(".display")).unwrap();
+        assert!(std::fs::read(&header).is_err());
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(!c.dir.exists(), "migration committed a partial save");
+        assert_eq!(std::fs::read(old.join("Data")).unwrap(), b"data");
+        assert!(header.is_dir());
+
+        std::fs::remove_dir(&header).unwrap();
+        std::fs::write(&header, b"header").unwrap();
+        assert_eq!(containers(&root), [("Player".into(), c.dir.clone())]);
+        assert!(!old.exists());
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("Data".into(), b"data".to_vec()),
+                ("Save Header".into(), b"header".to_vec())
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!((v.number, v.display.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn a_pending_legacy_migration_blocks_updates() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("%50layer"); // another encoded spelling of Player
+        let header = old.join("Header");
+        std::fs::create_dir_all(&header).unwrap();
+        std::fs::write(old.join("Data"), b"old data").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        let update = Update {
+            name: c.name.clone(),
+            dir: c.dir.clone(),
+            display: None,
+            changes: vec![("Data".into(), Some(b"new data".to_vec()))],
+        };
+        assert_eq!(update.submit(), NO_ACCESS);
+        assert!(!c.dir.exists());
+        assert_eq!(std::fs::read(old.join("Data")).unwrap(), b"old data");
+        assert!(header.is_dir());
+
+        std::fs::remove_dir(&header).unwrap();
+        std::fs::write(&header, b"header").unwrap();
+        assert_eq!(update.submit(), S_OK);
+        assert!(!old.exists());
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("Data".into(), b"new data".to_vec()),
+                ("Header".into(), b"header".to_vec())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_provider_root_blocks_a_new_version() {
+        let saves = tempfile::tempdir().unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let old = p.root.join("Player");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("Header"), b"legacy header").unwrap();
+        let c = p.container("Player");
+        let update = Update {
+            name: c.name.clone(),
+            dir: c.dir.clone(),
+            display: None,
+            changes: vec![("Data".into(), Some(b"new data".to_vec()))],
+        };
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p.root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let denied = std::fs::read_dir(&p.root).err().map(|error| error.kind());
+        let result = update.submit();
+        std::fs::set_permissions(&p.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(denied, Some(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(result, NO_ACCESS);
+        assert!(!c.dir.exists());
+        assert_eq!(std::fs::read(old.join("Header")).unwrap(), b"legacy header");
+        assert_eq!(update.submit(), S_OK);
+        assert!(!old.exists());
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("Data".into(), b"new data".to_vec()),
+                ("Header".into(), b"legacy header".to_vec())
+            ]
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
