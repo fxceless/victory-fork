@@ -1114,11 +1114,20 @@ fn vertex_output_interpolation(
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
+    const MAX_ELEMENTS: usize = 256;
+    const ROW_BYTES: usize = 32;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
+    let table_end = count
+        .checked_mul(ROW_BYTES)
+        .and_then(|bytes| base.checked_add(bytes))
+        .ok_or(ShaderError::Malformed("signature table overflow"))?;
+    if count > MAX_ELEMENTS || table_end > part.len() {
+        return Err(ShaderError::Malformed("signature table out of bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let at = base + 32 * i;
+        let at = base + ROW_BYTES * i;
         let name_at = u32_at(part, at + 4)? as usize;
         let name = part
             .get(name_at..)
@@ -1127,6 +1136,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        if mask & !0xF != 0 {
+            return Err(ShaderError::Malformed("invalid signature component mask"));
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -1187,6 +1199,13 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             }
         };
         let register = u32_at(part, at + 20)?;
+        let (col, cols) = if mask == 0 {
+            (0, 1)
+        } else {
+            let col = mask.trailing_zeros() as u8;
+            let last = 7 - mask.leading_zeros() as u8;
+            (col, last - col + 1)
+        };
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -1194,8 +1213,8 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             comp,
             interp: 0,
             row: (register != u32::MAX).then_some(register),
-            col: mask.trailing_zeros().min(3) as u8,
-            cols: mask.count_ones().max(1) as u8,
+            col,
+            cols,
             usage: 0,
             half: (4..=6).contains(&raw),
         });
@@ -3320,5 +3339,52 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_unbounded_counts_and_invalid_masks() {
+        // Huge element count on a tiny buffer must return Malformed instead of OOMing.
+        let huge_count = [0xff, 0xff, 0xff, 0xff, 8, 0, 0, 0];
+        assert!(matches!(
+            super::signature(&huge_count),
+            Err(crate::ShaderError::Malformed(_))
+        ));
+
+        // Overflowing table offset must also fail cleanly.
+        let huge_base = [1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+        assert!(matches!(
+            super::signature(&huge_base),
+            Err(crate::ShaderError::Malformed(_))
+        ));
+
+        let make_part = |mask: u8| {
+            let mut part = vec![0u8; 8 + 32];
+            part[0..4].copy_from_slice(&1u32.to_le_bytes()); // count = 1
+            part[4..8].copy_from_slice(&8u32.to_le_bytes()); // base = 8
+            part[8 + 4..8 + 8].copy_from_slice(&40u32.to_le_bytes()); // name offset
+            part[8 + 16..8 + 20].copy_from_slice(&3u32.to_le_bytes()); // float32
+            part[8 + 24] = mask;
+            part.extend_from_slice(b"TEXCOORD\0");
+            part
+        };
+
+        // Upper bits outside 0..=0xF used to yield cols > 4 and panic on shift.
+        assert!(matches!(
+            super::signature(&make_part(0xFF)),
+            Err(crate::ShaderError::Malformed(_))
+        ));
+        assert!(matches!(
+            super::signature(&make_part(0x1F)),
+            Err(crate::ShaderError::Malformed(_))
+        ));
+
+        // Contiguous (.zw) and sparse (.xw) 4-bit masks both satisfy col + cols <= 4.
+        let zw = super::signature(&make_part(0x0C)).unwrap();
+        assert_eq!((zw[0].col, zw[0].cols), (2, 2));
+        let xw = super::signature(&make_part(0x09)).unwrap();
+        assert_eq!((xw[0].col, xw[0].cols), (0, 4));
+        // Round-trips through container::signature without shift overflow.
+        assert!(!super::container::signature(&zw, false).is_empty());
+        assert!(!super::container::signature(&xw, false).is_empty());
     }
 }
