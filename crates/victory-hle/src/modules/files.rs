@@ -896,7 +896,19 @@ mod tests {
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
-        assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
+        // Right after `fclose` another process (or a scan of the new file)
+        // can still hold it for a moment: the delete then fails with
+        // ERROR_SHARING_VIOLATION, about once in 300 runs of the whole test
+        // binary. Try again for up to a second.
+        let mut deleted = 0;
+        for _ in 0..100 {
+            deleted = DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr());
+            if deleted != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(deleted, 0, "delete: {}", std::io::Error::last_os_error());
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
     }
 
