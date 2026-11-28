@@ -121,7 +121,7 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
 }
 
 fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> windows::core::Result<()> {
-    let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+    let code = crate::dxc::compile(COUNT, "main", "cs_5_1")?;
     // SAFETY: plain object creation; the code lives through the calls, the
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.

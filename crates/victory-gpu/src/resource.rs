@@ -4433,7 +4433,6 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
-        use windows::core::s;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -4622,8 +4621,8 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 float4 lit() : SV_Target { return 1.0; }
 "#;
-        let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1")).unwrap();
-        let ps = crate::host::compile(SOURCE, s!("lit"), s!("ps_5_1")).unwrap();
+        let vs = crate::dxc::compile(SOURCE, "corner", "vs_5_1").unwrap();
+        let ps = crate::dxc::compile(SOURCE, "lit", "ps_5_1").unwrap();
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),

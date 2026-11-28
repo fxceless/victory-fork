@@ -68,7 +68,7 @@ struct Pass {
 fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
-        let code = compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+        let code = crate::dxc::compile(SOURCE, "main", "cs_5_1").ok()?;
         // SAFETY: the code lives through the calls; the root signature is
         // inside it.
         unsafe {

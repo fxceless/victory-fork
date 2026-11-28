@@ -3,7 +3,8 @@
 //! A few of the host's passes are written in HLSL and compiled when the host
 //! starts: the indirect-argument clamp ([`crate::indirect`]), the compare of
 //! copies in the card's memory and the depth-plane twins ([`crate::host`]),
-//! and the in-place probe ([`crate::inplace`]). The system's compiler
+//! the indirect-light stand-in ([`crate::ambient`]), and the in-place probe
+//! ([`crate::inplace`]). The system's compiler
 //! (`D3DCompile`, `d3dcompiler_47`) is tried first, as it always was. Under
 //! Wine and Proton that is vkd3d-shader, which refuses some of this source
 //! outright (`E5005: Method 'Load' is not defined on type
