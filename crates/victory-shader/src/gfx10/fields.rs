@@ -555,23 +555,7 @@ impl Instruction {
             Encoding::Vop3 | Encoding::Vop3p => {
                 let w1 = w(1);
                 let field = |i: u32| w1 >> (9 * i) & 0x1FF;
-                let count = match self.opcode {
-                    _ if self.encoding == Encoding::Vop3p => {
-                        if name.starts_with("v_pk_")
-                            && !name.contains("_fma_")
-                            && !name.contains("_mad_")
-                        {
-                            2
-                        } else {
-                            3
-                        }
-                    }
-                    0x000..0x100 => 2,
-                    0x100..0x140 => 2 + usize::from(carry_in),
-                    0x180..0x200 => 1,
-                    _ if VOP3_TWO_SOURCES.contains(&name) => 2,
-                    _ => 3,
-                };
+                let count = vop3_source_count(self.encoding, self.opcode, name);
                 v.src = (0..count)
                     .map(|i| {
                         let code = field(i as u32);
@@ -613,6 +597,28 @@ impl Instruction {
             _ => unreachable!("not a VALU encoding"),
         }
         v
+    }
+}
+
+/// Active source operand count for a VOP3 or VOP3P opcode.
+pub(super) fn vop3_source_count(encoding: Encoding, opcode: u16, name: &str) -> usize {
+    if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
+        return 0;
+    }
+    if encoding == Encoding::Vop3p {
+        return if name.starts_with("v_pk_") && !name.contains("_fma_") && !name.contains("_mad_") {
+            2
+        } else {
+            3
+        };
+    }
+    let carry_in = name.ends_with("_co_ci_u32") || name == "v_cndmask_b32";
+    match opcode {
+        0x000..0x100 => 2,
+        0x100..0x140 => 2 + usize::from(carry_in),
+        0x180..0x200 => 1,
+        _ if VOP3_TWO_SOURCES.contains(&name) => 2,
+        _ => 3,
     }
 }
 

@@ -169,7 +169,11 @@ fn far_jump<'a>(
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
     let n = setpc.words[0] & 0xFF;
-    let mut delta = None;
+    if n >= 127 {
+        return Ok(None);
+    }
+    let mut lo: Option<(bool, u32)> = None;
+    let mut hi: Option<(bool, u32)> = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
         let Some(prev) = before(at) else {
@@ -178,31 +182,115 @@ fn far_jump<'a>(
         if prev.offset + 4 * prev.words.len() != at {
             break;
         }
+        // Never look back across a control-flow boundary into another block.
+        if !matches!(flow(prev, at, len), Ok(Flow::Next))
+            || matches!(prev.name(), Some("s_swappc_b64" | "s_rfe_b64"))
+        {
+            break;
+        }
         let w = prev.words[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
+        let imm = |code: u32| -> Option<u32> {
+            match code {
+                128..=192 => Some(code - 128),
+                193..=208 => Some((192i32 - code as i32) as u32),
+                0xFF => prev.words.get(1).copied(),
+                _ => None,
+            }
+        };
         match (prev.encoding, prev.name()) {
-            (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
-                if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
+            (Encoding::Sop2, Some("s_addc_u32"))
+                if hi.is_none() && lo.is_none() && sdst == n + 1 =>
             {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
-                delta = Some(if op == "s_add_u32" { literal } else { -literal });
+                let val = if ssrc0 == n + 1 {
+                    imm(ssrc1)
+                } else if ssrc1 == n + 1 {
+                    imm(ssrc0)
+                } else {
+                    None
+                };
+                let Some(val) = val else { break };
+                hi = Some((false, val));
+            }
+            (Encoding::Sop2, Some("s_subb_u32"))
+                if hi.is_none() && lo.is_none() && sdst == n + 1 =>
+            {
+                let Some(val) = (ssrc0 == n + 1).then(|| imm(ssrc1)).flatten() else {
+                    break;
+                };
+                hi = Some((true, val));
+            }
+            (Encoding::Sop2, Some("s_add_u32")) if lo.is_none() && sdst == n => {
+                let val = if ssrc0 == n {
+                    imm(ssrc1)
+                } else if ssrc1 == n {
+                    imm(ssrc0)
+                } else {
+                    None
+                };
+                let Some(val) = val else { break };
+                lo = Some((false, val));
+            }
+            (Encoding::Sop2, Some("s_sub_u32")) if lo.is_none() && sdst == n => {
+                let Some(val) = (ssrc0 == n).then(|| imm(ssrc1)).flatten() else {
+                    break;
+                };
+                lo = Some((true, val));
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
-                let Some(delta) = delta else { break };
+                let Some((is_sub, lo_val)) = lo else { break };
+                let delta = match hi {
+                    Some((hi_sub, hi_val)) if hi_sub == is_sub => {
+                        let raw = ((u64::from(hi_val) << 32) | u64::from(lo_val)) as i64;
+                        if is_sub {
+                            raw.checked_neg()
+                        } else {
+                            Some(raw)
+                        }
+                    }
+                    Some(_) => break,
+                    None => {
+                        let literal = i64::from(lo_val as i32);
+                        Some(if is_sub { -literal } else { literal })
+                    }
+                };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
-                    .ok()
-                    .filter(|&t| t < len)
+                return delta
+                    .and_then(|d| (prev.offset as i64).checked_add(4)?.checked_add(d))
+                    .and_then(|t| usize::try_from(t).ok())
+                    .filter(|&t| t < len && t.is_multiple_of(4))
                     .map(Some)
                     .ok_or(isa(setpc.offset, "far jump target outside the code"));
             }
-            _ => {}
+            _ => {
+                if writes_scalar_pair(prev, n as u8) {
+                    break;
+                }
+            }
         }
         at = prev.offset;
     }
     Ok(None)
+}
+
+/// Whether `inst` writes either register in the scalar pair `s[n:n+1]`.
+fn writes_scalar_pair(inst: &Instruction, n: u8) -> bool {
+    let hits = |op: Operand| match op {
+        Operand::Scalar { code, dwords } => {
+            let end = code.saturating_add(dwords);
+            code <= n + 1 && end > n
+        }
+        _ => false,
+    };
+    match inst.fields(true) {
+        Fields::Sop { dst, .. } => dst.is_some_and(hits),
+        Fields::Smem { data: Some(d), .. } => {
+            let name = inst.name().unwrap_or("");
+            !name.contains("_store_") && hits(d)
+        }
+        Fields::Valu(v) => v.dst.is_some_and(hits) || v.carry.is_some_and(hits),
+        _ => false,
+    }
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -239,7 +327,15 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     } else if w >> 30 == 0b10 {
         let literal = |srcs: &[u32]| 1 + usize::from(srcs.contains(&0xFF));
         match w >> 23 {
-            0x17D => (Encoding::Sop1, (w >> 8) & 0xFF, literal(&[w & 0xFF])),
+            0x17D => {
+                let op = (w >> 8) & 0xFF;
+                let has_src0 = name(Encoding::Sop1, op as u16) != Some("s_getpc_b64");
+                (
+                    Encoding::Sop1,
+                    op,
+                    if has_src0 { literal(&[w & 0xFF]) } else { 1 },
+                )
+            }
             0x17E => (
                 Encoding::Sopc,
                 (w >> 16) & 0x7F,
@@ -258,12 +354,31 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             ),
         }
     } else {
-        let vop3 =
-            |w1: u32| 2 + usize::from([w1, w1 >> 9, w1 >> 18].iter().any(|s| s & 0x1FF == 0xFF));
+        let vop3 = |encoding: Encoding, op: u32, w1: u32| {
+            let op_name = name(encoding, op as u16);
+            let count = match op_name {
+                Some(n) => fields::vop3_source_count(encoding, op as u16, n),
+                None => 3,
+            };
+            // `v_interp_*_f16` stores {high, chan, attr} in src0, where 0xFF is
+            // attr63.w rather than a 32-bit literal sentinel.
+            let start = usize::from(
+                encoding == Encoding::Vop3
+                    && op_name.is_some_and(|n| n.starts_with("v_interp_")),
+            );
+            let has_lit = (start..count).any(|i| (w1 >> (9 * i)) & 0x1FF == 0xFF);
+            2 + usize::from(has_lit)
+        };
         match w >> 26 {
             0x32 => (Encoding::Vintrp, (w >> 16) & 0x3, 1),
-            0x33 => (Encoding::Vop3p, (w >> 16) & 0x7F, vop3(word(1)?)),
-            0x35 => (Encoding::Vop3, (w >> 16) & 0x3FF, vop3(word(1)?)),
+            0x33 => {
+                let op = (w >> 16) & 0x7F;
+                (Encoding::Vop3p, op, vop3(Encoding::Vop3p, op, word(1)?))
+            }
+            0x35 => {
+                let op = (w >> 16) & 0x3FF;
+                (Encoding::Vop3, op, vop3(Encoding::Vop3, op, word(1)?))
+            }
             0x36 => (Encoding::Ds, (w >> 18) & 0xFF, 2),
             0x37 => {
                 let encoding = match (w >> 14) & 3 {
@@ -518,5 +633,178 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn vop3_interp_attr63_w_and_unused_slots_do_not_consume_literal() {
+        // v_interp_p1ll_f16 (0x342) with src0 = 0xFF (attr63.w, high=0), src1 = v0 (256)
+        let p1ll = [0xD400_0000 | (0x342 << 16), (256 << 9) | 0xFF];
+        // v_interp_p2_f16 (0x35a) with src0 = 0xFF (attr63.w), src1 = v1, src2 = v2
+        let p2 = [
+            0xD400_0000 | (0x35A << 16),
+            (258 << 18) | (257 << 9) | 0xFF,
+        ];
+        // 1-source VOP3 v_mov_b32 (0x181) with 0xFF in unused src1/src2
+        let vop1_vop3 = [
+            0xD400_0000 | (0x181 << 16),
+            (0xFF << 18) | (0xFF << 9) | 256,
+        ];
+        // 2-source VOP3 v_add_f32 (0x103) with 0xFF in unused src2
+        let vop2_vop3 = [
+            0xD400_0000 | (0x103 << 16),
+            (0xFF << 18) | (257 << 9) | 256,
+        ];
+        // 2-source VOP3P v_pk_add_f16 (0x00f) with 0xFF in unused src2
+        let vop3p = [
+            0xCC00_0000 | (0x00F << 16),
+            (0xFF << 18) | (257 << 9) | 256,
+        ];
+        // s_getpc_b64 s[0:1] with 0xFF in its unused ssrc0 field
+        let getpc = 0xBE80_1FFF;
+
+        let code = [
+            p1ll[0],
+            p1ll[1],
+            p2[0],
+            p2[1],
+            vop1_vop3[0],
+            vop1_vop3[1],
+            vop2_vop3[0],
+            vop2_vop3[1],
+            vop3p[0],
+            vop3p[1],
+            getpc,
+            S_ENDPGM,
+        ];
+        assert_eq!(
+            summary(&code),
+            [
+                (0, 2, "v_interp_p1ll_f16"),
+                (8, 2, "v_interp_p2_f16"),
+                (16, 2, "v_mov_b32"),
+                (24, 2, "v_add_f32"),
+                (32, 2, "v_pk_add_f16"),
+                (40, 1, "s_getpc_b64"),
+                (44, 1, "s_endpgm"),
+            ]
+        );
+        let decoded = decode(&bytes(&code)).unwrap();
+        let Fields::Valu(v) = decoded[0].fields(false) else {
+            panic!("expected VALU");
+        };
+        assert_eq!(
+            v.src[0],
+            Operand::Attr {
+                index: 63,
+                chan: 3,
+                high: false,
+            }
+        );
+    }
+
+    #[test]
+    fn far_jump_respects_barriers_clobbers_alignment_and_inline_constants() {
+        // Control-flow barrier (s_endpgm) between s_addc_u32 and s_setpc_b64:
+        // s_setpc_b64 is reached via branch and must NOT look back across s_endpgm.
+        let across_barrier = [
+            sopp(0x04, 5), // 0: s_cbranch_scc0 -> 24 (s_setpc_b64)
+            0xBE88_1F00,   // 4: s_getpc_b64 s[8:9]
+            0x8008_FF08,   // 8: s_add_u32 s8, s8, 24
+            24,            //    -> 8 + 24 = 32 (would land on trailing s_endpgm)
+            0x8209_8009,   // 16: s_addc_u32 s9, s9, 0
+            S_ENDPGM,      // 20: barrier
+            0xBE80_2008,   // 24: s_setpc_b64 s[8:9] (handover)
+            0xFFFF_FFFF,   // 28: data
+            S_ENDPGM,      // 32: unreachable unless misresolved
+        ];
+        let offsets: Vec<_> = summary(&across_barrier).iter().map(|i| i.0).collect();
+        assert!(!offsets.contains(&32), "crossed s_endpgm barrier: {offsets:?}");
+
+        // Register clobber between s_addc_u32 and s_setpc_b64 stops far_jump.
+        let clobbered = [
+            0xBE88_1F00, // 0: s_getpc_b64 s[8:9]
+            0x8008_FF08, // 4: s_add_u32 s8, s8, 24
+            24,
+            0x8209_8009, // 12: s_addc_u32 s9, s9, 0
+            0xBE88_0300, // 16: s_mov_b32 s8, s0 (clobbers s8)
+            0xBE80_2008, // 20: s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // 24: data
+            S_ENDPGM,    // 28: unreachable
+        ];
+        let offsets: Vec<_> = summary(&clobbered).iter().map(|i| i.0).collect();
+        assert!(!offsets.contains(&28), "ignored s8 clobber: {offsets:?}");
+
+        // Non-zero high carry word (1 << 32 + 20) must not be ignored as +20.
+        let bad_high = [
+            0xBE88_1F00, // 0: s_getpc_b64 s[8:9]
+            0x8008_FF08, // 4: s_add_u32 s8, s8, 20
+            20,
+            0x8209_8109, // 12: s_addc_u32 s9, s9, 1 (inline const 1 = 129 = 0x81)
+            0xBE80_2008, // 16: s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // 20
+            S_ENDPGM,    // 24
+        ];
+        assert!(decode(&bytes(&bad_high)).is_err());
+
+        // Misaligned target (4 + 22 = 26) must be rejected.
+        let misaligned = [
+            0xBE88_1F00, // 0: s_getpc_b64 s[8:9]
+            0x8008_FF08, // 4: s_add_u32 s8, s8, 22
+            22,
+            0x8209_8009, // 12: s_addc_u32 s9, s9, 0
+            0xBE80_2008, // 16: s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // 20
+            S_ENDPGM,    // 24
+            S_ENDPGM,    // 28
+        ];
+        assert!(decode(&bytes(&misaligned)).is_err());
+
+        // Commutative s_add_u32 with inline constant 16 (code 144 = 0x90):
+        // s_getpc_b64 at 0 -> PC=4, 4 + 16 = 20.
+        let commutative_inline = [
+            0xBE88_1F00, // 0: s_getpc_b64 s[8:9]
+            0x8008_0890, // 4: s_add_u32 s8, 16, s8 (ssrc0=0x90=16, ssrc1=8)
+            0x8209_0980, // 8: s_addc_u32 s9, 0, s9 (ssrc0=0x80=0, ssrc1=9)
+            0xBE80_2008, // 12: s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // 16: data
+            S_ENDPGM,    // 20: target
+        ];
+        let found: Vec<_> = summary(&commutative_inline)
+            .iter()
+            .map(|i| (i.0, i.2))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (0, "s_getpc_b64"),
+                (4, "s_add_u32"),
+                (8, "s_addc_u32"),
+                (12, "s_setpc_b64"),
+                (20, "s_endpgm"),
+            ]
+        );
+
+        // Backward s_sub_u32 + s_subb_u32 with inline constant 8 (code 136 = 0x88):
+        // s_getpc_b64 at 8 -> PC=12, 12 - 8 = 4.
+        let backward_sub = [
+            sopp(0x02, 1), // 0: s_branch -> 8
+            S_ENDPGM,      // 4: far jump target
+            0xBE88_1F00,   // 8: s_getpc_b64 s[8:9]
+            0x8088_8808,   // 12: s_sub_u32 s8, s8, 8 (op 1 << 23 = 0x8080_0000)
+            0x8289_8009,   // 16: s_subb_u32 s9, s9, 0 (op 5 << 23 = 0x8280_0000)
+            0xBE80_2008,   // 20: s_setpc_b64 s[8:9]
+        ];
+        let found: Vec<_> = summary(&backward_sub).iter().map(|i| (i.0, i.2)).collect();
+        assert_eq!(
+            found,
+            [
+                (0, "s_branch"),
+                (4, "s_endpgm"),
+                (8, "s_getpc_b64"),
+                (12, "s_sub_u32"),
+                (16, "s_subb_u32"),
+                (20, "s_setpc_b64"),
+            ]
+        );
     }
 }
