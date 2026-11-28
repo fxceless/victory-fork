@@ -31,6 +31,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
+#[cfg(all(windows, feature = "gpu-bcpack"))]
+#[path = "gpu_bcpack.rs"]
+mod gpu_bcpack;
+
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
@@ -1418,9 +1422,15 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+        Some(tables) => {
+            #[cfg(all(windows, feature = "gpu-bcpack"))]
+            if let Some(Ok(())) = gpu_bcpack::try_decode(bc, &source, out) {
+                return Ok(out.len());
+            }
+            bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(

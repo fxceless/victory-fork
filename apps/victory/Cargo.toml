@@ -30,6 +30,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+gpu-bcpack = ["victory-hle/gpu-bcpack"]
 
 [lints]
 workspace = true

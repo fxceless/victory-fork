@@ -17,6 +17,7 @@ zlib-rs.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+bcpack-gpu-sdk = { workspace = true, optional = true }
 windows-sys = { workspace = true, features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_HumanInterfaceDevice",
@@ -55,6 +56,7 @@ tempfile.workspace = true
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+gpu-bcpack = ["dep:bcpack-gpu-sdk"]
 
 [lints]
 workspace = true
