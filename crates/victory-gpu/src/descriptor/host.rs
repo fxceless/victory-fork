@@ -1637,7 +1637,15 @@ fn view_stride_and_kind(view: &View) -> (Option<u32>, u32) {
 /// Packed [`victory_shader::emit::SLOT_STRIDES`] word for `view`.
 fn view_stride_word(view: &View) -> u32 {
     let (stride, kind) = view_stride_and_kind(view);
-    stride.unwrap_or(0) | kind
+    match stride {
+        Some(stride) => stride | kind,
+        // Constant buffer views marked: programs read no other non-buffer
+        // slot as one (`SLOT_STRIDE_CONSTANT`).
+        None if matches!(view, View::Constant(..)) && victory_shader::emit::constant_marks() => {
+            victory_shader::emit::SLOT_STRIDE_CONSTANT
+        }
+        None => 0,
+    }
 }
 
 #[cfg(test)]
@@ -3424,8 +3432,10 @@ impl HostHeap {
                 }
             }
         }
-        let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
-        self.write_stride(index, stride.unwrap_or(0) | kind);
+        // The word of a constant buffer view is its mark
+        // (`SLOT_STRIDE_CONSTANT`), of any other non-buffer 0.
+        let stride = view.and_then(|view| view_stride_and_kind(view).0);
+        self.write_stride(index, view.map_or(0, view_stride_word));
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -6573,6 +6583,36 @@ mod tests {
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    /// The table of strides marks a constant buffer view's slot, and a
+    /// texture written over it after leaves no mark: a program that picks
+    /// the slot then reads zeros, not the texture's descriptor as a
+    /// constant buffer's.
+    #[test]
+    fn constant_buffer_slots_are_marked_in_the_stride_table() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !victory_shader::emit::constant_marks() {
+            return; // turned off for this run
+        }
+        let entry = |index: u32| -> u32 {
+            let (_, _, data) = heap.strides.as_ref().expect("a view heap has a table of strides");
+            // SAFETY: inside the mapping.
+            unsafe { (*data as *const u32).add(index as usize).read_volatile() }
+        };
+        let _ = heap.note_buffer(3, Some(&View::Constant(0x1000, 256)), false);
+        assert_eq!(entry(3), victory_shader::emit::SLOT_STRIDE_CONSTANT);
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let texture = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        let _ = heap.note_buffer(3, Some(&texture), false);
+        assert_eq!(entry(3), 0);
+        let _ = heap.note_buffer(4, None, false);
+        assert_eq!(entry(4), 0);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

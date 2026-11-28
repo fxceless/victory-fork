@@ -39,6 +39,23 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] entry of a slot that holds a constant buffer view.
+/// A program reads a slot it picks as a constant buffer only where this
+/// mark is; a slot whose entry is 0 holds neither a buffer nor a constant
+/// buffer, and the read gives zeros. Read as a constant buffer, a texture's
+/// descriptor is taken as a buffer's: on AMD that is the image's base
+/// shifted down by 8, an address near zero, and the card page-faults (the
+/// meshlet culling `_Prev` passes when work is sent ahead).
+/// `VICTORY_CONSTANT_MARKS=0` goes back to reading every non-buffer slot as
+/// a constant buffer.
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
+/// the translator alike.
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
