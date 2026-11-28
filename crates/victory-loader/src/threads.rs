@@ -78,12 +78,53 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 /// (a thread ended while holding a lock their detach code wants).
 const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Its thread id, set when the watchdog runs its own code; 0 until then.
+static WATCHDOG: AtomicU32 = AtomicU32::new(0);
+
+fn watchdog_main() {
+    // SAFETY: a plain query of the calling thread.
+    let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    WATCHDOG.store(id, Ordering::SeqCst);
+    std::thread::sleep(DETACH_DEADLINE);
+    end_process();
+}
+
+/// Starts the detach watchdog and waits until it is running, returning its
+/// thread id.
+///
+/// When spawning the watchdog fails during teardown (e.g. `PermissionDenied`
+/// / `ERROR_ACCESS_DENIED` while the process is terminating), detach proceeds
+/// without a watchdog deadline rather than panicking across the `extern "C"`
+/// `atexit` boundary.
+fn start_detach_watchdog(spawn: impl FnOnce(fn()) -> std::io::Result<()>) -> Option<u32> {
+    WATCHDOG.store(0, Ordering::SeqCst);
+    spawn(watchdog_main).ok()?;
+    // Its start (loader notices, Rust's thread set-up) is done only when
+    // it runs its own code. The loader notices need the loader lock. This
+    // thread can hold it, or a thread that waits for this thread can hold
+    // it. Then the watchdog does not start, so this wait has the same
+    // deadline.
+    let waiting = Instant::now();
+    let watchdog = loop {
+        match WATCHDOG.load(Ordering::SeqCst) {
+            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
+            0 => std::thread::yield_now(),
+            id => break id,
+        }
+    };
+    Some(watchdog)
+}
+
 /// Process exit (the CRT's `exit`, which titles call), in `ExitProcess`'s
 /// order: the title's exit functions have run; every other thread ends
 /// (title threads and ours); every attached image gets
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
 /// exe's TLS callbacks; then the CRT ends the process.
 extern "C" fn detach_all() {
+    detach_all_with(|f| std::thread::Builder::new().spawn(f).map(|_| ()));
+}
+
+fn detach_all_with(spawn_watchdog: impl FnOnce(fn()) -> std::io::Result<()>) {
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)
@@ -105,29 +146,15 @@ extern "C" fn detach_all() {
     // the loader lock, and a new thread needs both to start. After the
     // deadline it only ends the process; it does not log, because logging
     // needs the heap and the log writer's lock.
-    // Its thread id, set when it runs its own code; 0 until then.
-    static WATCHDOG: AtomicU32 = AtomicU32::new(0);
-    drop(std::thread::spawn(|| {
-        // SAFETY: a plain query of the calling thread.
-        let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-        WATCHDOG.store(id, Ordering::SeqCst);
-        std::thread::sleep(DETACH_DEADLINE);
-        end_process();
-    }));
-    // Its start (loader notices, Rust's thread set-up) is done only when
-    // it runs its own code. The loader notices need the loader lock. This
-    // thread can hold it, or a thread that waits for this thread can hold
-    // it. Then the watchdog does not start, so this wait has the same
-    // deadline.
-    let waiting = Instant::now();
-    let watchdog = loop {
-        match WATCHDOG.load(Ordering::SeqCst) {
-            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
-            0 => std::thread::yield_now(),
-            id => break id,
+    let mut keep = [0; 1];
+    let keep_len = match start_detach_watchdog(spawn_watchdog) {
+        Some(id) => {
+            keep[0] = id;
+            1
         }
+        None => 0,
     };
-    end_other_threads(&[watchdog]);
+    end_other_threads(&keep[..keep_len]);
     for image in dlls.iter().chain(&exes) {
         // SAFETY: attached images are bound. A non-null third argument
         // tells the entry points the process is ending.
@@ -435,5 +462,100 @@ mod tests {
             out.status.success() && text.contains("ENDED KEPT"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn atexit_runs_detach_all() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "threads::tests::atexit_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VICTORY_ATEXIT_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("DETACHED") && !text.contains("NOT_DETACHED"),
+            "status: {:?}\nstdout: {}\nstderr: {}",
+            out.status,
+            text,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn atexit_child() {
+        extern "C" fn report_detached() {
+            let msg = if super::EXITING.load(Ordering::SeqCst) {
+                "DETACHED\n"
+            } else {
+                "NOT_DETACHED\n"
+            };
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), msg.as_bytes());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if std::env::var_os("VICTORY_ATEXIT_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: registered before `detach_all` so LIFO `atexit` order runs
+        // `detach_all` first, then `report_detached`.
+        unsafe { super::atexit(report_detached) };
+        super::attached(0);
+        unsafe extern "C" {
+            fn exit(status: i32) -> !;
+        }
+        // SAFETY: `std::process::exit` calls Win32 `ExitProcess`, which skips
+        // CRT `atexit` handlers on MSVC; call the CRT `exit` that `atexit`
+        // registered into.
+        unsafe { exit(0) };
+    }
+
+    #[test]
+    fn detach_all_handles_watchdog_spawn_failure() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "threads::tests::detach_spawn_failure_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VICTORY_DETACH_SPAWN_FAILURE_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("FALLBACK_OK"),
+            "status: {:?}\nstdout: {}\nstderr: {}",
+            out.status,
+            text,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn detach_spawn_failure_child() {
+        if std::env::var_os("VICTORY_DETACH_SPAWN_FAILURE_CHILD").is_none() {
+            return;
+        }
+        static ENDS: AtomicU64 = AtomicU64::new(0);
+        busy(&ENDS);
+        super::detach_all_with(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated shutdown",
+            ))
+        });
+        let exiting = super::EXITING.load(Ordering::SeqCst);
+        let ended = stopped(&ENDS);
+        if exiting && ended {
+            println!("FALLBACK_OK");
+        } else {
+            println!("FALLBACK_FAILED exiting={exiting} ended={ended}");
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(0);
     }
 }
