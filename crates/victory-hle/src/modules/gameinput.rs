@@ -1234,6 +1234,9 @@ mod host {
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
+        /// Whether the last look at the keys had focus: the first one after
+        /// focus comes back takes no key pressed while it was away.
+        focused: bool,
     }
 
     impl Host {
@@ -1295,16 +1298,28 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             // The F1 settings menu takes the keyboard while it is shown.
             if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                // As with focus away: a key tapped while the menu had the keyboard is not
+                // the title's, so the first look after it closes only clears the low bits.
+                self.focused = false;
                 return Vec::new();
             }
             let mut down = scripted();
-            if focused() {
+            let focused = focused();
+            // A press from before the window had focus is not the title's: the first look
+            // after focus returns reads the low bits only to clear them.
+            let fresh = focused && !std::mem::replace(&mut self.focused, focused);
+            if focused {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    // Down now, or pressed since the last look (the low bit): a title that
+                    // asks once a frame at a frame a second still sees a tap between two asks.
+                    .filter(|&vk| {
+                        // SAFETY: a plain query.
+                        let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+                        state < 0 || (!fresh && state & 1 != 0)
+                    })
                     .collect();
                 down.extend(held);
             }
