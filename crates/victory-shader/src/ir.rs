@@ -1645,12 +1645,16 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
-        new
-    });
+    // Keep the unique prefix in operand order without a second allocation.
+    let mut unique = 0;
+    for read in 0..r.len() {
+        let reg = r[read];
+        if !r[..unique].contains(&reg) {
+            r[unique] = reg;
+            unique += 1;
+        }
+    }
+    r.truncate(unique);
     Ok(Some((r, w)))
 }
 
