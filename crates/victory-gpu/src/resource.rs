@@ -976,6 +976,7 @@ fn place<'a>(
         size: 0,
         alignment: KIB_64,
     };
+    let mut largest_resource_alignment = 1u64;
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
@@ -1004,7 +1005,14 @@ fn place<'a>(
         );
         total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
+        largest_resource_alignment = largest_resource_alignment.max(one.alignment);
     }
+    // Like a struct, the full array is padded to its largest member's
+    // alignment, while the individual offsets remain unchanged.
+    total.size = match total.size.checked_next_multiple_of(largest_resource_alignment) {
+        Some(size) => size,
+        None => return AllocationInfo { size: u64::MAX, alignment: 0 },
+    };
     total
 }
 
@@ -3890,6 +3898,40 @@ mod tests {
     }
 
     #[test]
+    fn allocation_info_rounds_total_to_largest_resource_alignment() {
+        let msaa = ResourceDesc {
+            sample_count: 4,
+            alignment: MIB_4,
+            flags: 1,
+            ..texture(1, 1, 28, 1)
+        };
+        let small = buffer(1);
+        let large = footprint(&msaa).unwrap();
+        assert_eq!(large, AllocationInfo { size: MIB_4, alignment: MIB_4 });
+        for (descs, expected) in [
+            ([msaa, small, small], 2 * MIB_4),
+            ([small, msaa, small], 3 * MIB_4),
+            ([small, small, msaa], 2 * MIB_4),
+        ] {
+            let total = place(descs.iter(), |_, _| {});
+            assert_eq!(total, AllocationInfo { size: expected, alignment: MIB_4 });
+            let mut info = AllocationInfo { size: 0, alignment: 0 };
+            allocation_info(&mut info, std::ptr::null(), 0, descs.len() as u32, descs.as_ptr());
+            assert_eq!(info, total);
+        }
+        let descs = [msaa, small, small].map(|desc| ResourceDesc1 { desc, mip_region: [0; 3] });
+        let mut each: [AllocationInfo1; 3] = std::array::from_fn(|_| AllocationInfo1 { offset: 0, alignment: 0, size: 0 });
+        let mut total = AllocationInfo { size: 0, alignment: 0 };
+        allocation_info2(&mut total, std::ptr::null(), 0, 3, descs.as_ptr(), each.as_mut_ptr());
+        assert_eq!(total, AllocationInfo { size: 2 * MIB_4, alignment: MIB_4 });
+        assert_eq!([each[0].offset, each[1].offset, each[2].offset], [0, MIB_4, MIB_4 + KIB_64]);
+        // Preserve the fork's existing 4 KiB console-texture placement.
+        let bc7 = texture(512, 512, 98, 10);
+        assert_eq!(place([&bc7].into_iter(), |_, _| {}), AllocationInfo { size: 0x56000, alignment: KIB_64 });
+        assert_eq!(place([&bc7, &bc7].into_iter(), |_, _| {}), AllocationInfo { size: 0xac000, alignment: KIB_64 });
+    }
+
+    #[test]
     fn sizes_cover_every_mip() {
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
         assert_eq!(size(&buffer(256)), Some(KIB_64));
@@ -3945,7 +3987,7 @@ mod tests {
         assert_eq!(
             info,
             AllocationInfo {
-                size: KIB_64 + size(&descs[1]).unwrap(),
+                size: (KIB_64 + size(&descs[1]).unwrap()).next_multiple_of(KIB_64),
                 alignment: KIB_64
             }
         );
