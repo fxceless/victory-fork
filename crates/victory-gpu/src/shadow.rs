@@ -1169,9 +1169,37 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
     out
 }
 
+/// Pages of `[a, e)` that have never been copied (`copied == 0`) or were
+/// written by the title after their last copy (`write > copied`). Matches
+/// [`Shadow::copy_stale`], which copies both cases even when a never-copied
+/// page does not appear in the write-watch delta `written`.
+fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+    if a >= e {
+        return Vec::new();
+    }
+    let mut writes = written.iter().peekable();
+    let mut out = Vec::new();
+    for page in a / PAGE..=(e - 1) / PAGE {
+        while writes.peek().is_some_and(|&&(p, _)| p < page) {
+            writes.next();
+        }
+        let write = match writes.peek() {
+            Some(&&(p, w)) if p == page => {
+                writes.next();
+                w
+            }
+            _ => 0,
+        };
+        if page >= base && copied.get(page - base).is_none_or(|&at| at == 0 || write > at) {
+            out.push(page);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, PAGE, changed_runs, merge_piece, outside, stale_pages_in};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -1383,6 +1411,26 @@ mod relay_tests {
         let mut wrong_cpu = cpu.clone();
         merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
         assert_eq!(wrong_title[30], base[30]);
+    }
+
+    /// Never-copied pages (`copied == 0`) inside a pending shader-write range
+    /// must still be reported as stale even when absent from the write-watch
+    /// journal, matching `copy_stale`.
+    #[test]
+    fn stale_pages_include_uncopied_pages_absent_from_write_watch() {
+        let base = 0x100usize;
+        // Pages 0..4: page 0 copied at t=5, page 1 never copied (0), page 2
+        // copied at t=5, page 3 copied at t=10.
+        let copied = [5u64, 0, 5, 10];
+        let a = base * PAGE;
+        let e = (base + 4) * PAGE;
+        // Write-watch only mentions page 2 written at t=7 and page 3 at t=8.
+        let written = [(base + 2, 7u64), (base + 3, 8u64)];
+        assert_eq!(stale_pages_in(base, &copied, a, e, &written), vec![base + 1, base + 2]);
+        // Even with an empty write-watch delta, uncopied page 1 is still stale.
+        assert_eq!(stale_pages_in(base, &copied, a, e, &[]), vec![base + 1]);
+        // Once all pages are copied and clean, nothing is stale.
+        assert!(stale_pages_in(base, &[10, 10, 10, 10], a, e, &written).is_empty());
     }
 }
 
@@ -3786,11 +3834,11 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
-    /// title wrote since the copy last took it. The answer comes from the
-    /// write-watch journal alone, as the submission's one asking left it
-    /// (`crate::watch::asked`); where the journal cannot say (memory not
-    /// write-watched, a range not asked about) it is yes. A page the copy
-    /// never took whole counts as written if the title ever wrote it.
+    /// title wrote since the copy last took it, or a page never copied yet.
+    /// The answer comes from the write-watch journal alone, as the
+    /// submission's one asking left it (`crate::watch::asked`); where the
+    /// journal cannot say (memory not write-watched, a range not asked about)
+    /// it is yes.
     ///
     /// For submissions sent to the card without a wait
     /// (`crate::host::late`): the ranges are those of flights in the air,
@@ -3827,14 +3875,14 @@ impl Shadow {
     /// title changed into the copy, in the ranges shaders may be writing,
     /// and only those bytes, so that what the shaders write beside them
     /// stays (`crate::host::late_exact`). For each page of such a range
-    /// that the title wrote since the copy last took it, title memory as
-    /// it is now is compared with what the copy held when the range was
-    /// given to the shaders: the copy's CPU side for a copy in the card's
-    /// memory (the changed runs go up before the next submission, each a
-    /// copy of its own bytes, `runs_left` of them at most), the snapshot
-    /// for the others (the changed bytes go into the copy and into the
-    /// snapshot, so the compare after the card ran takes them for the
-    /// title's and not the shaders').
+    /// that was never copied yet or that the title wrote since the copy last
+    /// took it, title memory as it is now is compared with what the copy
+    /// held when the range was given to the shaders: the copy's CPU side for
+    /// a copy in the card's memory (the changed runs go up before the next
+    /// submission, each a copy of its own bytes, `runs_left` of them at
+    /// most), the snapshot for the others (the changed bytes go into the
+    /// copy and into the snapshot, so the compare after the card ran takes
+    /// them for the title's and not the shaders').
     ///
     /// Whether the caller must still settle the flights: the journal
     /// cannot say what was written, a snapshot is missing, or `runs_left`
