@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -184,7 +185,9 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= heap.blocks[&host].size)
         // SAFETY: inside a live heap block, which the title and the audio
         // hardware share like on the console.
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
@@ -378,24 +381,35 @@ fn xma() -> RwLockReadGuard<'static, Xma> {
 struct Context(*mut u32);
 
 impl Context {
-    fn get(self, word: usize) -> u32 {
-        // SAFETY: inside the context array; the title reads and writes it
-        // concurrently, like the hardware's.
-        unsafe { self.0.add(word).read_volatile() }
+    fn atomic(self, word: usize) -> &'static AtomicU32 {
+        // SAFETY: inside the 64-byte-aligned XMA context array; the title and
+        // decoder thread read and update distinct bitfields in the same 32-bit
+        // words concurrently.
+        unsafe { AtomicU32::from_ptr(self.0.add(word)) }
     }
 
+    fn get(self, word: usize) -> u32 {
+        self.atomic(word).load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
-        // SAFETY: as above.
-        unsafe { self.0.add(word).write_volatile(value) }
+        self.atomic(word).store(value, Ordering::Release);
     }
 
     fn field(self, word: usize, shift: u32, bits: u32) -> u32 {
-        (self.get(word) >> shift) & ((1 << bits) - 1)
+        let mask = 1u32.checked_shl(bits).map_or(u32::MAX, |m| m - 1);
+        (self.get(word) >> shift) & mask
     }
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
-        let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let mask = 1u32.checked_shl(bits).map_or(u32::MAX, |m| m - 1) << shift;
+        let bits = (value << shift) & mask;
+        let _ = self
+            .atomic(word)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some((cur & !mask) | bits)
+            });
     }
 
     fn channels(self) -> usize {
@@ -883,10 +897,16 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(bytes) = heap_bytes(notification, size_of::<u32>())
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        let ptr = bytes.as_mut_ptr();
+        if (ptr as usize).is_multiple_of(align_of::<u32>()) {
+            // SAFETY: 4-byte-aligned u32 inside a live heap block.
+            unsafe { AtomicU32::from_ptr(ptr.cast()).store(1, Ordering::Release) };
+        } else {
+            // SAFETY: 4-byte span inside a live heap block; may be unaligned.
+            unsafe { ptr.cast::<u32>().write_unaligned(1) };
+        }
     }
     S_OK
 }
@@ -1426,5 +1446,61 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn context_set_field_is_atomic_across_disjoint_bitfields_and_notification_is_bounded() {
+        // Two threads concurrently update disjoint bitfields packed into word 0:
+        // thread A toggles input-valid bits (20..22), thread B advances write block (27..32).
+        let mut words = [0u32; 16];
+        let base = words.as_mut_ptr() as usize;
+        let t1 = std::thread::spawn(move || {
+            let ctx = Context(base as *mut u32);
+            for i in 0..20_000u32 {
+                ctx.set_field(0, 20, 2, (i & 3) | 1);
+            }
+            ctx.set_field(0, 20, 2, 0b11);
+        });
+        let t2 = std::thread::spawn(move || {
+            let ctx = Context(base as *mut u32);
+            for i in 0..20_000u32 {
+                ctx.set_field(0, 27, 5, i & 31);
+            }
+            ctx.set_field(0, 27, 5, 29);
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let ctx = Context(words.as_mut_ptr());
+        assert_eq!(ctx.field(0, 20, 2), 0b11);
+        assert_eq!(ctx.field(0, 27, 5), 29);
+
+        // ACP notification must not write past a block's end and must handle
+        // unaligned in-bounds addresses safely.
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0u32);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 8, 4, 0), S_OK);
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 64, 64), S_OK);
+        // Too close to end of 8-byte block (only 2 bytes left): ignored, no OOB write.
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 6),
+            S_OK
+        );
+        // SAFETY: 8-byte allocation from ApuAlloc.
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), 8) }, [0; 8]);
+        // Unaligned in-bounds address (offset 1, 4 bytes fit inside 8-byte block).
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 1),
+            S_OK
+        );
+        // SAFETY: reading unaligned u32 at offset 1 inside the 8-byte block.
+        assert_eq!(
+            unsafe { ptr.cast::<u8>().add(1).cast::<u32>().read_unaligned() },
+            1
+        );
+        (m.release)(acp);
+        ApuFree(ptr);
     }
 }
