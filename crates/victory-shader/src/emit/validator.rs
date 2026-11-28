@@ -108,6 +108,15 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
     len: blob_len,
 };
 
+const IID_IDXC_VERSION_INFO: Guid = Guid(
+    0xb04f_5b50,
+    0x2059,
+    0x4f12,
+    [0xa8, 0xff, 0xa1, 0xe0, 0xcd, 0xe1, 0xcc, 0x7e],
+);
+
+pub const PSV_VALIDATOR: (u32, u32) = (1, 8);
+
 pub struct Validator {
     object: Object,
 }
@@ -159,6 +168,28 @@ impl Validator {
                 object: object.cast(),
             })
         }
+    }
+
+    pub fn version(&self) -> Option<(u32, u32)> {
+        unsafe {
+            let mut info: *mut c_void = std::ptr::null_mut();
+            let query: unsafe extern "system" fn(Object, *const Guid, *mut *mut c_void) -> Hresult =
+                method(self.object, 0);
+            if query(self.object, &IID_IDXC_VERSION_INFO, &mut info) < 0 || info.is_null() {
+                return None;
+            }
+            let info: Object = info.cast();
+            let (mut major, mut minor) = (0u32, 0u32);
+            let get: unsafe extern "system" fn(Object, *mut u32, *mut u32) -> Hresult =
+                method(info, 3);
+            let hr = get(info, &mut major, &mut minor);
+            release(info);
+            (hr >= 0).then_some((major, minor))
+        }
+    }
+
+    pub fn checks_psv(&self) -> bool {
+        self.version().is_some_and(|v| v >= PSV_VALIDATOR)
     }
 
     /// Validates `container` and signs it in place; the error text if it
@@ -217,5 +248,15 @@ impl Drop for Validator {
     fn drop(&mut self) {
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn validator_reports_its_version() {
+        if let Ok(v) = super::Validator::load(super::Validator::default_path().as_deref()) {
+            assert!(v.version().is_some_and(|(major, _)| major >= 1));
+        }
     }
 }
