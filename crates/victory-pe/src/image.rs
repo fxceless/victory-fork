@@ -325,13 +325,16 @@ fn parse_delay_imports(
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked to be non-zero and inside the image.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
+    if iat_rva == 0 {
+        return Err(PeError::Malformed("IAT RVA is 0".into()));
+    }
     let mut entries = Vec::new();
     while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
         let iat_slot_rva = u32::try_from(entries.len() * 8)
@@ -507,6 +510,51 @@ mod tests {
         assert!(matches!(
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_iat_rva() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let desc = ImageInfo::parse(&data)
+            .unwrap()
+            .rva_to_file_offset(import_rva)
+            .unwrap() as usize;
+        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0);
+        data[desc + 16..desc + 20].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(msg)) if msg == "IAT RVA is 0"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_delay_import_iat_rva() {
+        let mut body = vec![0u8; 0x100];
+        body[0..4].copy_from_slice(&1u32.to_le_bytes()); // dlattrRva
+        body[4..8].copy_from_slice(&0x1040u32.to_le_bytes()); // dll_name_rva
+        body[12..16].copy_from_slice(&0x1060u32.to_le_bytes()); // import_address_table_rva
+        body[16..20].copy_from_slice(&0x1050u32.to_le_bytes()); // import_name_table_rva
+        body[0x40..0x46].copy_from_slice(b"t.dll\0");
+        body[0x50..0x58].copy_from_slice(&((1u64 << 63) | 1).to_le_bytes());
+
+        let mut data = synthetic_image(&body);
+        let export_dd = layout::data_directory_offset(&data, 0).unwrap();
+        data[export_dd..export_dd + 8].fill(0);
+        let delay_dd = layout::data_directory_offset(&data, 13).unwrap();
+        data[delay_dd..delay_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[delay_dd + 4..delay_dd + 8].copy_from_slice(&0x40u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        assert_eq!(info.delay_imports[0].entries[0].iat_slot_rva, 0x1060);
+
+        data[0x200 + 12..0x200 + 16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(msg)) if msg == "IAT RVA is 0"
         ));
     }
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
