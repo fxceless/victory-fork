@@ -77,6 +77,9 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
+            // Runtime LDS policy can change which Wave64 programs lower to Wave32.
+            "VICTORY_LDS_FLAGS",
+            "VICTORY_LDS_WRITE_ONLY_OK",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

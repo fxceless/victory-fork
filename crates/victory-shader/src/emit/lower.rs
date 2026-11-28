@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
+use super::lds::analyze as lds_meetings;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -451,12 +452,10 @@ pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     all_lane_blocks_of(st, false)
 }
 
@@ -972,15 +971,6 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
-/// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
-/// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
-/// group barrier) at its start and before its exit. `None` if barriers cannot keep the
-/// console's order.
-///
-/// The console runs the wave's lanes in step, so an LDS write is seen by every later read. Two
-/// host waves keep that order if they meet between any two accesses of which one writes. A
-/// barrier must be run by every thread, so it cannot stand in a lane branch's region; but
-/// every way into and out of such a region passes a block all lanes run, and the waves meet
 /// LDS accesses (block, instruction) whose order against the other lanes of their console wave
 /// does not count, and of those the reads that may see an LDS atomic of another lane
 /// ([`with_pair_meetings`] only).
@@ -1208,82 +1198,12 @@ thread_local! {
     pub(super) static TEST_LDS_START: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// there: before the exit of an all-lane block into a region with LDS accesses, and at the
-/// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
-/// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
-/// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(
-    p: &crate::ir::Program,
-    st: &Structured,
-    all: &[bool],
-    unordered: &HashSet<(usize, usize)>,
-) -> Option<Vec<(bool, bool)>> {
-    let n = st.exits.len();
-    let succ = |b: usize| -> Vec<usize> {
-        match st.exits[b] {
-            LaneExit::Jump(t) => vec![t],
-            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
-            LaneExit::End | LaneExit::Indirect => Vec::new(),
-        }
-    };
-    // regions: blocks not every lane runs, joined by the edges between them
-    let mut region: Vec<usize> = (0..n).collect();
-    fn find(region: &mut [usize], mut b: usize) -> usize {
-        while region[b] != b {
-            region[b] = region[region[b]];
-            b = region[b];
-        }
-        b
-    }
-    for b in 0..n {
-        for t in succ(b) {
-            if !all[b] && !all[t] {
-                let (x, y) = (find(&mut region, b), find(&mut region, t));
-                region[x] = y;
-            }
-        }
-    }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
-    for (b, block) in p.blocks.iter().enumerate().take(n) {
-        if all[b] {
-            continue;
-        }
-        let r = find(&mut region, b);
-        for (k, i) in block.insts.iter().enumerate() {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
-            if unordered.contains(&(b, k)) {
-                continue; // (no meeting: [`LdsOrder`])
-            }
-            if name.starts_with("ds_read") {
-                reads[r] = true;
-            } else {
-                writes[r] = true;
-            }
-        }
-    }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
-    }
-    let mut meet = vec![(false, false); n];
-    for b in 0..n {
-        for t in succ(b) {
-            if all[b] && !all[t] {
-                let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
-            } else if !all[b] && all[t] {
-                let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
-            }
-        }
-    }
-    Some(meet)
-}
+#[path = "lds_regions.rs"]
+mod lds_regions;
+use lds_regions::log_wave64_why;
+pub(super) use lds_regions::lds_flag_region;
+#[cfg(test)]
+pub(super) use lds_regions::wave64_why_reasons;
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
@@ -1826,30 +1746,37 @@ impl<'a> Lower<'a> {
                     // no guard), else a barrier would hang the group
                     // (with console waves meeting on their own, only the accesses whose order
                     // counts: [`LdsOrder`])
-                    let lds = |b: usize, k: usize, i: &Inst| {
-                        matches!(i.fields, Fields::Ds { .. })
-                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                            && !lds_order.unordered.contains(&(b, k))
-                    };
                     if let Some(all) = all_lane_blocks(x.st) {
-                        let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().enumerate().all(|(k, inst)| {
-                                !lds(b, k, inst) || all.get(b).copied().unwrap_or(false)
-                            })
-                        });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_order.unordered) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
-                        }
+                        let needs_check = |b: usize, k: usize, inst: &Inst| {
+                            super::lds::needs_region_check(inst, lds_order.unordered.contains(&(b, k)))
+                        };
+                        let divergent: Vec<_> = if s.lds_dwords > 0 && group > 32 {
+                            p.blocks
+                                .iter()
+                                .enumerate()
+                                .filter(|&(b, blk)| {
+                                    !all.get(b).copied().unwrap_or(false)
+                                        && blk.insts.iter().enumerate().any(|(k, i)| needs_check(b, k, i))
+                                })
+                                .map(|(b, _)| b)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut lds_refusal = None;
+                        let mut lds_ok = divergent.is_empty();
                         if !lds_ok {
-                            // (the blocks whose LDS accesses not every lane runs: with the
-                            // branches around them taken wave-wide they get their barriers)
-                            for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false)
-                                    && blk.insts.iter().enumerate().any(|(k, inst)| lds(b, k, inst))
-                                {
-                                    need(b);
+                            match lds_meetings(p, x.st, &all, &lds_order.unordered, x.io, x.res, cs) {
+                                Ok(meet) => {
+                                    lds_meet = Some((all.clone(), meet));
+                                    lds_ok = true;
+                                }
+                                Err(reason) => {
+                                    lds_refusal = Some(reason);
+                                    // Wave-wide lowering retries the branches around these blocks.
+                                    for b in divergent {
+                                        need(b);
+                                    }
                                 }
                             }
                         }
@@ -1863,45 +1790,13 @@ impl<'a> Lower<'a> {
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
                         }
-                    }
-                }
-                // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
-                    let mut why: Vec<&str> = Vec::new();
-                    for i in insts() {
-                        let n = i.name();
-                        let r = if n.starts_with("v_mbcnt") {
-                            "v_mbcnt"
-                        } else if n == "v_readlane_b32" {
-                            "v_readlane"
-                        } else if n == "v_writelane_b32" {
-                            "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
-                        } else if reads_mask_as_data(x.st, i) {
-                            "mask as data"
-                        } else {
-                            continue;
-                        };
-                        if !why.contains(&r) {
-                            why.push(r);
+                        // Report the refusal from the same analysis that picked the wave size.
+                        if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            log_wave64_why(p, x.st, group, s.lds_dwords > 0, false, lds_refusal);
                         }
+                    } else if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        log_wave64_why(p, x.st, group, s.lds_dwords > 0, true, None);
                     }
-                    if lane_constant_masks(x.st) {
-                        why.push("lane-constant mask");
-                    }
-                    if s.lds_dwords > 0 && group > 32 {
-                        why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
-                            None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all, &lds_order.unordered).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                    why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
             if wave == 32 && x.native.wave64 {
