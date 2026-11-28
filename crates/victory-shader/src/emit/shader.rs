@@ -100,26 +100,6 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
-/// The root SRV `t<SLOT_GUIDE>` in [`ROOT_CBV_SPACE`] of a program that walks
-/// the title's ray-tracing structures with the host's ray-tracing hardware
-/// for a guide (`mod.rs` `ray_guide`, `intersect.rs`): a raw buffer the host
-/// fills when it builds its own structures from the title's
-/// ([`crate::rays::guide_table`] says what is in it). It names the title's
-/// top levels the host has a structure of, the view-heap slot of each, and
-/// per host primitive the title's triangle node.
-pub const SLOT_GUIDE: u8 = 251;
-
-#[cfg(test)]
-thread_local! {
-    /// For a test's thread alone: lanes are numbered by the thread's number
-    /// in its group, no wave operation is emitted and no wave size is
-    /// declared. The software adapter runs waves of 4 lanes and refuses a
-    /// program that declares 32; a program whose groups are one console
-    /// wave, whose lanes share nothing and whose first-lane reads are of
-    /// values every lane has alike computes the same either way.
-    pub(crate) static LANES_ARE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     /// ForceEarlyDepthStencil: HLSL's `[earlydepthstencil]` (no `SFI0` bit).
@@ -138,27 +118,6 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
-    /// Inline ray queries.
-    pub const RAYTRACING_1_1: u64 = 1 << 25;
-}
-
-/// What a program that walks with the host's hardware for a guide keeps
-/// ([`Shader::ray_guide`]).
-#[derive(Clone, Copy)]
-pub(crate) struct RayGuide {
-    /// The thread's ray query.
-    pub query: V,
-    /// Thread-group shared memory, a dword a thread: whether a candidate of
-    /// the thread's query waits for its bottom level's root.
-    pub waits: V,
-    /// The thread's number in its group.
-    pub thread: V,
-    /// The guide table ([`SLOT_GUIDE`]).
-    pub table: V,
-    /// The table's entries of the guided top levels, read in the entry
-    /// block: the root node's address (low dword, bits from 32 up), the
-    /// root's pointer, the heap slot of the host's top level.
-    pub tops: [[V; 4]; crate::rays::GUIDE_TOPS as usize],
 }
 
 pub(crate) struct Types {
@@ -275,7 +234,6 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
-    guide: Option<RayGuide>,
     main: V,
     pub entry: usize,
 }
@@ -329,7 +287,6 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
-            guide: None,
             main,
             entry,
         }
@@ -347,49 +304,6 @@ impl Shader {
         g
     }
 
-    /// What the guided node test keeps for the whole program, made in the
-    /// entry block at its first use: the thread's ray query (every triangle
-    /// is a candidate: the title's code judges it), its dword of state, and
-    /// the guided top levels of the guide table.
-    pub fn ray_guide(&mut self) -> RayGuide {
-        if let Some(g) = self.guide {
-            return g;
-        }
-        let e = self.entry;
-        let i32t = self.t.i32;
-        const FORCE_NON_OPAQUE: u32 = 2;
-        let flags = self.m.i32(FORCE_NON_OPAQUE);
-        let query = self.op(e, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[flags]);
-        let threads = self.threads.map_or(1, |t| t.iter().product());
-        let state = self.m.array(threads, i32t);
-        let waits = self.m.global("guide", state, 3);
-        let thread = self.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
-        // No candidate waits when a thread starts. The group's shared memory
-        // is not zeroed by a card (the software adapter zeroes it): without
-        // this store a thread that has not traced yet read what an earlier
-        // group left there, took a candidate to be waiting and asked a ray
-        // query that was never begun for it (the card then did not come
-        // back from the program: device hung, in the first walking dispatch
-        // of a run, at every value of the switch).
-        let own = self.m.element(e, waits, thread);
-        let nothing = self.m.i32(0);
-        self.m.store(e, own, nothing);
-        let table = self.root_srv_handle(SLOT_GUIDE);
-        let (undef, all, align) = (self.m.undef(i32t), self.m.i8(15), self.m.i32(4));
-        let tops = std::array::from_fn(|k| {
-            let at = self.m.i32(16 + 16 * k as u32);
-            let r = self.op(e, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139, &[table, at, undef, all, align]);
-            std::array::from_fn(|n| {
-                let f = self.m.extract(e, r, n as u32);
-                self.m.cast(e, super::bitcode::Cast::Bitcast, f, i32t)
-            })
-        });
-        self.flags |= flags::RAYTRACING_1_1;
-        let g = RayGuide { query, waits, thread, table, tops };
-        self.guide = Some(g);
-        g
-    }
-
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
         &mut self,
@@ -400,18 +314,6 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        #[cfg(test)]
-        if LANES_ARE_THREADS.get() {
-            match name {
-                // The lane's number: the thread's in its group.
-                "waveGetLaneIndex" => {
-                    return self.op(block, "flattenedThreadIdInGroup.i32", Attr::ReadNone, ret, 96, &[]);
-                }
-                // A value every lane has alike is the first lane's.
-                "waveReadLaneFirst.i32" => return args[0],
-                _ => assert!(!name.starts_with("wave"), "{name} with lanes numbered by threads"),
-            }
-        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -944,10 +846,6 @@ impl Shader {
                 }
             }
         }
-        #[cfg(test)]
-        if LANES_ARE_THREADS.get() {
-            self.wave_size = None;
-        }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
@@ -1029,9 +927,6 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
-        }
-        if self.flags & flags::RAYTRACING_1_1 != 0 {
-            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

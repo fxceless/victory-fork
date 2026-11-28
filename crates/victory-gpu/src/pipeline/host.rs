@@ -519,16 +519,13 @@ impl HostPipeline {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
                     // Ours, not the title's, stay root descriptors: the
                     // table of strides, the directory of title memory by
-                    // address and its fault notes, the guide table of the
-                    // programs that walk with the host's ray-tracing
-                    // hardware (`VICTORY_RAY_GUIDE=1`).
+                    // address and its fault notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
-                            || slot == victory_shader::emit::SLOT_GUIDE
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -595,9 +592,6 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        // Its static samplers have their places in the driver's table first
-        // (`sampler_order`): the same in every run.
-        super::sampler_order::before(&host.device, &samplers);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {

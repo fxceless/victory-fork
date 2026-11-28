@@ -20,151 +20,37 @@ repository's history and the Credits section further down), built on
 [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its
 contributors. Thank you.
 
+**Status, 28 November 2026.** This is VIctory-NVIDIA's tree at `959dcaf`, run as
+measured below, plus the water fixes. **Ray tracing is on by default** (the title's own
+structure builder and ray programs; `play --set VICTORY_BVH_BUILDER=0` plays without it).
+On a GeForce RTX 4070 (32 GB of RAM), 1920x1080 inside upscaled to 2560x1440, standing on
+a pier by the sea: about **15 frames a second**. Compared with a console playthrough of the
+same kind of place, the sun's shadows, the sky light and the distance match, and the sea is
+teal-green and see-through in the shallows.
+
 **What differs here from VIctory-NVIDIA.**
 
 - *Wording.* This repository does not name the title, so a handful of comments
   and launcher texts say "the title", one launcher script is named
   `scripts/play-framegen.ps1`, and its two optional environment names start
   with `TITLE_`.
-- *Ray-tracing fixes* (in `crates/victory-gpu/src/pipeline/make.rs` and
-  `memory.rs`). They only act while the title's ray tracing runs:
-  - The per-material ray-tracing resolve programs are no longer waited for
-    while the driver builds them, and they queue in a line of their own behind
-    the pipelines that draws ask for. Before, a session with ray tracing on
-    ran at about 280 ms a frame for as long as any of them was being built.
-  - Memory pages made for the ray programs are no longer limited for the
-    whole run (2,048 pages in VIctory-NVIDIA: they ran out within a minute
-    and the ray programs read zeros from then on). They are now a budget of
-    512 MB held at a time; at the budget the oldest page is given back, and a
-    page that is still read is made again in the next frame. The log line
-    `title memory by address: ... from faults ...` shows pages held, given
-    back and wanted again.
-  - A log line names the pipeline whenever a frame waited 50 ms or more for
-    one.
-- *The water's light on 32-lane cards.* Three changes in the shader
-  translator (`crates/victory-shader/src/emit`), and the water's tiled volume
-  light is switched on (`VICTORY_WATER_LIGHT=1` in the launcher's settings):
-  - From VIctory-NVIDIA's newer commit `854f57f` (trustno1-coder; a port of
-    Vice-Tay `c125c0c`), with its test: console lanes in groups of several
-    host waves take their threads from a group counter. On NVIDIA cards some
-    threads of a group ran twice and others never, which left block-shaped
-    holes in the water's transmission pass.
-  - A skip around a loop on a scalar test is kept for the wave to take, and a
-    group's shared memory starts as the program's first store leaves it.
-  - `water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly` takes the
-    wave-wide form (it did not translate before).
-  - The water light's tile lists take a slot a lane
-    (`emit/water_tile_slots.rs`, `VICTORY_WATER_TILE_SLOTS=0`: as before).
-    Run as two host waves, the program that lists the water tiles to light
-    let the second wave's tiles overwrite slots of the first; those tiles got
-    no light and the sea had dark patches around boats, piers and lamp posts.
-    The idea is xss3009's "Fix transmission tile allocation on wave32 hosts"
-    (seen in the SmXme fork of VIctory-NVIDIA), written again for this tree.
-    With it the open water has its colour, its light and no dark patches on
-    a GeForce RTX 4070.
-- *The card stays under its memory budget* (`crates/victory-gpu`: `pool.rs`,
-  `resource.rs`, `shadow.rs`). Textures live in 64 MB blocks that only go
-  back to the card when wholly empty, and the gate that admits new textures
-  weighed the card's use minus the free part of those blocks: in long
-  sessions the card went 0.8 to 1.0 GB over its budget and frames went from
-  about 90 ms to about 160 ms with stalls of a second. Now a new block is
-  made only if the card's real use, the block and the render targets still
-  to come stay under the texture line; the sweep keeps some room free inside
-  the blocks; the ray programs' arenas leave the render targets' room too. A
-  texture with no room waits and shows its older view. A line
-  `texture blocks: ...` says how full the blocks are and how many were not
-  made. Nothing is moved or given back (`VICTORY_POOL_GATE=0`: as before).
-- *Ray walkers* (`emit/lower.rs`, `emit/intersect.rs`): a load by address of a
-  page that an earlier load of the same turn looked up goes through that
-  look's view, and the second half of a 128-byte node through the first
-  half's. A triangle step does one directory look instead of two, entering an
-  instance one instead of nine. `VICTORY_MEMORY_NEAR=0` gives the old code.
-- *Dynamic descriptor slots* (`crates/victory-gpu`): a list's translation
-  pauses while slots are short (`VICTORY_THIN_GATE`), so draws no longer go
-  without in busy scenes; one copy of a table for every length a list reads
-  it to; slots go back at the start of a landing; a counter line says how
-  many a frame takes and who holds them.
-- *Instruments* (diagnostics builds): the card's time of draws by what was
-  recorded with them and by whether they read a copy in the PC's memory, a
-  census of windows of title memory, and F9 to save one frame with every
-  texture its passes wrote.
-- *A stall at one lock* (`crates/victory-gpu/src/host.rs`, `wait_for_slots`).
-  A draw that finds no free dynamic descriptor slot used to settle everything
-  in flight while holding the submission lock; the submitting thread stood at
-  that lock about 13 ms a frame in busy scenes, and about 48 ms with ray
-  tracing on. With `VICTORY_DYNAMIC_WAIT=1` the draw waits only for the next
-  landing and does not hold the lock. It is **on** by default
-  (`play --set VICTORY_DYNAMIC_WAIT=0` turns it off); the log line
-  `dynamic descriptor slots: ...` shows what it did.
-
-**Ray tracing is on by default.** Since 27 November 2026 the launcher
-(`victory play`) starts the title with its own ray tracing running
-(`VICTORY_BVH_BUILDER=1` in the launcher's settings), with the fixes above.
-VIctory-NVIDIA has it off by default. To play without it, start with
-`play --set VICTORY_BVH_BUILDER=0`: the light estimate takes its place again
-and the frame rate is higher. The `raytracing` branch is the same code as
-`main`.
-
-Ray tracing is work in progress. Measured on a GeForce RTX 4070 with the
-scene at 1920x1080, in one play session with the memory gate: about 12.6
-frames a second at 5,000 to 7,000 draws a frame and about 10 at 7,000 to
-12,000, with the card 1.3 GB under its budget throughout. The card's time is
-the limit: about 30 ms a frame go to five ray-walking programs, about 40 ms
-to ordinary drawing, and the water's light costs more again in sea views.
-The first visit to a place is slower while the driver builds that place's
-ray-tracing programs; they are saved for the next start. Known to be wrong
-still: some vehicles' paint comes out a flat lime green, and while
-travelling fast the ray programs' pages can lag behind.
-
-**Status, 27 November 2026, night.** By default the frame rate is where the
-session above left it (about 10 to 12.6 frames a second with ray tracing
-on). The new hardware guide (below, off unless switched on) ran on a card
-for the first time; it still leaves objects out of the rays' scene, so its
-frame rate is not counted as a gain.
-What the day's work found and what is in hand:
-
-- *Slow first minutes after a start: fixed* (`crates/victory-gpu/src/pipeline/sampler_order.rs`,
-  `VICTORY_SAMPLER_ORDER=0`: as before). Since the afternoon every start had
-  the driver compiling several hundred compute pipelines again, about 8
-  minutes in which the world ran at 2 to 9 frames a second. The driver gives
-  each static sampler a place in a table in the order root signatures are
-  first made, a compiled pipeline carries the places, and the order differed
-  from start to start, so the driver's cache on disk did not answer. Now
-  every static sampler a pipeline has had is listed in a file beside the
-  pipeline library and made in that order before the first root signature
-  that holds one. Measured on a GeForce RTX 4070: compute pipelines that took
-  over a second, 406 in a start before, 211 in the one start that compiled
-  them in the kept order, 0 of 1,314 in the next; all pipelines made 34
-  seconds after that start. VIctory-NVIDIA's commit `64d4931` describes the
-  same cause, measured on another card (`pipeline/samplers.rs` there).
-- *The card's ray-tracing hardware: first session on a card* (`VICTORY_RAY_GUIDE`, off unless set;
-  `crates/victory-gpu/src/guide.rs`, `guide/core.rs`, `crates/victory-shader/src/rays.rs`). The title's
-  ray walkers are loops over its own structures. With the guide the layer builds the host's own
-  ray-tracing structures from the title's (bottom levels decoded from title memory into a pool, a top
-  level before each walk), the card's hardware finds the candidates, and the title's own triangle
-  test still decides. Start with `play --set VICTORY_RAY_GUIDE=3 --set VICTORY_MEMORY_TARGETS_MB=2688`
-  (the translator's sources changed, so shaders translate once more).
-  **It is not right yet and its frame rate is not a gain yet.** In its first session on a GeForce RTX
-  4070 it read 12.3 to 13.2 frames a second at 7,600 to 8,300 draws a frame (75 to 81 ms), against
-  10.3 (97 ms) at 7,000 to 9,000 draws in the session above, BUT about 590 of some 2,000 instances a
-  frame were left out of the host's top level, so rays missed those objects: their ray-traced light
-  and shadows were gone on screen, and rays that find less cost less. The number says nothing until
-  the picture is whole. The cause in hand: the check that a decoded structure is sound turned down
-  most bottom levels (3,598 of 4,007 in that session), and an instance of a turned-down one is left
-  out. Every static structure of the title turned out to be stored scaled and moved in a space of
-  its own, which the decoder brings back; the check's tolerance for that is the next thing to fix.
-  Leave the switch off to play.
-  One fault found on the way: the guided node test kept a word a thread in the group's shared memory
-  and nothing stored it before the first load. The software adapter zeroes that memory and every test
-  passed; on the card the first walking dispatch never came back (device hung). The program now
-  stores it where it starts.
-- *Lime-green vehicles.* Read in the title's paint programs: the green is a
-  data value (a decal layer's paint colour picked through a mask texture),
-  not a lighting fault. Which input is wrong on the PC is not known yet; a
-  test that runs the title's program and its translation side by side on the
-  same inputs is being written.
-- Every change is now tried alone, one a session, against the session above
-  at equal draw counts, and published with the measured result.
+- *Ray tracing on by default* (`VICTORY_BVH_BUILDER=1` in the launcher's settings).
+- *The water's own light runs on 32-lane cards* (`VICTORY_WATER_LIGHT=1` in the launcher's
+  settings). VIctory-NVIDIA left it out there because it drew dark blocks on the water; the
+  sea was then dark navy and opaque. Five changes to the shader translator make it run right:
+  - From VIctory-NVIDIA's newer commit `854f57f` (trustno1-coder; a port of Vice-Tay
+    `c125c0c`), with its test: console lanes in groups of several host waves take their
+    threads from a group counter (some threads of a group ran twice and others never).
+  - A skip around a loop on a scalar test is kept for the wave to take, and a group's shared
+    memory starts as the program's first store leaves it.
+  - `water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly` takes the wave-wide form (it
+    did not translate before).
+  - The water light's tile lists take a slot a lane (`emit/water_tile_slots.rs`, after
+    xss3009's fix in the SmXme fork; `VICTORY_WATER_TILE_SLOTS=0`: as before): run as two host
+    waves, the second wave's tiles overwrote slots of the first and those tiles got no light.
+- *Known:* the first start after an update translates the shaders again (`victory warm --used`
+  does it ahead: about 5 minutes here), and the driver builds several hundred pipelines again
+  at every start for a few minutes; a fix for that is next.
 
 **This fork's earlier work** (up to commit `9a9091d1`) stays in this
 repository's history, with its own credits in the README of that commit.
@@ -377,10 +263,9 @@ foxhound's own measurements, on an RTX 4070 SUPER, are in its README.
 
 What is known to be wrong:
 
-- **Ray tracing is slow and not complete.** In this fork the title's own is
-  on by default (see the first section: what it costs and what is still
-  wrong). `play --set VICTORY_BVH_BUILDER=0` turns it off; an estimate then
-  stands in for indirect light and reflections.
+- **No ray tracing.** The title's own is off (`VICTORY_BVH_BUILDER=1`, or the
+  menu's RAY TRACING, turns it on: slow and with a broken picture on this
+  base). An estimate stands in for indirect light and reflections.
 - **Frame generation needs room in the card's memory.** The layer fills the
   card with textures up to its budget; with frame generation on from the start
   the launcher holds a fifth of the budget back (a little less while it is only

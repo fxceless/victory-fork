@@ -14,7 +14,6 @@ pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
-pub mod rays;
 pub mod resource;
 pub mod spill;
 pub mod structure;

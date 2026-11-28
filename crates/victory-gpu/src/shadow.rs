@@ -34,9 +34,6 @@ pub(crate) struct Shadow {
     landing: std::sync::atomic::AtomicBool,
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
-    /// Whether `buffer` lies in the PC's memory ([`Shadow::in_pc_memory`]).
-    #[cfg(feature = "diagnostics")]
-    pc: std::sync::OnceLock<bool>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -592,74 +589,6 @@ fn windows_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
 }
 
-/// Windows outside buffers since the start, how many and their bytes: made
-/// with a side in the card's memory; made in the PC's memory alone; and of
-/// those, the ones turned down because a part of the card's budget must
-/// stay free, and the ones turned down for want of room under
-/// [`window_card_most`].
-static WINDOWS_MADE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
-fn window_made(which: usize, size: u64) {
-    WINDOWS_MADE[2 * which].fetch_add(1, Ordering::Relaxed);
-    WINDOWS_MADE[2 * which + 1].fetch_add(size, Ordering::Relaxed);
-}
-
-/// The frame line of [`WINDOWS_MADE`]: every draw that takes its vertices,
-/// indices or constants from a window in the PC's memory has the card fetch
-/// them over the bus ([`window_card_most`]), and no line said how many
-/// windows that is.
-pub(crate) fn window_line() {
-    let n = |i: usize| WINDOWS_MADE[i].load(Ordering::Relaxed);
-    if n(0) + n(2) == 0 {
-        return;
-    }
-    tracing::info!(
-        "windows outside buffers made since the start: {} with a side in the card's memory ({} MB), {} in the PC's memory alone \
-         ({} MB: the card reads those over the bus); of the latter {} ({} MB) because the card had less than {} % of its budget \
-         free (VICTORY_WINDOWS_LATE=1: 3 %), {} ({} MB) for want of room under {} MB (VICTORY_CARD_WINDOWS_MB); alive now on \
-         the card with the memory by address: {} MB; of the memory by address made since the start {} pieces ({} MB) lie in the \
-         card's own memory and {} ({} MB) in the PC's (counted with the card's in the number before)",
-        n(0),
-        n(1) >> 20,
-        n(2),
-        n(3) >> 20,
-        n(4),
-        n(5) >> 20,
-        100 - window_line_hundredths(),
-        n(6),
-        n(7) >> 20,
-        window_card_most() >> 20,
-        WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20,
-        BY_ADDRESS[0].load(Ordering::Relaxed),
-        BY_ADDRESS[1].load(Ordering::Relaxed) >> 20,
-        BY_ADDRESS[2].load(Ordering::Relaxed),
-        BY_ADDRESS[3].load(Ordering::Relaxed) >> 20
-    );
-}
-
-/// Whether a window still goes to the card when the textures have filled it
-/// (`VICTORY_WINDOWS_LATE=1`; off by default).
-///
-/// A window got its side on the card only while a fifth of the card's budget
-/// was free. The texture queue fills the card to its own line (92 % of the
-/// budget: "the texture queue's room ... against a line of 9375 MB"), so
-/// from the first minute in the world every new window stayed in the PC's
-/// memory, whatever was left of the windows' own room
-/// ([`window_card_most`]): run 410 ended with 9,087 MB in use of 10,143 (90
-/// %). With the switch a window goes up while 3 % of the budget is free, as
-/// a title buffer does with its room kept (`card_room_kept_on`), still at
-/// most [`window_card_most`] bytes of them in all. The texture queue counts
-/// what the card holds, so the textures' share shrinks by what the windows
-/// take: at most the windows' room, which the budget rule meant for them.
-fn windows_late() -> bool {
-    crate::asked_for!("VICTORY_WINDOWS_LATE")
-}
-
-/// The hundredths of the card's budget a new window may fill it to.
-fn window_line_hundredths() -> u64 {
-    if windows_late() { 97 } else { 80 }
-}
-
 /// [`window_card_for`] in the card's own memory.
 fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
@@ -671,14 +600,12 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * window_line_hundredths()
+        && used + size > budget / 10 * 8
     {
-        window_made(2, size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
-        window_made(3, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -3201,22 +3128,6 @@ impl Shadow {
         self.place.is_some()
     }
 
-    /// For the livery probe (`crate::livery`): what the copy's CPU side
-    /// holds of the title's `len` bytes at `address` (of a copy in the
-    /// card's memory: what was last put there for the card). `None` outside
-    /// the copy, and for title memory in place, which is no copy. A refresh
-    /// of another thread may be writing there: the answer is of the moment.
-    pub(crate) fn held_at(&self, address: u64, len: usize) -> Option<Vec<u8>> {
-        let at = address.checked_sub(self.start)?;
-        if self.place.is_some() || self.data.is_null() || at.checked_add(len as u64)? > self.len {
-            return None;
-        }
-        let mut held = vec![0u8; len];
-        // SAFETY: inside the copy's mapping, which lives as long as the copy.
-        unsafe { std::ptr::copy_nonoverlapping(self.data.add(at as usize).cast_const(), held.as_mut_ptr(), len) };
-        Some(held)
-    }
-
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3246,28 +3157,6 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    /// Whether the buffer shaders read lies in the PC's memory, so that the
-    /// card fetches every load from it over the bus: a buffer the CPU maps
-    /// in system memory (`Host::shared_buffer`, upload memory, title memory
-    /// in place), not one in the card's own memory (`Host::uav_buffer`,
-    /// `Host::mapped_card_buffer`).
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn in_pc_memory(&self) -> bool {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_L0,
-        };
-        *self.pc.get_or_init(|| {
-            let mut heap = D3D12_HEAP_PROPERTIES::default();
-            // SAFETY: a live buffer; a plain query into our own struct.
-            if unsafe { self.buffer.GetHeapProperties(Some(&mut heap), None) }.is_err() {
-                return false;
-            }
-            heap.Type == D3D12_HEAP_TYPE_UPLOAD
-                || heap.Type == D3D12_HEAP_TYPE_READBACK
-                || (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.MemoryPoolPreference == D3D12_MEMORY_POOL_L0)
-        })
-    }
-
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.
@@ -3282,8 +3171,6 @@ impl Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
             width: Default::default(),
-            #[cfg(feature = "diagnostics")]
-            pc: Default::default(),
             buffer,
             data,
             gpu,
@@ -5586,22 +5473,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    // (And with room left for the render targets still to come:
-    // `crate::resource::by_address_room`.)
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| crate::resource::by_address_room(budget, used, len));
+    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
-    // Counted by where it lies: `WINDOW_CARD_BYTES` below takes both.
-    let place = usize::from(on_card.is_none());
-    BY_ADDRESS[2 * place].fetch_add(1, Ordering::Relaxed);
-    BY_ADDRESS[2 * place + 1].fetch_add(len, Ordering::Relaxed);
-    if place == 0 {
-        BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).insert(start);
-    }
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -5627,21 +5505,6 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     carded(&shadow);
     Some(shadow)
-}
-
-/// Title memory by address made since the start ([`by_address`]): with its
-/// shaders' side in the card's own memory, how many and their bytes; then
-/// in the PC's memory, where every access of a shader crosses the bus.
-static BY_ADDRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-/// Where the pieces of [`by_address`] made in the card's own memory start
-/// (they live as long as the process).
-static BY_ADDRESS_ON_CARD: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
-
-/// Whether the piece of [`by_address`] that starts at `start` lies in the
-/// card's own memory (else in the PC's, where shaders read it over the bus).
-pub(crate) fn by_address_on_card(start: u64) -> bool {
-    BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).contains(&start)
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -5719,7 +5582,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // buffer there, and the one just made is the CPU's side.
     let (buffer, card) = match window_card_for(len) {
         Some(on_card) => {
-            window_made(0, len);
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
@@ -5732,10 +5594,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             };
             (on_card, Some(card))
         }
-        None => {
-            window_made(1, len);
-            (buffer, None)
-        }
+        None => (buffer, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

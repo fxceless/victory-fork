@@ -1937,25 +1937,6 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// For the line of `crate::host::wait_for_slots`: the fewest dynamic slots a
-/// view heap had free since the last line (`u32::MAX`: none was asked for),
-/// and how many that heap has in all.
-pub(crate) static DYNAMIC_LOW: [std::sync::atomic::AtomicU32; 2] =
-    [std::sync::atomic::AtomicU32::new(u32::MAX), std::sync::atomic::AtomicU32::new(0)];
-
-/// For the gate of `crate::list::thin`: the title slots of the biggest view
-/// heap that took or gave back dynamic slots, and the dynamic slots it has
-/// free now (`u32::MAX`: none has yet).
-static DYNAMIC_FREE: [std::sync::atomic::AtomicU32; 2] =
-    [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(u32::MAX)];
-
-/// The dynamic slots free now in the title's view heap ([`DYNAMIC_FREE`]),
-/// and how many it has in all (0: none was asked for yet).
-pub(crate) fn dynamic_room() -> (u32, u32) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (DYNAMIC_FREE[1].load(Relaxed), DYNAMIC_LOW[1].load(Relaxed))
-}
-
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -2295,9 +2276,6 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            DYNAMIC_LOW[0].fetch_min(self.free.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
-            DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
-            self.note_room();
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -2311,22 +2289,9 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed).saturating_sub(n as u32);
-        DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
-        DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
-        self.note_room();
+        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
-    }
-
-    /// Notes the dynamic slots free now ([`DYNAMIC_FREE`]), if no bigger
-    /// heap has noted its own. Under the lock of `next`.
-    fn note_room(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.count >= DYNAMIC_FREE[0].load(Relaxed) {
-            DYNAMIC_FREE[0].store(self.count, Relaxed);
-            DYNAMIC_FREE[1].store(self.free.load(Relaxed), Relaxed);
-        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -3475,7 +3440,6 @@ impl HostHeap {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
-            self.note_room();
         }
     }
 
@@ -3703,27 +3667,6 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 1);
         self.keep(index, Some(buffer.clone()));
-    }
-
-    /// Makes slot `index` (a dynamic one) the view of the host ray-tracing
-    /// structure at `location` on the card (a top level of the host's own,
-    /// `crate::guide`): a view of no resource, which holds the address.
-    pub(crate) fn structure_at(&self, index: u32, location: u64) {
-        let Some(host) = host() else { return };
-        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_UNKNOWN,
-            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV { Location: location },
-            },
-        };
-        // SAFETY: a slot of our heap; such a view has no resource.
-        unsafe { host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), self.at(index)) };
-        self.put(index);
-        self.clear_twin(index);
-        self.write_stride(index, 0);
-        self.keep(index, None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -4120,62 +4063,9 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))
     }
 
-    /// What host slot `index` shows against the title's record at `handle`,
-    /// in words and as a kind, for the livery probe (`crate::livery`): "own"
-    /// (made from that record), "stand-in" (the 1x1 grey of [`neutral`]: a
-    /// shader that picks the slot by index reads 0.5 in every channel),
-    /// "null" (reads zeros), "other" (made from another record: an earlier
-    /// view of the same texture, or another texture), "none" (past the
-    /// heap). With the size, levels and format of the host texture shown.
-    pub(crate) fn slot_probe(&self, index: u32, handle: u64) -> (String, &'static str) {
-        let key = record_key(handle);
-        let Some(made) = self.made.get(index).filter(|_| index < self.count) else {
-            return ("past the host heap".into(), "none");
-        };
-        let kept = self.kept_in(index);
-        let texture = match &kept {
-            Some(shown) => {
-                // SAFETY: a live resource.
-                let d = unsafe { shown.GetDesc() };
-                format!("{}x{} levels {} f{}", d.Width, d.Height, d.MipLevels, d.Format.0)
-            }
-            None => "no texture".into(),
-        };
-        if made == 0 {
-            let is_neutral = match (&kept, neutral()) {
-                (Some(shown), Some(neutral)) => windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(neutral),
-                _ => false,
-            };
-            return match (is_neutral, kept.is_some()) {
-                (true, _) => (format!("THE GREY STAND-IN {texture}"), "stand-in"),
-                (false, true) => (format!("not made from a record, shows {texture}"), "other"),
-                (false, false) => ("null".into(), "null"),
-            };
-        }
-        if made == key {
-            return (format!("its own view, {texture}"), "own");
-        }
-        let view = |key: u64| view_at(key as u32, (key >> 32) as u32);
-        let levels = |v: &View| match v {
-            View::Placed(false, _, d) => format!("from level {} count {}", d[4], d[5] as i32),
-            View::Shader(_, Some(d)) => format!("from level {} count {}", d[4], d[5] as i32),
-            _ => String::new(),
-        };
-        match (view(made), view(key)) {
-            (Some(old), Some(new)) if same_placed_texture(&old, &new) => {
-                (format!("AN EARLIER VIEW OF THE SAME TEXTURE ({}), {texture}", levels(&old)), "other")
-            }
-            (Some(old), _) => {
-                let old: String = format!("{old:?}").chars().take(100).collect();
-                (format!("ANOTHER VIEW {old}, {texture}"), "other")
-            }
-            (None, _) => (format!("a view that is gone, {texture}"), "other"),
-        }
-    }
-
     /// What the queue of textures picked by index knows of title slot
-    /// `index` at `frame`, in a few words (diagnostics, and the livery
-    /// probe).
+    /// `index` at `frame`, in a few words (diagnostics).
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
         let textures = self.queue(super::queue_site::OTHER);
         match textures.slots.get(&index) {
@@ -6846,34 +6736,6 @@ mod tests {
         let mut plain = TextureQueue::default();
         plain.written(40, 1, 0, false);
         assert!(plain.take_out(40));
-    }
-
-    /// The livery probe's reading of a slot against the title's record: a
-    /// null slot, the grey stand-in with its size, the record's own view,
-    /// another record's, and a slot past the heap.
-    #[test]
-    fn a_slot_is_told_as_what_it_shows() {
-        let Some(heap) = HostHeap::new(false, 8) else {
-            return; // no host GPU
-        };
-        let record = [VIEW_TAG, 7, 3, 0, 0, 0, 0, 0u32];
-        let handle = record.as_ptr() as u64;
-        let key = record_key(handle);
-        assert_eq!(heap.slot_probe(2, handle), ("null".to_owned(), "null"));
-        if let Some(neutral) = neutral() {
-            heap.keep(2, Some(neutral.clone()));
-            let (text, kind) = heap.slot_probe(2, handle);
-            assert_eq!(kind, "stand-in");
-            assert_eq!(text, "THE GREY STAND-IN 1x1 levels 1 f28");
-        }
-        heap.made.set(2, key);
-        assert_eq!(heap.slot_probe(2, handle).1, "own");
-        heap.made.set(2, key + 1);
-        assert_eq!(heap.slot_probe(2, handle).1, "other");
-        assert_eq!(heap.slot_probe(heap.count, handle).1, "none");
-        heap.made.set(2, 0);
-        heap.keep(2, None);
-        assert_eq!(heap.slot_probe(2, handle).1, "null");
     }
 
     #[test]

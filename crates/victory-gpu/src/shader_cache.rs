@@ -95,16 +95,6 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
-        // So is the guided node test of the programs that walk the title's
-        // ray-tracing structures (`VICTORY_RAY_GUIDE=1`), likewise only
-        // while it is on.
-        if victory_shader::emit::ray_guide() {
-            tracing::info!(
-                "VICTORY_RAY_GUIDE=1: programs that walk the title's ray-tracing structures ask the host's ray-tracing hardware for their candidates"
-            );
-            bytes.extend_from_slice(b"VICTORY_RAY_GUIDE=1");
-            bytes.push(0);
-        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

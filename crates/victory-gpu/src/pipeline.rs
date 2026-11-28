@@ -139,9 +139,6 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
-    /// Whether it is one of the title's vehicle paint shaders with decals,
-    /// once asked (`crate::livery::reads_decals`, the livery probe).
-    pub(crate) livery: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(windows)]
@@ -235,7 +232,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
-        livery: Default::default(),
     })
 }
 
@@ -774,8 +770,6 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
-#[cfg(windows)]
-pub(crate) mod sampler_order;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

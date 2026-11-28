@@ -278,11 +278,6 @@ impl Detached {
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
-
-    /// It was sent to the card (for `crate::host::slot_stats`).
-    pub(crate) fn sent(&mut self) {
-        self._state.slots_at(2);
-    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -494,8 +489,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-        state.slots_at(1);
+        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -569,9 +563,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let mut state =
+            let state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            state.slots_at(1);
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -892,8 +885,6 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
-            #[cfg(feature = "diagnostics")]
-            list.mark_between(crate::host::between::TITLE_BARRIER);
         }
     }
     0
@@ -908,8 +899,6 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
-        #[cfg(feature = "diagnostics")]
-        list.mark_between(crate::host::between::OUR_BARRIER);
     }
 }
 
@@ -1668,8 +1657,6 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
-            #[cfg(feature = "diagnostics")]
-            list.mark_between(crate::host::between::TITLE_BARRIER);
         }
     }
     let _ = (this, flags, control, address, size);
@@ -1772,18 +1759,6 @@ mod state {
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
-    }
-    /// `RSSetShadingRate(base rate, two combiners or null)`: null is both
-    /// at passthrough.
-    pub(super) extern "system" fn shading_rate(this: This, rate: u32, combiners: *const [u32; 2]) {
-        // SAFETY: the title passes two combiners or null.
-        let combiners = unsafe { combiners.as_ref() }.copied().unwrap_or([0, 0]);
-        shading_rate_set(this, rate, combiners[0], combiners[1]);
-    }
-    /// As [`shading_rate`], the combiners by value (as a list whose calls
-    /// are written down keeps them).
-    pub(super) extern "system" fn shading_rate_set(this: This, rate: u32, first: u32, second: u32) {
-        with_state(this, |list, s| s.set_shading_rate(list, rate, [first, second]));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_binding(this, |s| s.set_heaps(items(heaps, count)));
@@ -1949,8 +1924,6 @@ mod state {
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
     pub(super) use super::ignored_state as depth_bounds;
-    pub(super) use super::ignored_state as shading_rate;
-    pub(super) use super::ignored_state as shading_rate_set;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -2253,8 +2226,6 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
-        #[cfg(feature = "diagnostics")]
-        list.mark_between(crate::host::between::TITLE_BARRIER);
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -2406,7 +2377,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
-    (124, state::shading_rate as *const ()),      // 0x3e0 shading rate
+    (124, ignored_state as *const ()),            // 0x3e0 shading rate
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.

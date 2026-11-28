@@ -105,8 +105,6 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
-mod rays_tests;
-#[cfg(all(test, windows))]
 mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
@@ -277,17 +275,6 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
-/// Whether a load by address in a program that walks the title's structures
-/// takes the copy an earlier load of the same 64 KiB page found, without a
-/// look in the directory of its own (`lower.rs` `memory_near`;
-/// `VICTORY_MEMORY_NEAR=0`: every load looks). The same bytes are read
-/// either way: the switch is for measuring what the looks cost. Part of the
-/// translation: the shader cache keys on it.
-pub fn memory_near() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NEAR").is_none_or(|v| v != "0"))
-}
-
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
@@ -295,43 +282,6 @@ pub fn memory_near() -> bool {
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
-}
-
-pub use shader::SLOT_GUIDE;
-
-/// `VICTORY_RAY_GUIDE=1`: a program that walks the title's ray-tracing
-/// structures (the 64-bit node test over title memory, console waves of 32)
-/// asks the host's ray-tracing hardware which triangles its ray can meet
-/// (`intersect.rs`, the guided node test): at the root of a top level the
-/// host has a structure of ([`SLOT_GUIDE`]) the node test runs an inline ray
-/// query and gives the title's loop the candidate's instance node and then
-/// its triangle node, in place of the boxes between. The title's own code
-/// still enters the instance, tests the triangle and judges it. Off unless
-/// asked: the host builds no such structures yet (the tests do). Part of
-/// the translation: the shader cache keys on it (`victory-gpu`'s does).
-pub fn ray_guide() -> bool {
-    #[cfg(test)]
-    if let Some(on) = lower::intersect::TEST_GUIDE.get() {
-        return on;
-    }
-    ray_guide_level() != 0
-}
-
-/// `VICTORY_RAY_GUIDE`'s value: 0 (unset, or anything else: off), or 1, 2,
-/// 3 or 4. The translation is the same for the four ([`ray_guide`]); they
-/// say how much the host builds for it (`victory-gpu` `guide.rs`): 1
-/// nothing (the guide table of no top level), 2 a top level a frame whose
-/// instances are all stand-in boxes, 3 also bottom levels of the title's
-/// static ones, 4 also of those the title builds at run time.
-pub fn ray_guide_level() -> u8 {
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| match std::env::var("VICTORY_RAY_GUIDE").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        Ok("3") => 3,
-        Ok("4") => 4,
-        _ => 0,
-    })
 }
 
 /// The clean-up passes that run over a translated program before it is

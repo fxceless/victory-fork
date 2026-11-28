@@ -700,14 +700,3 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
-
-/// The tests' program of one node test of the 64-bit form over title memory,
-/// read through the directory (for `rays_tests.rs`).
-pub(super) fn one_node_test() -> Result<HostShader, ShaderError> {
-    build(true, WHOLE).map(|built| built.0)
-}
-
-/// The same of the 32-bit form, the structure's address in the descriptor.
-pub(super) fn one_narrow_node_test() -> Result<HostShader, ShaderError> {
-    build(false, Descriptor::Numbers(0x1234_5678, bvh::BOX_SORT)).map(|built| built.0)
-}
