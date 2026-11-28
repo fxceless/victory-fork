@@ -30,8 +30,13 @@ pub(crate) fn texture_spares(memory: Option<[u64; 4]>, keep: bool, small: bool) 
     }
 }
 
-/// Supplement the live allocation gate with an explicit texture cap, never
-/// substitute the cap for the live gate. Unknown VRAM retains the fallback cap.
+/// Account for reusable pool space and reservations without integer wraparound.
+pub(crate) fn texture_usage(used: u64, free_pool: u64, buffers: u64, targets: u64) -> u64 {
+    used.saturating_sub(free_pool).saturating_add(buffers).saturating_add(targets)
+}
+
+/// Supplement reported-memory admission with an explicit texture cap, never
+/// substitute the cap for it. Unknown VRAM retains the fallback cap.
 pub(crate) fn texture_room(filled: u64, limit: Option<u64>, under_budget: Option<bool>) -> bool {
     if limit.is_some_and(|limit| filled >= limit) { return false; }
     under_budget.unwrap_or_else(|| filled < limit.unwrap_or(4 * GIB).min(4 * GIB))
@@ -40,6 +45,13 @@ pub(crate) fn texture_room(filled: u64, limit: Option<u64>, under_budget: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn texture_usage_accounts_for_free_pool_and_saturates_reservations() {
+        assert_eq!(texture_usage(4 * GIB, GIB, GIB, 2 * GIB), 6 * GIB);
+        assert_eq!(texture_usage(0, GIB, 0, 0), 0);
+        assert_eq!(texture_usage(u64::MAX - 1, 0, 2, 2), u64::MAX);
+    }
+
     #[test]
     fn small_profile_starts_before_memory_pressure() {
         assert!(small_host(Some(16 * GIB), false));

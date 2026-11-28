@@ -10,6 +10,7 @@ foreach ($tier in $expected.Keys) {
     $ms = [double]::Parse($plan.Settings.VICTORY_FRAME_INTERVAL_MS, [Globalization.CultureInfo]::InvariantCulture)
     if ([Math]::Abs(1000.0 / $ms - $plan.FrameCapFps) -gt 0.001) { throw 'Frame clock and simulation rate disagree.' }
     if (-not $plan.Warm -or $plan.Settings.VICTORY_FRAMEGEN -ne '0') { throw 'Qualification must warm known pipelines and disable frame generation.' }
+    if ($plan.Settings.ContainsKey('VICTORY_POOL_GATE') -or $plan.Settings.ContainsKey('VICTORY_DYNAMIC_WAIT')) { throw 'Removed upstream switches must not be advertised.' }
     if ($plan.Settings.VICTORY_WATER_LIGHT -ne '1' -or $plan.Settings.VICTORY_LEAVE_OUT -ne '') { throw 'Full-pass profile silently disabled rendering passes.' }
 }
 try { & $launcher -Exe 'unused' -Tier reference -FrameCapFps 60 -ShowSettings | Out-Null; throw 'Low cap accepted.' }

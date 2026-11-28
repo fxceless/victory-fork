@@ -6,7 +6,8 @@ foreach ($mode in @('stock', 'quality', 'balanced', 'performance')) {
     $plan = & $launcher -Exe 'unused.exe' -Upscaling $mode -ShowSettings
     if ($plan.Console -ne 'series-s') { throw 'The memory profile must use Series S.' }
     if ($plan.Settings.VICTORY_MEMORY_PROFILE -ne '16gb-8gb') { throw 'Small-memory policy is missing.' }
-    if ($plan.Settings.VICTORY_POOL_GATE -ne '1') { throw 'Texture-block admission must stay enabled.' }
+    if ($plan.Settings.VICTORY_MEMORY_PROFILE -ne '16gb-8gb' -or $plan.Settings.VICTORY_TEXTURE_BUDGET_MB -ne '2560') { throw 'Small-memory profile and supplemental texture cap must stay enabled.' }
+    if ($plan.Settings.ContainsKey('VICTORY_POOL_GATE')) { throw 'Removed upstream block-gate switch must not be advertised.' }
     if ($plan.Settings.VICTORY_DLSS -ne '0' -or $plan.Settings.VICTORY_FRAMEGEN -ne '0') { throw 'Default launch must not request NVIDIA-only effects.' }
     if ($plan.Settings.ContainsKey('VICTORY_D3D12_ADAPTER')) { throw 'The profile must not force an NVIDIA adapter.' }
     if ($plan.Settings.VICTORY_BVH_BUILDER -ne '0') { throw 'Ray tracing must be opt-in on the small-memory profile.' }

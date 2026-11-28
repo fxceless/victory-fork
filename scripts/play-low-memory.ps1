@@ -19,7 +19,6 @@ $settings = @{
     VICTORY_TEXTURE_CATCHUP = '0'
     VICTORY_PIPELINE_BOOK = '1'
     VICTORY_LEVELS_ON_DEMAND = '1'
-    VICTORY_POOL_GATE = '1'
     VICTORY_RIPE_BLOCKS = '4'
     VICTORY_BVH_BUILDER = $(if ($RayTracing) { '1' } else { '0' })
     VICTORY_DLSS = '0'

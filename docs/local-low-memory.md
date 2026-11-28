@@ -1,9 +1,10 @@
 # Local 16 GiB RAM / 8 GiB VRAM branch
 
-Prepared 2026-11-27. Recommended starting point: **victory-fork/main at
-2eade68cade9b2f8cd2511cc97328e83f58508c3**. These experimental changes were
-prepared on branch `local/16gb-8gb`. Publication does not change the validation
-limits below: a full Rust build and gameplay measurements are still required.
+Prepared 2026-11-27 on **victory-fork/main at
+2eade68cade9b2f8cd2511cc97328e83f58508c3**. Updated 2026-11-28 to merge main at
+`368967f8fea2a982cea134c5a051b2afe7d9fc8f` into `local/16gb-8gb`.
+The source comparison below describes the original inspected heads. A full
+Rust build and gameplay measurements of the updated branch are still required.
 
 ## Source comparison
 
@@ -23,23 +24,24 @@ coverage for the valid rotation modes and packed mode-6 channel ordering.
 Its host GPU initialization detects AMD/RDNA waves; NVIDIA-focused features
 are optional. This does not establish tested performance on the user's AMD GPU.
 
-The source of the existing new-block gate is fxceless's commit
-`2eade68cade9b2f8cd2511cc97328e83f58508c3` in the linked victory-fork checkout.
-It distinguishes existing pool space from allocating another 64 MiB heap, and
-defers speculative textures without making an individual committed allocation
-as a workaround. Those mechanisms are retained, including the mandatory-work
-fallback and retry handling. This branch is not a wholesale merge of the three
+The original base had a new-block gate from `2eade68`. Main at `368967f` returns
+to the run-403 renderer and removes that gate, its wait/retry helpers and the
+dynamic descriptor-wait switch. This merge keeps main's allocator and shader/
+water fixes. It adapts our supplemental texture cap to main's live WDDM usage,
+free pool space and buffer/target reservations. It does not reintroduce the
+removed gate or claim a hard bound on every new heap allocation. The launchers
+no longer advertise the removed switches. This is not a wholesale merge of the
 different renderers.
 
 ## Fixes applied here
 
 - Explicit texture caps are now supplemental to the real WDDM budget and
-  reservations. They cannot bypass the dynamic allocation gate.
-- The initial-texture floor no longer bypasses live budget checks, including
-  the new-block check. A known exhausted budget cannot be treated as spare
+  reservations. They cannot bypass reported-memory admission.
+- The initial-texture floor no longer bypasses live budget checks.
+  A known exhausted budget cannot be treated as spare
   capacity merely because few textures have been created.
-- New-block arithmetic uses a widened sum, so integer overflow cannot grant
-  permission. Pool-pressure arithmetic also saturates instead of wrapping.
+- Texture usage and reservations share saturating arithmetic between admission
+  and reclamation. The removed block-gate arithmetic and tests are not retained.
 - Automatic <=16 GiB RAM detection and `VICTORY_MEMORY_PROFILE=16gb-8gb` select
   smaller speculative work before memory pressure has already developed.
 - Small-profile texture passes have soft limits of 32 MiB, 16 MiB under
@@ -58,7 +60,7 @@ different renderers.
   failures, and restore the parent environment and current directory on exit,
   including on failure.
 
-The allocation gate still permits mandatory work when it cannot wait. Required
+Host-memory admission retains the existing rules for mandatory work. Required
 title allocations, active buffer mirrors, pending GPU work, Windows and the
 driver are not subject to a hard 16 GiB total-process cap. These changes do not
 establish that the game fits or runs well on 16 GiB / 8 GiB hardware.
@@ -118,11 +120,16 @@ restoration, and rejection of a missing runner. PowerShell syntax and diff/text
 checks are also performed. The stub never launches or contains a game.
 
 Additional Rust regression tests cover cache/admission rules, cap intersection,
-allocation boundary/overflow cases and BC7 precision/packing. **They have not
-run**, because Rust/Cargo is missing in this execution environment. The pinned
+reservation arithmetic/overflow cases and BC7 precision/packing. **They have not
+run locally**, because Rust/Cargo is missing in this execution environment. The pinned
 toolchain remains unchanged. Full workspace Clippy, workspace tests and game
 qualification are pending. The previous branches' six FSR 1 WARP readbacks do
 not validate this different temporal renderer.
+
+PortBridge independently executed the launcher and six standalone budget checks
+against the earlier published head `4351fb4`. Its report does not validate this
+merge's changed admission wiring or a full GPU/crate build. Those still require
+the updated CI and gameplay checks.
 
 To qualify the target, build with the pinned toolchain and run the same scene on
 actual 16 GiB / 8 GiB hardware. Measure working set, private bytes, commit

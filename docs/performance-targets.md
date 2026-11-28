@@ -58,8 +58,9 @@ No arbitrary render-target resizing or unguarded resolution patch was added.
   environment. First-time pipelines not yet recorded can still stall or drop
   draws; first traversal and warm traversal must be tested separately.
 - Pipeline recording stays enabled so later starts know which pipelines were
-  requested. Shared pipeline wait accounting and the existing dynamic
-  descriptor wait fix remain enabled. Pipeline waits were not set to zero:
+  requested. Shared pipeline wait accounting remains enabled. Main at `368967f`
+  removed the dynamic descriptor-wait switch; the launcher follows its current
+  descriptor retry implementation. Pipeline waits were not set to zero:
   making a frame faster by losing required passes would invalidate quality.
 - Frame-clock and title simulation rate are set together. **All required timing
   patches must now succeed before execution**, including the simulation step;

@@ -67,19 +67,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_SPANS_QUICK", "1"),
     ("VICTORY_SYNC_FINE", "1"),
     ("VICTORY_HEAP_SYNC_AT_SUBMIT", "1"),
-    // THE RAY-TRACING BUILD (branch `raytracing`): the title's own ray tracing runs (its structure builder
-    // and ray programs). The light estimate below switches itself off while it does (ambient.rs).
-    ("VICTORY_BVH_BUILDER", "1"),
-    // A draw that finds no free dynamic descriptor slot waits for the next landing without the
-    // submission lock (host.rs `wait_for_slots`). With ray tracing on, at 9,000 to 12,000 draws a
-    // frame, the submitting thread stood about 48 ms a frame at that lock; about 13 ms with it off.
-    ("VICTORY_DYNAMIC_WAIT", "1"),
-    // The water's tiled light runs (it is left out on 32-lane hosts otherwise, make.rs).
+    // The water's tiled light runs (it is left out on 32-lane hosts otherwise, make.rs): its dark
+    // tiles came from a skip the translator left out around a loop (emit: kept now).
     ("VICTORY_WATER_LIGHT", "1"),
-    // Texture pieces are placed as before (first block that fits), not fullest block first: that
-    // would change how often an empty block is given back to the card, which has not been counted
-    // yet. The gate (no new block past the line) is on either way.
-    ("VICTORY_POOL_FULLEST", "0"),
+    // The title's own ray tracing runs (its structure builder and ray programs);
+    // `play --set VICTORY_BVH_BUILDER=0` plays without it.
+    ("VICTORY_BVH_BUILDER", "1"),
     // Light without the title's ray tracing
     ("VICTORY_AMBIENT", "0.8"),
     ("VICTORY_AMBIENT_AIR", "1.5"),
