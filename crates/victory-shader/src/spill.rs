@@ -44,14 +44,22 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
         return None;
     }
     let registers = u32::from(cs.user_sgprs());
-    let spilled: Vec<(u32, u32)> = native
+    // Hardware-initialized SGPRs (user + TGID/GroupInfo + scratch wave offset)
+    // must stay strictly below `FIRST` (16), because rewritten spilled
+    // parameters occupy synthetic entry registers `s16+`.
+    if registers < 2 || u32::from(cs.initialized_sgprs()) > FIRST {
+        return None;
+    }
+    let entries: Vec<(u32, u32)> = native
         .layout
         .iter()
-        .filter(|e| e.sgprs > 0 && u32::from(e.user_data) >= registers)
+        .filter(|e| e.sgprs > 0)
         .map(|e| (u32::from(e.user_data), e.sgprs))
         .collect();
-    // Only the one arrangement seen: the table starts at index 16.
-    (spilled.iter().map(|e| e.0).min() == Some(FIRST) && registers >= 2).then_some(spilled)
+    // Every declared parameter must live in the spilled table starting at index
+    // 16: lowering subtracts `user_first() == 16` from every root parameter's
+    // `user_data`, so hybrid layouts with any entry below 16 would underflow.
+    (entries.iter().map(|e| e.0).min() == Some(FIRST)).then_some(entries)
 }
 
 /// Whether `native` reads its root parameters from a spilled user-data
@@ -155,6 +163,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
 
     // Each load through the pointer: its dwords become entry values.
     let mut replaced: std::collections::HashMap<Value, Value> = Default::default();
+    let mut spilled_inputs: std::collections::HashMap<Reg, Value> = Default::default();
     let mut gone: Vec<(usize, usize)> = Vec::new();
     let mut inputs = p.inputs.clone();
     for (b, block) in p.blocks.iter().enumerate() {
@@ -186,8 +195,15 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 let Some(k) = code.checked_sub(first) else {
                     continue 'insts;
                 };
-                let index = FIRST + offset as u32 / 4 + u32::from(k);
-                let declared = spilled.iter().any(|&(at, n)| index >= at && index < at + n);
+                let Some(index) = FIRST
+                    .checked_add(offset as u32 / 4)
+                    .and_then(|x| x.checked_add(u32::from(k)))
+                else {
+                    continue 'insts;
+                };
+                let declared = spilled
+                    .iter()
+                    .any(|&(at, n)| index >= at && index.checked_sub(at).is_some_and(|d| d < n));
                 if !declared {
                     if read_somewhere.contains(&v) {
                         continue 'insts;
@@ -204,15 +220,12 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 dwords.push((Reg::S(code), v));
             }
             for (reg, v) in dwords {
-                let value = match inputs.iter().find(|e| e.0 == reg) {
-                    Some(e) => e.1,
-                    None => {
-                        let value = Value(next);
-                        next += 1;
-                        inputs.push((reg, value));
-                        value
-                    }
-                };
+                let value = *spilled_inputs.entry(reg).or_insert_with(|| {
+                    let value = Value(next);
+                    next += 1;
+                    inputs.push((reg, value));
+                    value
+                });
                 replaced.insert(v, value);
             }
             gone.push((b, i));
@@ -376,5 +389,46 @@ mod tests {
         assert_eq!(loads, 1);
         // The pointer is still read, by the load that stays.
         assert!(p.inputs.iter().any(|i| i.0 == Reg::S(0)));
+    }
+
+    #[test]
+    fn hybrid_layout_with_register_and_spilled_params_is_rejected() {
+        // user_data = 2 (in-register) alongside user_data = 16 (spilled) would
+        // underflow `rp.user_data - 16` in lowering if treated as spilled.
+        let n = native(
+            &TABLE,
+            4,
+            vec![
+                param(RootType::Constants, 2, 1, 0),
+                param(RootType::Descriptor, 16, 2, 1),
+            ],
+        );
+        assert!(!is_spilled(&n));
+        let mut p = ir::build(&n.code, false, 256).unwrap();
+        let before = p.clone();
+        assert_eq!(user_data(&mut p, &n), 0);
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn system_sgpr_reaching_s16_is_rejected() {
+        // 14 user SGPRs + TGID_X|Y|Z occupies s14, s15, s16 (`initialized_sgprs == 17`).
+        // Rewriting spilled index 16 onto synthetic Reg::S(16) would clobber SV_GroupID.z.
+        let mut clash = native(&TABLE, 14, vec![param(RootType::Descriptor, 16, 2, 0)]);
+        clash.io = StageIo::Cs(ComputeIo {
+            rsrc2: (14 << 1) | (0b111 << 7),
+            threads: [1, 1, 1],
+        });
+        assert!(!is_spilled(&clash));
+        let mut p = ir::build(&clash.code, false, 256).unwrap();
+        assert_eq!(user_data(&mut p, &clash), 0);
+
+        // 13 user SGPRs + TGID_X|Y|Z ends at s15 (`initialized_sgprs == 16 <= 16`): safe.
+        let mut safe = native(&TABLE, 13, vec![param(RootType::Descriptor, 16, 2, 0)]);
+        safe.io = StageIo::Cs(ComputeIo {
+            rsrc2: (13 << 1) | (0b111 << 7),
+            threads: [1, 1, 1],
+        });
+        assert!(is_spilled(&safe));
     }
 }
