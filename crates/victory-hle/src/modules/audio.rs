@@ -684,6 +684,33 @@ fn dump_input(index: u32, context: Context) {
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
+///
+/// The thread runs at time-critical priority. Each voice's output ring holds
+/// `SAMPLES_PER_BLOCK / 375 * size` seconds of audio — 21 to 83 ms for the
+/// ring sizes the title asks for — and the frame timeline stalls far longer
+/// than that under memory pressure (150 to 260 ms a frame measured while the
+/// run's private memory passed 32 GiB). At normal priority the decoder then
+/// waits behind the thirty-odd frame threads (`victory-list`, `victory-wide`,
+/// the title's own workers) for its 2 ms slice, a ring runs dry in between,
+/// and the title's mixer reads a partial block: the audio crackles. The
+/// title's mixer thread itself is what these rings feed, so the decoder
+/// belongs with it above the frame's threads; `ahead_of_other_programs`
+/// raised the whole process for the same kind of reason, and the pipeline
+/// helpers went the other way (`VICTORY_HELPER_PRIORITY`) — this thread is
+/// the one a frame can wait for, not one a frame feeds.
+#[cfg(windows)]
+fn decoder_thread_priority() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+    // SAFETY: this thread's own priority, right after it starts.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } != 0;
+    if !set {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "the XMA decoder could not raise its priority; audio may crackle when frames stall");
+    }
+}
+
+#[cfg(not(windows))]
+fn decoder_thread_priority() {}
+
 fn wake_decoder() {
     static DECODER: OnceLock<std::thread::Thread> = OnceLock::new();
     DECODER
@@ -691,6 +718,7 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    decoder_thread_priority();
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
