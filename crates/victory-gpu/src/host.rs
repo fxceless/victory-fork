@@ -817,9 +817,68 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
-/// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// For the report of a host GPU failure: how full the system's commit and
+/// the card's memory were. A device is removed when memory runs out as
+/// well (the driver's shader compiler can take gigabytes for one program),
+/// and the removal reason does not say so.
+fn memory_when_failed(card: Option<[u64; 4]>) -> String {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
+        PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure of ours to fill.
+    let system = (unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0).then(|| {
+        let page = info.PageSize as u64;
+        let (total, limit) = (info.CommitTotal as u64, info.CommitLimit as u64);
+        (total * page, limit * page)
+    });
+    let mut own = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    let own = (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut own, own.cb) } != 0)
+        .then_some(own.PagefileUsage as u64);
+    memory_line(system, own, card)
+}
+
+/// `; memory: the system's commit <in use> of <limit> MiB (this process
+/// <private> MiB); the card's own <in use> of <budget> MiB, shared <in use>
+/// of <budget> MiB`, of what is known.
+fn memory_line(system: Option<(u64, u64)>, own: Option<u64>, card: Option<[u64; 4]>) -> String {
+    const MIB: u64 = 1 << 20;
+    let mut parts = Vec::new();
+    if let Some((total, limit)) = system {
+        let mut part = format!("the system's commit {} of {} MiB", total / MIB, limit / MIB);
+        if let Some(own) = own {
+            part.push_str(&format!(" (this process {} MiB)", own / MIB));
+        }
+        parts.push(part);
+    }
+    if let Some([budget, used, shared_budget, shared_used]) = card {
+        parts.push(format!(
+            "the card's own {} of {} MiB, shared {} of {} MiB",
+            used / MIB,
+            budget / MIB,
+            shared_used / MIB,
+            shared_budget / MIB
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; memory: {}", parts.join("; "))
+    }
+}
+
+/// Ends the run on a host GPU failure: what failed, the removal reason, the
+/// debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
+/// diagnostics build names the command), and how full memory was.
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
@@ -835,6 +894,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             ),
             None => {}
         }
+        text.push_str(&memory_when_failed(host.video_memory()));
     }
     tracing::error!("{text}");
     // Tests have no log: the reason goes to their output.
@@ -11124,6 +11184,29 @@ mod trail {
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
+    }
+
+    /// A GPU failure says how full the system's commit and the card's
+    /// memory were, of what is known.
+    #[test]
+    fn a_failure_says_how_full_memory_was() {
+        const MIB: u64 = 1 << 20;
+        let card = [16_000 * MIB, 12_522 * MIB, 15_900 * MIB, 310 * MIB];
+        let system = (36_900 * MIB, 37_000 * MIB);
+        assert_eq!(
+            super::memory_line(Some(system), Some(35_658 * MIB), Some(card)),
+            "; memory: the system's commit 36900 of 37000 MiB (this process 35658 MiB); \
+             the card's own 12522 of 16000 MiB, shared 310 of 15900 MiB"
+        );
+        assert_eq!(
+            super::memory_line(Some((2 * MIB, 3 * MIB)), None, None),
+            "; memory: the system's commit 2 of 3 MiB"
+        );
+        assert_eq!(super::memory_line(None, Some(MIB), None), "");
+        // This process's own numbers are there to be read.
+        let here = super::memory_when_failed(None);
+        assert!(here.starts_with("; memory: the system's commit "), "{here}");
+        assert!(here.contains("(this process "), "{here}");
     }
 }
 
