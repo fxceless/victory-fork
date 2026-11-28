@@ -723,6 +723,8 @@ impl Module {
             }
         }
         let mut fold = vec![None; self.blocks.len()];
+        let mut folded_to: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
+        let mut fold_parent = vec![false; self.blocks.len()];
         for &b in &post {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
@@ -730,9 +732,14 @@ impl Module {
                 blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
+                && !fold_parent[b]
+                && fold[*p].is_none()
                 && !succs(*p).contains(&h)
+                && !folded_to[*p].contains(&h)
             {
                 fold[b] = Some((*p, h));
+                folded_to[*p].push(h);
+                fold_parent[*p] = true;
             }
         }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();

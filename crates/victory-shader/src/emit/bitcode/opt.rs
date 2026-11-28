@@ -77,6 +77,8 @@ pub(crate) struct Usage {
     pub wave_ops: bool,
     /// A rasterizer ordered view.
     pub rovs: bool,
+    /// A 64-bit float (`double`), as a result or an operand.
+    pub doubles: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -209,6 +211,20 @@ pub(super) enum Effect {
 
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
+    // Wave and quad operations depend on which lanes are active.
+    if name.starts_with("wave") || name.starts_with("quad") {
+        return Effect::Lanes;
+    }
+    // Resource handles must stay block-local: reusing them across basic
+    // blocks breaks DXIL handle legalisation on GPU drivers (NVIDIA
+    // pipeline refusals / corruption, AMD compiler crashes) while keeping
+    // same-block deduplication (`LOADS`) and dead-code removal (`DEAD`).
+    if matches!(
+        name,
+        "createHandleFromHeap" | "createHandleFromBinding" | "annotateHandle"
+    ) {
+        return Effect::Lanes;
+    }
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
@@ -217,11 +233,7 @@ pub(super) fn effect(f: &Func) -> Effect {
         {
             Effect::Pure
         }
-        Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
-        // Declared with the attribute of calls that have effects, and have
-        // none: they read the other lanes' values.
-        _ if name.starts_with("wave") || name.starts_with("quad") => Effect::Lanes,
         _ => Effect::Writes,
     }
 }
@@ -1058,6 +1070,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -1086,7 +1099,12 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    let ty = self.type_of(v);
+                    u.int64 |= wide(ty);
+                    u.doubles |= double(ty);
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
@@ -2224,5 +2242,133 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn resource_handles_are_block_local_and_not_reused_across_blocks() {
+        for name in [
+            "dx.op.createHandleFromHeap",
+            "dx.op.createHandleFromBinding",
+            "dx.op.annotateHandle",
+        ] {
+            let Diamond {
+                k: Kit { mut m, b, writes, .. },
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let one = m.i32(1);
+            let two = m.i32(2);
+            let fty = m.func_ty(i32t, vec![i32t, i32t]);
+            let hfn = m.function(name, fty, Some(Attr::ReadNone), false);
+            let first = m.call(b, hfn, vec![one, two]);
+            let same_block = m.call(b, hfn, vec![one, two]);
+            let dead = m.call(b, hfn, vec![two, two]);
+            m.call(b, writes, vec![first, same_block]);
+            let below = m.call(then, hfn, vec![one, two]);
+            m.call(then, writes, vec![below, below]);
+            m.optimise(DEAD | REUSE | LOADS);
+            assert_eq!(stores(&m, b)[0], [first, first], "{name}: same block");
+            assert!(
+                m.blocks[b].body.iter().all(|&i| V::Inst(i) != dead),
+                "{name}: dead handle removed"
+            );
+            assert_eq!(stores(&m, then)[0], [below, below], "{name}: cross block");
+            assert_ne!(below, first, "{name}: must not reuse across blocks");
+            m.write();
+        }
+    }
+
+    #[test]
+    fn dead_double_clears_doubles_flag_and_validates() {
+        let mut s = crate::emit::shader::Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let uav = s.root_uav_handle(0);
+        let f64t = s.m.double();
+        let (z, one) = (s.m.i32(0), s.m.i32(1));
+        let u = s.m.undef(s.t.i32);
+        // Dead double-precision op sets `flags::DOUBLES`, then `DEAD` removes it.
+        s.flags |= crate::emit::shader::flags::DOUBLES;
+        let _dead_f64 = s.op(entry, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[z, one]);
+        // Live store so the compute shader is non-trivial.
+        let mask = s.m.i8(1);
+        let align = s.m.i32(4);
+        s.op(
+            entry,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[uav, z, u, one, u, u, u, mask, align],
+        );
+        s.m.terminate(entry, Term::Ret);
+        let mut dxil = s.finish();
+        // `SFI0` bit 0 (`DOUBLES`) must be clear when `DEAD` runs.
+        if crate::emit::shader_opt() & DEAD != 0 {
+            let parsed = crate::dxbc::Container::parse(&dxil).unwrap();
+            let sfi0 = parsed
+                .parts
+                .iter()
+                .find(|p| p.fourcc == crate::dxbc::FourCC::SFI0)
+                .unwrap()
+                .data;
+            let features = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+            assert_eq!(features & 0x1, 0, "stale DOUBLES flag remained in SFI0");
+        }
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+            validator
+                .validate(&mut dxil)
+                .expect("dead double shader must validate");
+        }
+    }
+
+    #[test]
+    fn two_empty_latches_from_one_branch_validate_with_dxil() {
+        let mut s = crate::emit::shader::Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let uav = s.root_uav_handle(0);
+        let i32t = s.t.i32;
+        let (z, one, two, three) = (s.m.i32(0), s.m.i32(1), s.m.i32(2), s.m.i32(3));
+        let u = s.m.undef(i32t);
+        let head = s.m.new_block();
+        let body = s.m.new_block();
+        let latch_a = s.m.new_block();
+        let latch_b = s.m.new_block();
+        let exit = s.m.new_block();
+        s.m.terminate(entry, Term::Br(head));
+        let count = s.m.phi(head, i32t);
+        let acc = s.m.phi(head, i32t);
+        let more = s.m.cmp(head, pred::IULT, count, three);
+        s.m.terminate(head, Term::CondBr(more, body, exit));
+        let next = s.m.bin(body, Bin::Add, count, one);
+        let parity = s.m.bin(body, Bin::And, count, one);
+        let odd = s.m.cmp(body, pred::NE, parity, z);
+        // Both arms become empty `Br(head)` latches feeding distinct values into `acc`.
+        let val_a = s.m.bin(body, Bin::Add, acc, one);
+        let val_b = s.m.bin(body, Bin::Add, acc, two);
+        s.m.terminate(body, Term::CondBr(odd, latch_a, latch_b));
+        s.m.terminate(latch_a, Term::Br(head));
+        s.m.terminate(latch_b, Term::Br(head));
+        s.m.set_phi(count, vec![(z, entry), (next, latch_a), (next, latch_b)]);
+        s.m.set_phi(acc, vec![(z, entry), (val_a, latch_a), (val_b, latch_b)]);
+        let mask = s.m.i8(1);
+        let align = s.m.i32(4);
+        s.op(
+            exit,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[uav, z, u, acc, u, u, u, mask, align],
+        );
+        s.m.terminate(exit, Term::Ret);
+        let mut dxil = s.finish();
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+            validator
+                .validate(&mut dxil)
+                .expect("two empty latches from one CondBr must produce valid DXIL");
+        }
     }
 }
