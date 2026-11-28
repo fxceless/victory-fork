@@ -1616,6 +1616,55 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
 }
 
 #[test]
+fn ds_subword_writes_preserve_neighboring_bits_and_one_lanes_value() {
+    let word = 0xa5c3_d75a;
+    for (op, bytes, high_half) in [(0x1e, 1u32, false), (0x1f, 2, false), (0xa0, 1, true), (0xa1, 2, true)] {
+        for same_address in [true, false] {
+            let mut body = vec![
+                vop1(0x001, 4, vgpr(0)), // remember the group thread index
+                vop1(0x001, 5, 0x80), // v5 = LDS byte address 0
+            ];
+            body.extend(ds(0x2d, 7, 5, 1)); // atomic exchange initializes the dword
+            body.push(S_BARRIER);
+            body.push(vop2(0x1b, 6, 0x81, 4)); // v6 = thread index & 1
+            body.push(vop2(0x1a, 7, vgpr(6), 2)); // v7 = 1 << parity
+            if high_half {
+                body.push(vop2(0x1a, 7, 0x90, 7)); // the store reads the high half
+            }
+            if same_address {
+                let [write, operands] = ds(op, 0, 5, 7);
+                body.extend([write | bytes, operands]); // both values target the second field
+            } else {
+                if bytes == 2 {
+                    body.push(vop2(0x1a, 6, 0x81, 6)); // byte address = 2 * parity
+                }
+                body.extend(ds(op, 0, 6, 7));
+            }
+            body.push(S_BARRIER);
+            body.extend(ds(DS_READ_B32, 0, 5, 0));
+            // v_cmpx_eq_u32 0, v4: only group thread zero writes the UAV.
+            body.push(0x7c00_0000 | (0xd2 << 17) | (4 << 9) | 0x80);
+            let shader = build_cs(&body, 64, 512);
+            run_cases(&shader, &[[word, 1, 0, 0]], |backend, _, _, got| {
+                let shift = bytes * 8;
+                let mask = (1 << shift) - 1;
+                if same_address {
+                    let kept = word & !(mask << shift);
+                    let possibilities = [kept | (1 << shift), kept | (2 << shift)];
+                    assert!(
+                        possibilities.contains(&got),
+                        "{backend}: overlapping LDS writes merged values for op {op:#x}: got {got:#010x}, expected {possibilities:#x?}"
+                    );
+                } else {
+                    let want = (word & !(mask | (mask << shift))) | 1 | (2 << shift);
+                    assert_eq!(got, want, "{backend}: adjacent LDS writes for op {op:#x}");
+                }
+            });
+        }
+    }
+}
+
+#[test]
 fn ds_min_max_f32_are_atomic_across_waves() {
     // 64 threads (two host waves of 32 or one of 64): LDS[0] = v1, then
     // every thread applies (thread - 32) as a float; v0 = LDS[0].
