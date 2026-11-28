@@ -43,3 +43,8 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[[test]]
+name = "arc_probe"
+path = "tests/arc_probe.rs"
+required-features = ["diagnostics"]
