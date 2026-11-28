@@ -17,7 +17,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -26,6 +26,11 @@ use crate::object::{HRESULT, S_FALSE, S_OK, This};
 const TIMEOUT: HRESULT = S_FALSE;
 /// The frame-origin event: the one that starts frames and makes tokens.
 const ORIGIN: u32 = 0;
+/// The flip event: the title waits for it before each present.
+const FLIP: u32 = 2;
+/// Whether a flip wait has ended since the last present (see
+/// [`before_present`]).
+static FLIPPED: AtomicBool = AtomicBool::new(true);
 /// Make the frame's token even if the wait times out (the title starts the
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
@@ -212,6 +217,9 @@ pub(crate) extern "system" fn wait(
             std::thread::sleep(wait);
         }
         last(kind).fetch_max(tick, Ordering::Relaxed);
+        if kind == FLIP {
+            FLIPPED.store(true, Ordering::Relaxed);
+        }
         S_OK
     };
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -242,6 +250,21 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// Called before each present to the host. A present with no flip wait
+/// since the last one (a frame begun early, on an origin time-out: the
+/// movie player catching up) waits for the next flip tick and takes it, as
+/// the console flips such a frame on its tick. Shown at once, it stayed on
+/// screen ~5 ms and the frames around it twice as long: the intro movie
+/// judders on its first seconds.
+pub(crate) fn before_present() {
+    if FLIPPED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let (tick, wait) = next_tick(FLIP);
+    std::thread::sleep(wait);
+    last(FLIP).fetch_max(tick, Ordering::Relaxed);
 }
 
 /// How even the frames are (`VICTORY_TIMER_LOG=1`): the times between frame
@@ -405,5 +428,26 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+
+        // A present right after a flip wait goes at once and takes no tick.
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        let flipped = LAST[2].load(Ordering::Relaxed);
+        before_present();
+        assert_eq!(LAST[2].load(Ordering::Relaxed), flipped);
+        // A present with no flip wait since the last one (a frame begun
+        // early, on a time-out) is held to the next flip tick, as the
+        // console flips it there: the movie player's catch-up frames.
+        before_present();
+        let held = LAST[2].load(Ordering::Relaxed);
+        assert!(held > flipped, "{held} after {flipped}");
+        // And the next frame's flip wait takes the tick after it.
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        assert!(LAST[2].load(Ordering::Relaxed) > held);
     }
 }
