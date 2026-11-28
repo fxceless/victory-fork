@@ -12186,6 +12186,42 @@ impl<'a> Lower<'a> {
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        // CS_Tiling_Generate_Opaque: the coverage quad comes from
+                        // the G channel of a stencil-plane SRV, not normalized
+                        // colour. Its integer bits select 16x16 lighting tiles.
+                        // Keep the float form when a float view is bound.
+                        if name == "image_gather4_lz" && *dmask == 2 && !*d16
+                            && kind == 2 && inst.machine.offset == 0xe4 && sampler_choice.is_none()
+                            && matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads == [8, 8, 1])
+                            && super::container::hash(&self.x.native.code) == [
+                                0x76, 0xc2, 0xab, 0xcc, 0x80, 0x31, 0xf7, 0x0e,
+                                0xf2, 0x99, 0x06, 0x84, 0x05, 0x39, 0x5f, 0xc0,
+                            ]
+                            && let Some((integer, _)) = self.integer_view(src)?
+                        {
+                            let Operand::Vector { reg, .. } = *data else {
+                                return Err("a gather result");
+                            };
+                            let int_handle = self.handle(site, src, false, (props.0, (4 << 8) | 5))?; // uint4
+                            let (ui, fp, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+                            self.s.m.terminate(c, Term::CondBr(integer, ui, fp));
+                            let int_ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5]);
+                            let float = self.s.op(fp, "textureGather.f32", Attr::ReadOnly, self.s.t.res_ret, 73, &args);
+                            args[0] = int_handle;
+                            let uint = self.s.op(ui, "textureGather.i32", Attr::ReadOnly, int_ret, 73, &args);
+                            self.s.m.terminate(ui, Term::Br(join));
+                            self.s.m.terminate(fp, Term::Br(join));
+                            self.cur = join;
+                            for ch in 0..4 {
+                                let u = self.s.m.extract(ui, uint, ch);
+                                let f = self.s.m.extract(fp, float, ch);
+                                let bits = self.s.m.cast(fp, Cast::Bitcast, f, self.s.t.i32);
+                                let v = self.s.m.phi(join, self.s.t.i32);
+                                self.s.m.set_phi(v, vec![(u, ui), (bits, fp)]);
+                                self.write(inst, Reg::V(reg + ch as u8), v, guard);
+                            }
+                            return Ok(());
+                        }
                         call_sample(self, "textureGather.f32", 73, &args, &mut gathered)
                     }
                 }
